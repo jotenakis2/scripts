@@ -3,7 +3,7 @@
 #gstreamer1-plugins-base gstreamer1-plugins-good
 #gstreamer1-plugins-bad-freeworld
 
-readonly VER=0.3
+readonly VER=0.4
 set -euo pipefail
 
 # ─── Variables globales ────────────────────────────────────────────────────────
@@ -307,9 +307,22 @@ INSTALL_RUSTUP() {
 INSTALL_CARGO_PACKAGES() {
     SECTION "Paquets Cargo"
 
+    # Tableau de mapping : [nom_du_paquet]="binaire1 binaire2 ..."
+    local -A BIN_MAPPING=(
+        ["yazi-build"]="yazi ya"
+        ["tealdeer"]="tldr"
+        ["parallel-disk-usage"]="pdu"
+        ["fd-find"]="fd"
+        ["bottom"]="btm"
+        ["ripgrep"]="rg"
+        ["cargo-update"]="cargo-install-update cargo-install-update-config"
+    )
+
     local cmd check
     for cmd in "${!CARGO_PACKAGES[@]}"; do
         check="${CARGO_PACKAGES[${cmd}]}"
+
+        # 1. Installation du paquet via Cargo
         if cargo install --list | grep -q "^${check} "; then
             OK "${check} déjà installé."
         elif [[ "${cmd}" == "yazi-build" ]]; then
@@ -317,7 +330,45 @@ INSTALL_CARGO_PACKAGES() {
         else
             RUN "Installation ${cmd}" cargo install "${cmd}"
         fi
+
+        # 2. Création des liens symboliques dans /usr/local/bin
+        local bins_to_link
+        if [[ -n "${BIN_MAPPING[${cmd}]:-}" ]]; then
+            bins_to_link="${BIN_MAPPING[${cmd}]}"
+        else
+            bins_to_link="${cmd}"
+        fi
+
+        local bin_name src_bin dest_link current_target
+        for bin_name in ${bins_to_link}; do
+            src_bin="${CARGO_HOME}/bin/${bin_name}"
+            dest_link="/usr/local/bin/${bin_name}"
+
+            if [[ -x "${src_bin}" ]]; then
+                # Résolution de SC2312 : On gère readlink séparément
+                current_target=""
+                if [[ -L "${dest_link}" ]]; then
+                    current_target=$(readlink -f "${dest_link}" || true)
+                fi
+
+                if [[ "${current_target}" != "${src_bin}" ]]; then
+                    RUN "Lien symbolique : ${bin_name} -> /usr/local/bin" sudo ln -sf "${src_bin}" "${dest_link}"
+                else
+                    OK "Lien symbolique ${bin_name} déjà présent."
+                fi
+            else
+                ERR "Binaire introuvable : ${src_bin}"
+            fi
+        done
     done
+
+    # 3. Ajustement des permissions pour l'accès global
+    RUN "Permissions : accès global aux binaires Cargo" \
+        chmod a+x "${HOME}" \
+        "${HOME}/.local" \
+        "${HOME}/.local/share" \
+        "${CARGO_HOME}" \
+        "${CARGO_HOME}/bin"
 }
 
 # ─── 8. Outils git  ─────────────────────────────────────────────────────────────
