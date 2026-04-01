@@ -3,7 +3,7 @@
 #gstreamer1-plugins-base gstreamer1-plugins-good
 #gstreamer1-plugins-bad-freeworld
 
-readonly VER=0.4
+readonly VER=0.5
 set -euo pipefail
 
 # ─── Variables globales ────────────────────────────────────────────────────────
@@ -18,8 +18,7 @@ DNF_PACKAGES=(
 )
 DNF_REMOVE=(
     zram-generator-defaults PackageKit-glib PackageKit google-noto-sans-mono-cjk-vf-fonts akonadi-server kdeconnectd
-    libreswan plasma-drkonqi ibus imsettings imsettings-libs rpmfusion-nonfree-appstream-data rpmfusion-free-appstream-data
-    maliit-keyboard abrt plasma-discover
+    libreswan plasma-drkonqi ibus imsettings imsettings-libs maliit-keyboard abrt plasma-discover
 )
 FONTS=( jetbrainsmono-nerd-fonts iosevka-nerd-fonts )
 declare -A CARGO_PACKAGES=(
@@ -150,6 +149,7 @@ CHECK_SHELL() {
     [[ "${EUID}" -ne 0 ]]              || DIE "Ne pas lancer en root. Le script gère sudo lui-même."
     [[ -f /etc/fedora-release ]]       || DIE "Fedora uniquement."
 
+    sudo ls > /dev/null 2>&1
     RUN "Dépendances initiales" sudo dnf install -y curl git stow pciutils dnf-plugins-core
 
     local fedora_rel
@@ -190,19 +190,29 @@ ADD_REPOS() {
     fedora_ver=$(rpm -E '%fedora')
 
     if ! rpm -q rpmfusion-free-release &>/dev/null; then
-        RUN "RPM Fusion free (f${fedora_ver})" sudo dnf install -y "https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-${fedora_ver}.noarch.rpm"
+        RUN "RPM Fusion free (f${fedora_ver})" sudo dnf install -y https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-"${fedora_ver}".noarch.rpm
+        RUN "RPM Fusion free tainted (f${fedora_ver})" sudo dnf install -y rpmfusion-free-release-tainted
     else
         OK "RPM Fusion free déjà présent."
     fi
 
     if ! rpm -q rpmfusion-nonfree-release &>/dev/null; then
-        RUN "RPM Fusion nonfree (f${fedora_ver})" sudo dnf install -y "https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-${fedora_ver}.noarch.rpm"
+        RUN "RPM Fusion nonfree (f${fedora_ver})" sudo dnf install -y https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-"${fedora_ver}".noarch.rpm
+        RUN "RPM Fusion nonfree tainted (f${fedora_ver})" sudo dnf install rpmfusion-nonfree-release-tainted
     else
         OK "RPM Fusion nonfree déjà présent."
     fi
 
+    if rpm -q rpmfusion-free-appstream-data &>/dev/null; then
+        RUN "suppression métadonnées appstream free" sudo dnf remove -y rpmfusion-free-appstream-data
+    fi
+    if rpm -q rpmfusion-nonfree-appstream-data &>/dev/null; then
+        RUN "suppression métadonnées appstream nonfree" sudo dnf remove -y rpmfusion-nonfree-appstream-data
+    fi
+
     if ! rpm -q terra-release &>/dev/null; then
-        RUN "Terra (f${fedora_ver})" sudo dnf install -y "https://repos.fyralabs.com/terra${fedora_ver}/terra-release.rpm"
+        # shellcheck disable=SC2016
+        RUN "Terra (f${fedora_ver})" sudo dnf install -y --nogpgcheck --repofrompath 'terra,https://repos.fyralabs.com/terra$releasever' terra-release
     else
         OK "Terra déjà présent."
     fi
