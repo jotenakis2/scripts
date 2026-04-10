@@ -7,7 +7,7 @@
 # TODO : récup pid ligne courante pour kill ou renice ?
 ######################################################################################################################################
 set -euo pipefail
-readonly VER=0.998                                      # numéro de version du script
+readonly VER=0.999                                      # numéro de version du script
 readonly NAME="${0##*/}"                                # nom du script
 readonly MYPID="$$"                                     # pid du script, pour filtrer lui et les descendants.
 readonly DIR="${HOME}/.config/psim"                     # dossier de conf
@@ -26,11 +26,8 @@ MAIN(){
         trap CLEANUP INT TERM
         printf '\033[?25l\033[?1049h\033[H'
         while true; do
-            # on position le curseur en haut à gauche pour écraser affichage précédent (pas de clear pour éviter effet "flash")
-            printf '\033[H'
-            # on affiche les processus
+            printf '\033[H' # on position le curseur en haut à gauche
             DISPLAY_DYNAMIC
-            # si filtrage on ajoute les lignes vides requises
             if [[ -n "${FILTER}" ]]; then
                 # on récupère le nb de lignes affichées par awk
                 displayed_real=0
@@ -1082,6 +1079,7 @@ STATS() {
 DISPLAY_DYNAMIC() {
     local formatps
     WIDTH=${COLUMNS:-$(tput cols)} # tput en fallback
+    WIDTH=$((WIDTH - 2)) # -2 par sécurité.
     HEIGHT=${LINES:-$(tput lines)} # tput en fallback
     local NEED_TOTAL=$((OFFSET > 0 || TIPS_STATE >= 1 ? 1 : 0))
     [[ ${NEED_TOTAL} -eq 1 ]] && COUNT_PROCS
