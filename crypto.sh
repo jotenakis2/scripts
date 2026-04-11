@@ -39,7 +39,7 @@ API_BASE="https://api.coingecko.com/api/v3"
 
 # Demander le nombre de cryptos à afficher
 gum style --border rounded --padding "0 1" --border-foreground $BleuGum "Combien de cryptos afficher ?"
-NB_CRYPTOS=$(gum choose --cursor.foreground=$BleuGum --header.foreground=$BleuGum --show-help=false --header "Choix ?" "10" "20" "30" "40" "50")
+NB_CRYPTOS=$(gum choose --cursor.foreground=$BleuGum --header.foreground=$BleuGum --show-help=false --header "Choix ?" "10" "20" "30" "40" "50" "100" "200")
 
 if [ -z "$NB_CRYPTOS" ]; then
     echo "Annulé"
@@ -51,7 +51,8 @@ gum style --border double --padding "1 2" --border-foreground $VertGum --foregro
 # Récupération des données
 gum spin --spinner dot --title "Récupération des données..." -- sleep 0.5
 
-DATA=$(curl -s "${API_BASE}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=150&page=1&sparkline=false&price_change_percentage=1h,24h,7d,14d,30d,200d,1y")
+#DATA=$(curl -s "${API_BASE}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=150&page=1&sparkline=false&price_change_percentage=1h,24h,7d,14d,30d,200d,1y")
+DATA=$(curl -s "${API_BASE}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1&sparkline=false&price_change_percentage=1h,24h,7d,14d,30d,200d,1y")
 
 # En-tête du tableau avec séparateurs
 printf "\n"
@@ -101,12 +102,11 @@ make_link() {
 }
 
 # Filtrage complet : stablecoins USD, wrapped, staking, bridged, RWA tokens (mais on garde les stablecoins or)
-FILTER="usdt|usdc|usde|usd1|usdf|usdg|busd|dai|usdd|tusd|usdp|gusd|usds|pyusd|fdusd|frax|buidl|bnsol|rlusd|bfusd|^w[a-z]|^st[a-z]|^cb[a-z]|^r[a-z]eth|weeth|wbeth|^wbt|bsc-usd|^e[a-z]eth|^sa[a-z]|^aeth|figr|heloc|_usd|^susd|jitosol|^m$"
+FILTER="usdt|gho|jtrsy|eurcv|nusd|pc0000023|pc0000031|fdit|reusd|ustbl|apxusd|frxusd|币安人生|avusd|usd0|cash|pusd|usdc|usde|usd1|usdf|usdg|busd|dai|usdd|tusd|usdp|gusd|usds|pyusd|fdusd|frax|buidl|bnsol|rlusd|bfusd|^w[a-z]|^st[a-z]|^cb[a-z]|^r[a-z]eth|weeth|wbeth|^wbt|bsc-usd|^e[a-z]eth|^sa[a-z]|^aeth|figr|heloc|_usd|^susd|jitosol|^m$"
 
 # Traitement des données avec détection de doublons
 count=0
 declare -A seen_symbols
-
 echo "$DATA" | jq -r '.[] | [
     .market_cap_rank,
     .id,
