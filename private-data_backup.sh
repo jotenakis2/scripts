@@ -1,38 +1,25 @@
 #!/usr/bin/env bash
 # Usage : backup | restore
 set -euo pipefail
-SPIN_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-DATE=$(date +%Y%m%d_%H%M%S)
-LOG_DIR="${HOME}/.local/log"
-LOG_FILE="${LOG_DIR}/private-data_backup-${DATE}.log"
+
+# Dossier de stockage des sauvegardes
 NAS_MOUNT="/media/NAS/backup/data2restore"
-mkdir -p "${NAS_MOUNT}" "${LOG_DIR}"
 
 # dossiers à sauvegarder
-PROFILES=(
-   "FIREFOX"
-   "BRAVE"
-   "SSH"
-   "IPTVNATOR"
-   "SSHMANAGER"
-)
 declare -A SOURCES=(
    ["FIREFOX"]=".mozilla/firefox/"
    ["BRAVE"]=".config/BraveSoftware/Brave-Browser/"
+   ["HELIUM"]=".config/net.imput.helium/"
    ["SSH"]=".ssh/"
    ["IPTVNATOR"]=".config/iptvnator/"
    ["SSHMANAGER"]=".local/share/sshmanager"
 )
-declare -A TARGETS=(
-   ["FIREFOX"]="${NAS_MOUNT}/FIREFOX_${DATE}.tar.gz"
-   ["BRAVE"]="${NAS_MOUNT}/BRAVE_${DATE}.tar.gz"
-   ["SSH"]="${NAS_MOUNT}/SSH_${DATE}.tar.gz"
-   ["IPTVNATOR"]="${NAS_MOUNT}/IPTVNATOR_${DATE}.tar.gz"
-   ["SSHMANAGER"]="${NAS_MOUNT}/SSHMANAGER_${DATE}.tar.gz"
-)
+
+# binaire à surveiller avant la sauvegarde (par exemple pour les profils navigateurs il est recommandé de fermer le navigateur avant sauvegarde/restauration - si on met "" on ne surveille rien)
 declare -A COMMANDS=(
    ["FIREFOX"]="firefox"
    ["BRAVE"]="brave"
+   ["HELIUM"]="helium"
    ["SSH"]=""
    ["IPTVNATOR"]="iptvnator.bin"
    ["SSHMANAGER"]=""
@@ -54,24 +41,27 @@ fi
 
 backup() {
     local profil cmd source target 
-    for profil in "${PROFILES[@]}"; do
-		source=${SOURCES["${profil}"]}
-		target=${TARGETS["${profil}"]}
-		cmd=${COMMANDS["${profil}"]}
+    for profil in "${!SOURCES[@]}"; do
+        source=${SOURCES["${profil}"]}
+        target="${NAS_MOUNT}/${profil}_${DATE}.tar.gz"
+        cmd=${COMMANDS["${profil}"]:-}
 		if [[ -n "${cmd}" ]] && pgrep -x "${cmd}" >/dev/null; then
 			_ERR "Ferme ${cmd} d'abord."
 		else
 			_RUN "Sauvegarde du profil ${profil} en cours..." tar -cvzf "${target}" -C "${HOME}" "${source}"
 		fi
     done
+    echo
+    find "${NAS_MOUNT}" -maxdepth 1 -type f -printf '%f\t%s\n' | awk -F '\t' '{ printf "%s (%d Mo)\n", $1, ($2/1024/1024)+1.0 }' | sort | grep "${DATE}" | column -t
+
 }
 
 ####################################################################################################################
 
 restore() {
     local profil file
-    for profil in "${PROFILES[@]}"; do
-    	cmd=${COMMANDS["${profil}"]}
+    for profil in "${!SOURCES[@]}"; do
+    	cmd=${COMMANDS["${profil}"]:-}
 		file=$(find "${NAS_MOUNT}" -maxdepth 1 -name "${profil}_*.tar.gz" -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2- || true)
 		if [[ -n "${cmd}" ]] && pgrep -x "${cmd}" >/dev/null; then
 			_ERR "Ferme ${cmd} d'abord."
@@ -113,10 +103,44 @@ _RUN() {
     fi
 }
 ####################################################################################################################
+# shellcheck disable=SC2312
+show() {
+    local profil
+    local -i w=0
+
+    for profil in "${!SOURCES[@]}"; do
+        (( ${#profil} > w )) && w=${#profil}
+    done
+
+    printf '%-*s | %-40s | %s\n' \
+        "${w}" "Profil" \
+        "Dossier" \
+        "Binaire de contrôle"
+    printf '%-*s-+-%-40s-+-%s\n' \
+        "${w}" "$(printf '%*s' "${w}" '' | tr ' ' '-')" \
+        "$(printf '%*s' 40 '' | tr ' ' '-')" \
+        "$(printf '%*s' 20 '' | tr ' ' '-')"
+
+    for profil in "${!SOURCES[@]}"; do
+        printf '%-*s | %-40s | %s\n' \
+            "${w}" "${profil}" \
+            "${SOURCES[${profil}]}" \
+            "${COMMANDS[${profil}]:-}"
+    done
+    echo -e "\nContenu de la sauvegarde :"
+    find "${NAS_MOUNT}" -maxdepth 1 -type f -printf '%f\t%s\n' | awk -F '\t' '{ printf "%s (%d Mo)\n", $1, ($2/1024/1024)+1.0 }' | sort | column -t
+}
+####################################################################################################################
+SPIN_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+DATE=$(date +%Y%m%d_%H%M%S)
+LOG_DIR="${HOME}/.local/log"
+LOG_FILE="${LOG_DIR}/private-data_backup-${DATE}.log"
+mkdir -p "${NAS_MOUNT}" "${LOG_DIR}"
 
 case "${1:-}" in
-    backup)  backup  ;;
-    restore) restore ;;
-    *) echo "Usage: $0 backup|restore" ;;
+    backup)  echo "Log : ${LOG_FILE}"; backup  ;;
+    restore) echo "Log : ${LOG_FILE}"; restore ;;
+    show)    show ;;
+    *) echo "Usage: $0 backup|restore|show" ;;
 esac
 ####################################################################################################################
