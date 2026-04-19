@@ -13,6 +13,7 @@ declare -A SOURCES=(
    ["SSH"]=".ssh/"
    ["IPTVNATOR"]=".config/iptvnator/"
    ["SSHMANAGER"]=".local/share/sshmanager"
+   ["MSMTP"]=".config/msmtp"
 )
 
 # binaire à surveiller avant la sauvegarde (par exemple pour les profils navigateurs il est recommandé de fermer le navigateur avant sauvegarde/restauration - si on met "" on ne surveille rien)
@@ -23,6 +24,7 @@ declare -A COMMANDS=(
    ["SSH"]=""
    ["IPTVNATOR"]="iptvnator.bin"
    ["SSHMANAGER"]=""
+   ["MSMTP"]=""
 )
 
 
