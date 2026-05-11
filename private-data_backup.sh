@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Usage : ./private-data_backup.sh backup | restore | show 
-
+# Usage : ./private-data_backup.sh backup | restore [PROFIL] | delete_old | show 
 # Dossier de stockage des sauvegardes (par exemple un point de montage d'un NAS ou d'un disque externe)
 NAS_MOUNT="/media/NAS/backup/data2restore"
 
@@ -15,6 +14,8 @@ declare -A SOURCES=(
    ["MSMTP"]=".config/msmtp"
    ["IMAGES"]="Pictures"
    ["DOCUMENTS"]="Documents"
+   ["MOK"]="mok-cachyos"
+   ["DISCORD"]=".config/vesktop"
    # ajouter ici sur le modèle ["NOM-DU-PROFIL-DE-SAUVEGARDE"]="Dossier" où Dossier est un répertoire dans $HOME
 )
 
@@ -25,6 +26,7 @@ declare -A COMMANDS=(
    ["BRAVE"]="brave"
    ["HELIUM"]="helium"
    ["IPTVNATOR"]="iptvnator.bin"
+   ["DISCORD"]="vesktop"
    # ajouter ici sur le modèle ["NOM-DU-PROFIL-DE-SAUVEGARDE"]="nom-du-binaire"
 )
 
@@ -44,25 +46,131 @@ declare -A COMMANDS=(
 ####################################################################################################################
 ####################################################################################################################
 set -euo pipefail
-readonly SCRIPTNAME="${0##*/}"
-readonly VER=1.0
+VER=1.1
+SCRIPTNAME="${0##*/}"
+SCRIPTNAME="${SCRIPTNAME%.sh}"
+readonly VER SCRIPTNAME
 
-trap '_ERR "Interruption ligne ${LINENO}"; _DIE "Log : ${LOG_FILE}"' ERR
+trap '_CLEANUP' ERR
+trap '_INTERRUPT' INT
+trap '_DO_CLEAN' EXIT
 
-C_RESET='' C_RED='' C_GREEN=''
-if [[ -t 1 ]]; then
-    C_RESET='\e[0m'
-    C_RED='\e[1;31m'
-    C_GREEN='\e[1;32m'
-    C_YELLOW='\e[1;33m'
-    C_CYAN='\e[1;36m'
-fi
+
+
+
+########################################################################################################################
+# shellcheck disable=SC2034
+_ENABLE_COLORS() {
+    if [[ -t 1 ]] && command -v tput &>/dev/null && [[ -z "${NO_COLOR:-}" ]]; then
+        # texte
+        C_BLACK=$(tput setaf 0)
+        C_RED=$(tput setaf 1)
+        C_GREEN=$(tput setaf 2)
+        C_YELLOW=$(tput setaf 3)
+        C_BLUE=$(tput setaf 4)
+        C_MAGENTA=$(tput setaf 5)
+        C_CYAN=$(tput setaf 6)
+        C_WHITE=$(tput setaf 7)
+
+        # attribut
+        C_BOLD=$(tput bold)
+        C_DIM=$(tput dim)
+        C_RESET=$(tput sgr0)
+        C_UNDERLINE=$(tput smul)
+        C_RESET_UNDERLINE=$(tput rmul)
+
+        # background
+        BKGND_BLACK=$(tput setab 0)
+        BKGND_RED=$(tput setab 1)
+        BKGND_GREEN=$(tput setab 2)
+        BKGND_YELLOW=$(tput setab 3)
+        BKGND_BLUE=$(tput setab 4)
+        BKGND_MAGENTA=$(tput setab 5)
+        BKGND_CYAN=$(tput setab 6)
+        BKGND_WHITE=$(tput setab 7)
+    else
+        # texte
+        C_BLACK=''
+        C_RED=''
+        C_GREEN=''
+        C_YELLOW=''
+        C_BLUE=''
+        C_MAGENTA=''
+        C_CYAN=''
+        C_WHITE=''
+
+        # attribut
+        C_BOLD=''
+        C_DIM=''
+        C_RESET=''
+        C_UNDERLINE=''
+        C_RESET_UNDERLINE=''
+
+        # background
+        BKGND_BLACK=''
+        BKGND_RED=''
+        BKGND_GREEN=''
+        BKGND_YELLOW=''
+        BKGND_BLUE=''
+        BKGND_MAGENTA=''
+        BKGND_CYAN=''
+        BKGND_WHITE=''
+    fi
+    local vars=(
+        C_BLACK C_RED C_GREEN C_YELLOW C_BLUE C_MAGENTA C_CYAN C_WHITE
+        C_BOLD C_DIM C_RESET C_UNDERLINE C_RESET_UNDERLINE
+        BKGND_BLACK BKGND_RED BKGND_GREEN BKGND_YELLOW
+        BKGND_BLUE BKGND_MAGENTA BKGND_CYAN BKGND_WHITE
+    )
+    export "${vars[@]}"
+}
+
+########################################################################################################################
+
+_DO_CLEAN(){
+	echo ""
+	if [[ -e "${LOG_FILE}" ]]; then
+		echo "Log : ${LOG_FILE}"
+	fi
+}
+
+########################################################################################################################
+
+_DO_LOG(){
+    if [[ -s "${LOG_FILE:-}" ]]; then
+        _OK "Extrait du Log :"
+        echo "--------------------------------------------------------------------------"
+        tail -5 "${LOG_FILE:-}" 2>/dev/null
+        echo "--------------------------------------------------------------------------"
+        _DIE "Log complet : ${LOG_FILE:-}"
+    fi
+    echo -e "${C_RESET}"
+}
+
+########################################################################################################################
+
+_CLEANUP() {
+    echo -e "${C_BOLD}${C_RED} Plantage !${C_RESET}"
+    _DO_CLEAN
+    echo -e "${C_BOLD}${C_RED}"
+    _DO_LOG
+}
+
 
 ####################################################################################################################
 
 backup() {
-    local profil cmd source target 
+    local profil cmd source target selected
+    selected=${1:-}
     for profil in "${!SOURCES[@]}"; do
+    	if [[ -n "${selected}" ]]; then
+            selected="${selected^^}"
+            if [[ -z "${SOURCES["${selected}"]:-}" ]]; then
+                _DIE "Profil inconnu : ${selected}. Utilisez 'show' pour lister les profils."
+            else
+				if [[ "${profil}" != "${selected}" ]]; then continue ;fi
+			fi
+    	fi
         source=${SOURCES["${profil}"]}
         target="${NAS_MOUNT}/${profil}_${DATE}.tar.gz"
         cmd=${COMMANDS["${profil}"]:-}
@@ -174,7 +282,7 @@ delete_old() {
         # On garde le premier (le plus récent), on supprime les suivants
         echo "Profil ${profil} : "
         echo ""
-        echo -e "${C_GREEN}✓${C_RESET}Conservation de ${files[0]##*/}"
+        echo -e "${C_GREEN}✓ ${C_RESET}Conservation de ${files[0]##*/}"
         for file in "${files[@]:1}"; do
             _RUN "Suppression de ${file##*/}" rm -vf "${file}"
             (( deleted++ )) || true
@@ -256,17 +364,19 @@ _restore_one() {
 }
 
 ####################################################################################################################
+_ENABLE_COLORS
 SPIN_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-DATE=$(date +%Y%m%d_%H%M%S)
-LOG_DIR="${HOME}/.local/log"
-LOG_FILE="${LOG_DIR}/private-data_backup-${DATE}.log"
-mkdir -p "${NAS_MOUNT}" "${LOG_DIR}"
+DATE=$(date +%d_%m_%Y-%H.%M.%S)
+LOG_DIR="${HOME}/.local/share/${SCRIPTNAME}"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/${SCRIPTNAME}-${DATE}.log"
+mkdir -p "${NAS_MOUNT}"
 echo -e "\n${C_CYAN}${SCRIPTNAME}${C_RESET} ${C_YELLOW}v${VER}${C_RESET}\n"
 case "${1:-}" in
-    backup)      echo "Log : ${LOG_FILE}"; echo; backup ;;
-    restore)     echo "Log : ${LOG_FILE}"; echo; restore "${2:-}" ;;
-    delete_old)  echo "Log : ${LOG_FILE}"; echo; delete_old ;;
-    show)        show ;;
+    backup)      backup "${2:-}"  ;;
+    restore)     restore "${2:-}" ;;
+    delete_old)  delete_old       ;;
+    show)        show             ;;
     *)           echo -e "Usage :${C_GREEN} $0 backup | restore [PROFIL] | delete_old | show${C_RESET}" ;;
 esac
 ####################################################################################################################
