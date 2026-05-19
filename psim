@@ -169,7 +169,7 @@ AWKSIMPLE=$(cat <<'EOF'
              if (!showopts) sub(/^.*\//,"",cmd)                         # on supprime le chemin complet pour ne conserver que basename
           }
         # on tronque le champ cmd à 52 caractères fixes, alignés à gauche
-          cmd_padded=sprintf("%-52s",cmd)
+          cmd_padded=sprintf("%-60s",cmd)
         # on concatène les arguments de cmd dans 1 seule variable (opts)
           opts=""
           if(NF>8){ for(i=9;i<=NF;i++) opts=opts (i>9?" ":"") $i }
@@ -213,7 +213,7 @@ AWKSIMPLE=$(cat <<'EOF'
                     base_part = substr(cmd, RSTART+1)
                     cmd_col = GREY dir_part RESET YELLOW base_part RESET
                     # PAD fixe pour 52 cols VISIBLES (compense ANSI)
-                    cmd_col = cmd_col sprintf("%-*s", 52-length(base_part)-length(dir_part), " ")
+                    cmd_col = cmd_col sprintf("%-*s", 60-length(base_part)-length(dir_part), " ")
                 } else {
                     cmd_col = YELLOW cmd_padded RESET
                 }
@@ -332,7 +332,7 @@ AWKNOOB=$(cat <<'EOF'
               if (!showopts) sub(/^.*\//,"",cmd)
           }
         # on tronque le champ cmd à 52 caractères fixes, alignés à gauche
-          cmd_padded=sprintf("%-52s",cmd)
+          cmd_padded=sprintf("%-60s",cmd)
         # on concatène les arguments de cmd dans 1 seule variable (opts)
           opts=""
           if(NF>5){ for(i=6;i<=NF;i++) opts=opts (i>6?" ":"") $i }
@@ -371,7 +371,7 @@ AWKNOOB=$(cat <<'EOF'
                     base_part = substr(cmd, RSTART+1)
                     cmd_col = GREY dir_part RESET YELLOW base_part RESET
                     # PAD fixe pour 52 cols VISIBLES (compense ANSI)
-                    cmd_col = cmd_col sprintf("%-*s", 52-length(base_part)-length(dir_part), " ")
+                    cmd_col = cmd_col sprintf("%-*s", 60-length(base_part)-length(dir_part), " ")
                 } else {
                     cmd_col = YELLOW cmd_padded RESET
                 }
@@ -1079,7 +1079,7 @@ STATS() {
 DISPLAY_DYNAMIC() {
     local formatps
     WIDTH=${COLUMNS:-$(tput cols)} # tput en fallback
-    WIDTH=$((WIDTH - 2)) # -2 par sécurité.
+    WIDTH=$((WIDTH - 1)) # -2 par sécurité.
     HEIGHT=${LINES:-$(tput lines)} # tput en fallback
     local NEED_TOTAL=$((OFFSET > 0 || TIPS_STATE >= 1 ? 1 : 0))
     [[ ${NEED_TOTAL} -eq 1 ]] && COUNT_PROCS
