@@ -607,8 +607,8 @@ DISPLAY-TIPS(){ # Barre d'aide
         base_color="   ${cc}[c]${ResetFg}pu ${cm}[m]${ResetFg}em ${cp}[p]${ResetFg}id ${cP}[P]${ResetFg}pid ${cu}[u]${ResetFg}ser ${cC}[C]${ResetFg}md ${co}[o]${ResetFg} ${ck}[k]${ResetFg} ${ch}[h]${ResetFg} ${cf}[f]${ResetFg} ${BleuBold}[ ] [q]${ResetFg}uit ${BleuBold}[+/-]${ResetFg} ${CF}[F]${ResetFg}   ${intcolor}${scroll_info}${ResetFg}"
     else
         [[ ${INTERVAL} -ge ${SEUILFREEZE} ]] && { intcolor="${Vert}FREEZE${Gris}"; int="FREEZE"; }
-        base_plain="  [c]pu | [m]em | [p]id | [P]pid | [u]ser | [C]md | [o]ptions | [k]ernel | [h]eader | [f]ooter | [ ]mode | [↓↑]scroll | [q]uit | [+/-]refresh | [F]reeze   ${int}${scroll_info}"
-        base_color="   ${cc}[c]${ResetFg}pu | ${cm}[m]${ResetFg}em | ${cp}[p]${ResetFg}id | ${cP}[P]${ResetFg}pid | ${cu}[u]${ResetFg}ser | ${cC}[C]${ResetFg}md | ${co}[o]${ResetFg}ptions | ${ck}[k]${ResetFg}ernel | ${ch}[h]${ResetFg}eader | ${cf}[f]${ResetFg}ooter | ${BleuBold}[ ]${ResetFg}mode | ${BleuBold}[↓↑]${ResetFg}scroll | ${BleuBold}[q]${ResetFg}uit | ${BleuBold}[+/-]${ResetFg}refresh | ${CF}[F]${ResetFg}reeze   ${intcolor}${scroll_info}${ResetFg}"
+        base_plain="  [c]pu | [m]em | [p]id | [P]pid | [u]ser | [C]md | [o]ptions | [k]ernel | [h]eader | [f]ooter | [ ]mode | [↕ ]scroll | [q]uit | [+/-]refresh | [F]reeze   ${int}${scroll_info}"
+        base_color="   ${cc}[c]${ResetFg}pu | ${cm}[m]${ResetFg}em | ${cp}[p]${ResetFg}id | ${cP}[P]${ResetFg}pid | ${cu}[u]${ResetFg}ser | ${cC}[C]${ResetFg}md | ${co}[o]${ResetFg}ptions | ${ck}[k]${ResetFg}ernel | ${ch}[h]${ResetFg}eader | ${cf}[f]${ResetFg}ooter | ${BleuBold}[ ]${ResetFg}mode | ${BleuBold}[↕ ]${ResetFg}scroll | ${BleuBold}[q]${ResetFg}uit | ${BleuBold}[+/-]${ResetFg}refresh | ${CF}[F]${ResetFg}reeze   ${intcolor}${scroll_info}${ResetFg}"
     fi
 
     # on calcule la place restante pour afficher le FILTRE en croppant le moins possible
