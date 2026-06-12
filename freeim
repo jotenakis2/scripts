@@ -23,20 +23,20 @@ cols=110                # largeur par défaut
 # fonction principale
 main() {
     gestion-options "$@"
-    [[ ${NOCOLOR} == true ]] && NO_COLOR="yes" || NO_COLOR=""
+    [[ ${NOCOLOR} = true ]] && NO_COLOR="yes" || NO_COLOR=""
     _ENABLE_COLORS
-    [[ ${HELP} == true ]] && help
-    [[ ${VER} == true ]] && ver
+    [[ ${HELP} = true ]] && help
+    [[ ${VER} = true ]] && ver
     { ${HELP} || ${VER}; } && exit 0
     check_dependance
     detect_swap
     compute_meminfo
-    [[ ${FREE} == true ]] && display_as_free
+    [[ ${FREE} = true ]] && display_as_free
     display_RAM
     if [[ -n "${swap_devices}" ]]; then
         display_SWAP
     else
-        if [[ ${SIMPLE} == false ]] && [[ ${NOEXPLAIN} == false ]]; then
+        if [[ ${SIMPLE} = false ]] && [[ ${NOEXPLAIN} = false ]]; then
             echo -e "\n${C_CYAN}Note\n  ${C_GREEN}${name} n'a pas détecté d'espace d'échange (swap).${Reset}"
         fi
     fi
@@ -45,17 +45,6 @@ main() {
 ###########################################################################################################################################################
 
 #------------------------------------------------------------FONCTIONS-------------------------------------------------------------------------------------
-# define_colors() {
-#     Rouge=$'\033[0;31m'
-#     #Noir=$'\033[0;30m'
-#     Vert=$'\033[0;32m'
-#     Jaune=$'\033[0;33m'
-#     Bleu=$'\033[0;34m'
-#     #Magenta=$'\033[0;35m'
-#     Cyan=$'\033[0;36m'
-#     Reset=$'\033[0m'
-#     return 0
-# }
 # shellcheck disable=SC2034
 _ENABLE_COLORS() {
     if [[ -t 1 ]] && command -v tput &>/dev/null && [[ -z "${NO_COLOR:-}" ]]; then
