@@ -3,14 +3,25 @@
 # mise à jour de iptvnator appimage
 
 set -euo pipefail
-RESET="\033[0m"
-RED="\033[1;31m"
-YELLOW="\033[1;33m"
-BLUE="\033[1;34m"
-GREEN="\033[1;32m"
+if [[ -t 1 ]]; then
+	RESET="\033[0m"
+	RED="\033[1;31m"
+	YELLOW="\033[1;33m"
+	BLUE="\033[1;34m"
+	GREEN="\033[1;32m"
+else
+	RESET=""
+	RED=""
+	YELLOW=""
+	BLUE=""
+	GREEN=""
+fi
+
 APPIMAGES_DIR="$HOME/AppImages"
 
-clear
+if [[ -t 1 ]]; then
+	clear
+fi
 echo
 echo -e "$YELLOW>>> Script de mise à jour de IPTVnator <<<$RESET"
 echo
