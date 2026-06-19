@@ -229,7 +229,8 @@ display(){
 ########################################################################################################
 
 #--- début GPU
-gpu=$(cat "${GPUpath}")
+gpu=''
+[[ -f "${GPUpath}" ]] && gpu=$(cat "${GPUpath}")
 
 #--- début Cpu
 # méthode basée sur calcul kernel /proc/stat à 2 instants
