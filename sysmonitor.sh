@@ -2,6 +2,8 @@
 set -euo pipefail
 
 #-----------------------------------------------------------------------------
+#iFACE
+ipfilter="192.168"
 # GPU
 GPUpath="/sys/class/drm/card1/device/gpu_busy_percent"
 # filtre de la commande sensors, pour affichage d une température
@@ -16,7 +18,7 @@ seuilcpu=90    # %
 seuilgpu=90    # %
 seuilmem=90    # %
 seuilswap=80   # %
-seuilload=50  # %
+seuilload=50   # %
 seuilnet=1024  # ko/s
 seuilsensor=70 #°C
 seuilbatt=10   # %
@@ -33,18 +35,19 @@ seuilbatt=10   # %
 #-------------------------------------------------------
 # shellcheck disable=SC2034
 define_default_colors(){
-	Noir="\033[0;30m"
-	Rouge="\033[0;31m"
-	Vert="\033[0;32m"
-	Jaune="\033[0;33m"
-	Bleu="\033[0;34m"
-	Violet="\033[0;35m"
-	Cyan="\033[0;36m"
-	Blanc="\033[0;37m"
-	Gris="\033[0;38m"
-	Reset="\033[0m"
-	#
-	#iconcolor="${Bleu}"
+	Noir= ; Rouge= ; Vert= ; Jaune= ; Bleu= ; Violet= ; Cyan= ; Blanc= ; Gris= ; Reset=
+	if [[ -z "${NO_COLOR:-}" ]]; then
+		Noir="\033[0;30m"
+		Rouge="\033[0;31m"
+		Vert="\033[0;32m"
+		Jaune="\033[0;33m"
+		Bleu="\033[0;34m"
+		Violet="\033[0;35m"
+		Cyan="\033[0;36m"
+		Blanc="\033[0;37m"
+		Gris="\033[0;38m"
+		Reset="\033[0m"
+	fi
 	return 0
 }
 
@@ -153,7 +156,7 @@ display(){
 	colorcpu="${Bleu}"
 	colorswap="${Bleu}"
 
-	# Formatage adaptatif du CPU
+	# Formatage adaptatif du CPU & couleur icône
 	if awk "BEGIN {exit !(${cpu} < 10)}"; then
 	    cpu=$(awk "BEGIN {printf \"%4.1f\", ${cpu}}")  # < 10% : 1 décimale
 	else
@@ -161,7 +164,7 @@ display(){
 	fi
 	awk "BEGIN {exit !(${cpu} >= ${seuilcpu})}" && colorcpu="${Rouge}"
 
-	# Formatage adaptatif du GPU
+	# Formatage adaptatif du GPU & couleur icône 
 	if awk "BEGIN {exit !(${gpu} < 10)}"; then
 	    gpu=$(awk "BEGIN {printf \"%4.1f\", ${gpu}}")  # < 10% : 1 décimale
 	else
@@ -169,23 +172,23 @@ display(){
 	fi
 	awk "BEGIN {exit !(${gpu} >= ${seuilgpu})}" && colorgpu="${Rouge}"
 
-	# Formatage adaptatif LOAD
+	# Formatage adaptatif LOAD & couleur icône
 	if awk "BEGIN {exit !(${load_pct} < 10)}"; then
 	   load_pct=$(awk "BEGIN {printf \"%4.1f\", ${load_pct}}")  # < 10% : 1 décimale
 	else
 	   load_pct=$(awk "BEGIN {printf \"%4.0f\", ${load_pct}}")  # >= 10% : 0 décimale
 	fi
+	awk "BEGIN {exit !(${load_pct} >= ${seuilload})}" && colorload="${Rouge}"
 
-	# Formatage adaptatif RAM
+	# Formatage adaptatif RAM & couleur icône
 	if awk "BEGIN {exit !(${mem_pct} < 10)}"; then
 	   mem_pct=$(awk "BEGIN {printf \"%4.1f\", ${mem_pct}}")  # < 10% : 1 décimale
 	else
 	   mem_pct=$(awk "BEGIN {printf \"%4.0f\", ${mem_pct}}")  # >= 10% : 0 décimale
 	fi
-
+	awk "BEGIN {exit !(${mem_pct} >= ${seuilmem})}" && colormem="${Rouge}"
 	
-	[[ "${load_pct}" -ge "${seuilload}" ]] && colorload="${Rouge}" 
-	[[ "${mem_pct}" -ge "${seuilmem}" ]] && colormem="${Rouge}"
+	# couleur icône
 	[[ "${tx}" -ge "${seuilnet}" ]] && colortx="${Rouge}"
 	[[ "${rx}" -ge "${seuilnet}" ]] && colorrx="${Rouge}"
 
@@ -239,8 +242,18 @@ pt=$((u+n+s+i+w+ir+si+st)); pi=$((i+w))
 
 
 #---Charge
-load=$(awk '{print $1}' /proc/loadavg) # charge 1 min
-load_pct=$(awk "BEGIN {printf \"%.0f\", (${load} / $(nproc)) * 100}") || true # charge 1min / nb de processeurs * 100
+load=$(awk '{print $1}' /proc/loadavg)
+
+# charge 1min / nb de processeurs * 100, arrondi à l'entier
+load_pct=$(awk -v ld="${load}" -v nproc="$(nproc)" '
+  BEGIN {
+    if (ld == "" || nproc == 0) {
+      print 0
+      exit
+    }
+    printf "%.0f\n", (ld / nproc) * 100
+  }
+') || true
 
 #---Memory & swap
 read -r mem_total mem_avail swap_total swap_avail < <(
@@ -255,21 +268,26 @@ swap_pct="na"
 [[ ${swap_total} -gt 0 ]] && swap_pct=$(( (swap_total - swap_avail) * 100 / swap_total ))
 
 #---Temperature
-sensor=$(sensors 2>/dev/null | grep "${FiltreSensor}" || true)
-sensor=$(echo "${sensor}" | grep -oP '\+\K[0-9]+' || true) # on filtre la sortie de sensors pour récupérer une température
-
+sensor=$(sensors | awk -v filtre="${FiltreSensor}" '
+  $0 ~ "^" filtre {
+    gsub(/[^0-9.]/, "", $2)
+    printf "%d\n", int($2 + 0.5)
+  }
+'
+)
 #---Réseau
-lan="$(ip route | awk '/^default/ {print $5}')" # on récupère l'interface de la route par défaut (wlan0, eth0, ...)
+lan=$(ip route | grep "${ipfilter}" | awk '/^default/ {print $5}') # on récupère l'interface de la route par défaut (wlan0, eth0, ...)
+
 if [[ -n "${lan}" ]]; then
     net_rx1=$(cat "/sys/class/net/${lan}/statistics/rx_bytes" || true)
     net_tx1=$(cat "/sys/class/net/${lan}/statistics/tx_bytes" || true)
-    sleep 0.5
+    sleep 1
     net_rx2=$(cat "/sys/class/net/${lan}/statistics/rx_bytes" || true)
     net_tx2=$(cat "/sys/class/net/${lan}/statistics/tx_bytes" || true)
-    rx=$(( (net_rx2 - net_rx1) * 2 / 1024 ))
-    tx=$(( (net_tx2 - net_tx1) * 2 / 1024 ))
+    rx=$(( (net_rx2 - net_rx1) / 1024 ))
+    tx=$(( (net_tx2 - net_tx1) / 1024 ))
 else
-	sleep 0.5
+	sleep 1
     rx=0
     tx=0
 fi

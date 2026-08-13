@@ -16,6 +16,6 @@ else
 	  'BEGIN {
 	  	oo1 = one / 12
 	    oo5 = five / 12
-	    printf "   1min: %4.1f (%3.0f%%)    5min: %4.1f (%3.0f%%)\n", one, oo1*100, five, oo5*100
+	    printf "󱇯  1min: %4.1f(%2.0f%%) 5min: %4.1f(%2.0f%%)\n", one, oo1*100, five, oo5*100
 	  }'
 fi

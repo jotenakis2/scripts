@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+#
+# Visualize CPU usage per-core and AVG on Linux.
+#
+# # Created
+# Author: Dave Eddy <ysap@daveeddy.com>
+# Date: January 13, 2026
+# License: MIT
+#
+# # Contributors
+# - Dave Eddy <ysap@daveeddy.com>
+# - jotenakis
+set -euo pipefail
+
+CURRENT=()
+PREVIOUS=()
+NUM_CPUS=()
+INTERVAL=1 # 1 second
+BAR_CHAR='⋮'
+
+main() {
+	AVG=$(nproc) # la clé AVG va stocker la valeur moyenne des core cpu
+	init
+	while true; do
+		update-term
+		copy-data
+	    read-proc
+	    visualize-data
+		manage-keys
+	done
+}
+
+#------------------------------------------------------------------------------------------------------------------------
+
+enable-color(){
+	if [[ -z ${NO_COLOR:-} ]]; then
+		COLOR1=$'\e[31m' # RED
+		COLOR2=$'\e[35m' # MAGENTA
+		COLOR3=$'\e[36m' # CYAN
+		COLOR4=$'\e[32m'
+		DIM=$'\e[2m'
+		BOLD=$'\e[1m'
+		RST=$'\e[0m'
+	else
+		COLOR1=
+		COLOR2=
+		COLOR3=
+		COLOR4=
+		BOLD=
+		DIM=
+		RST=
+	fi	
+}
+
+#------------------------------------------------------------------------------------------------------------------------
+
+manage-keys(){
+	local keypressed
+	printf '\e[H' # move the cursor home
+	if read -rt "${INTERVAL}" -n 1 keypressed 2>/dev/null; then
+		case "${keypressed}" in
+			q|Q|e|E)	cleanup 
+						;;
+			+) 			((INTERVAL < 60)) && ((INTERVAL++)) || true
+			   			;;
+			-) 			((INTERVAL > 1)) && ((INTERVAL--)) || true
+			   			;;
+		    *) 			;;
+		esac
+	fi	
+}
+
+#------------------------------------------------------------------------------------------------------------------------
+
+copy-data() {
+	PREVIOUS=()
+
+	local key value
+	for key in "${!CURRENT[@]}"; do
+		value=${CURRENT[${key}]}
+		PREVIOUS[key]=${value}
+	done
+}
+
+#------------------------------------------------------------------------------------------------------------------------
+
+read-proc() {
+	local key user nice system idle iowait
+	local irq softirq steal guest guest_nice
+	
+	CURRENT=()
+	for key in "${NUM_CPUS[@]}"; do
+		CURRENT[key]=
+	done
+
+	local busy value num
+	while read -r key user nice system idle iowait irq softirq steal guest guest_nice; do
+		# filter out everything but the cores
+		if [[ ${key} != cpu* ]]; then
+			continue
+		elif [[ ${key} == 'cpu' ]]; then # average value
+			num=${AVG}
+		else
+			num=${key#cpu}
+		fi
+		
+
+		busy=$((user + nice + system + irq + softirq + steal + guest + guest_nice))
+		idle=$((idle + iowait))
+
+		value="${busy} ${idle}"
+
+		CURRENT[num]=${value}
+	done < /proc/stat
+}
+
+#------------------------------------------------------------------------------------------------------------------------
+
+print-bar() {
+	local key=$1
+	local empty_char=' '
+
+	local busy1 idle1 busy2 idle2
+	read -r busy1 idle1 <<< "${PREVIOUS[${key}]}"
+	read -r busy2 idle2 <<< "${CURRENT[${key}]}"
+
+	# check for offline cpu
+	local usage online
+	if [[ -z ${busy1} || -z ${busy2} ]]; then
+		# offline CPU
+		usage=0
+		online=
+	else
+		# online CPU
+		local busy=$((busy2 - busy1))
+		local idle=$((idle2 - idle1))
+		local total=$((busy + idle))
+
+		usage=$((1000 * busy / total))
+		online=1
+	fi
+
+	local int=$((usage / 10))
+	local frac=$((usage % 10))
+	local perc=${int}.${frac}
+
+	local num_bars=$((usage * BAR_LENGTH / 1000))
+
+	local i
+	local s='['
+	for ((i = 0; i < num_bars; i++)); do
+		if [[ "${key}" = "${AVG}" ]]; then
+			s+=${BOLD}${COLOR4}${BAR_CHAR}${RST}
+		else
+			s+=${COLOR1}${BAR_CHAR}${RST}
+		fi
+	done
+	for ((i = num_bars; i < BAR_LENGTH; i++)); do
+		s+=${empty_char}
+	done
+	s+=']'
+
+	local state
+	if [[ -n ${online} ]]; then
+		printf -v perc '%-7s' "${perc}%"
+		state=${COLOR3}${perc}${RST}
+		if [[ "${key}" = "${AVG}" ]]; then
+			state=${BOLD}${COLOR4}${perc}${RST}	
+		fi
+	else
+		state=${DIM}offline${RST}
+	fi
+	
+	local str=''
+	if [[ "${key}" = "${AVG}" ]]; then
+		str="${BOLD}${COLOR4}AVG  "
+	elif [[ "${key}" -le 9 ]]; then
+		str="${COLOR2}cpu${key} "
+	else
+		str="${COLOR2}cpu${key}"
+	fi
+	echo "${s} ${str}${RST} ${state}"
+}
+
+#------------------------------------------------------------------------------------------------------------------------
+
+visualize-data() {
+	local ttime pttime plain left pad cpucore
+	pttime="$(date '+%T') (${INTERVAL}sec)"
+	ttime="${DIM}$(date '+%T')${RST} ${BOLD}(${INTERVAL}sec)${RST}"
+	plain="CPU Usage on ${HOSTNAME}"
+	left="${DIM}CPU Usage on ${RST}${BOLD}${COLOR3}${HOSTNAME}${RST}"
+	pad=$((COLUMNS - ${#pttime} - ${#plain}))
+
+	printf '\e[H' # move the cursor home
+	printf '%s%*s%s\n' "${left}" "${pad}" '' "${ttime}"
+	for cpucore in "${!CURRENT[@]}"; do
+		[[ "${cpucore}" = "${AVG}" ]] && echo ''
+		print-bar "${cpucore}"
+	done
+}
+
+#------------------------------------------------------------------------------------------------------------------------
+
+cleanup() {
+	printf '\e[?1049l' # disable alternate buffer
+	printf '\e[?25h' # show the cursor
+	exit 0
+}
+
+#------------------------------------------------------------------------------------------------------------------------
+
+update-term() {
+	COLUMNS="$(tput cols)"
+	COLUMNS=${COLUMNS:-80}
+	
+	# figure out how much buffer room is needed
+	local cpus=( "${!CURRENT[@]}" )
+	local highest_cpu=${cpus[-2]} #-1 c'est AVG, -2 c'est le dernier core
+
+	# [] + " cpu" + num + " offline"
+	local i=$((2 + 4 + ${#highest_cpu} + 8))
+	BAR_LENGTH=$((COLUMNS - i))
+	BAR_LENGTH=${BAR_LENGTH:-30}
+}
+
+#------------------------------------------------------------------------------------------------------------------------
+
+read-all-cpus() {
+	NUM_CPUS=(/sys/devices/system/cpu/cpu[0-9]*)
+	NUM_CPUS=("${NUM_CPUS[@]##*/cpu}" "${AVG}")
+}
+
+#------------------------------------------------------------------------------------------------------------------------
+
+init() {
+	enable-color
+	shopt -s checkwinsize
+	read-all-cpus
+	read-proc
+	sleep 0.2
+	trap cleanup EXIT
+	trap update-term WINCH
+	printf '\e[?1049h' # enable alternate buffer
+	printf '\e[?25l' # hide the cursor
+	printf '\e[H' # move the cursor home
+}
+
+#------------------------------------------------------------------------------------------------------------------------
+main "$@"

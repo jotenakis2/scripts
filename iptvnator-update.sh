@@ -48,4 +48,4 @@ else
 	echo -e "$YELLOW $RESET Dernière version déjà installée (${BLUE}${CURRENT}${RESET})."
 fi
 echo -en "$GREEN $RESET Symlink $BLUE" && ln -svf "$FILENAME" iptvnator && echo -e "$RESET"
-eza -l --no-user --no-permissions --no-filesize --color --icons "$APPIMAGES_DIR"
+/opt/cargo/bin/eza -l --no-user --no-permissions --no-filesize --color always --icons always "$APPIMAGES_DIR"

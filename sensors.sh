@@ -8,14 +8,13 @@ Magenta=$'\033[0;35m'
 Cyan=$'\033[0;36m'
 Reset=$'\033[0m'
 GPU='amdgpu-pci-0500' BAT='BAT0-acpi-0' WIFI='ath11k_hwmon-pci-0200'
-CPU='k10temp-pci-00c3' NVME='nvme-pci-0400' ACPI='acpitz-acpi-0'
+CPU='k10temp-pci-00c3' NVME='nvme-pci-0400'
 dir="${HOME}/.cache/sensors"
 GPUfile="${dir}/gpu" BATfile="${dir}/bat" WIFIfile="${dir}/wifi"
-CPUfile="${dir}/cpu" NVMEfile="${dir}/nvme" ACPIfile="${dir}/acpi"
+CPUfile="${dir}/cpu" NVMEfile="${dir}/nvme" 
 readonly Rouge Noir Vert Jaune Bleu Magenta Cyan Reset 
-readonly GPU CPU BAT WIFI ACPI NVME
-readonly dir
-readonly GPUfile CPUfile BATfile WIFIfile ACPIfile NVMEfile
+readonly GPU CPU BAT WIFI NVME dir
+readonly GPUfile CPUfile BATfile WIFIfile NVMEfile
 
 #-------------------------------------------------------------------------------------------------------------------------------------------------
 CLEANUP() {
@@ -43,8 +42,11 @@ printf '\033[?25l\033[?1049h\033[H\033[2J'
 
 trap CLEANUP INT TERM
 while true; do
-	sensors "${GPU}" > "${GPUfile}" ; sensors "${BAT}" > "${BATfile}" ; sensors "${WIFI}" > "${WIFIfile}"
-	sensors "${CPU}" > "${CPUfile}" ; sensors "${NVME}" > "${NVMEfile}" ; sensors "${ACPI}" > "${ACPIfile}"
+	sensors "${GPU}" > "${GPUfile}"
+	sensors "${BAT}" > "${BATfile}"
+	sensors "${WIFI}" > "${WIFIfile}"
+	sensors "${CPU}" > "${CPUfile}"
+	sensors "${NVME}" > "${NVMEfile}" 
 
 	echo -en "${Jaune}"
 	echo "╔════════════════════════════════╗"
@@ -56,19 +58,10 @@ while true; do
 	get_status "${cpu_temp}" " C"
 	gpu_temp=$(grep edge "${GPUfile}" | awk '{print $2}' || true)
 	get_status "${gpu_temp}" " G"
-	nvme_temp=$(grep Composite "${NVMEfile}" | head -1 | awk '{print $2}' || true)
+	nvme_temp=$(grep 'Sensor 2' "${NVMEfile}" | head -1 | awk '{print $3}' || true)
 	get_status "${nvme_temp}" "  "
 	wifi_temp=$(grep temp "${WIFIfile}" | awk '{print $2}' || true)
 	get_status "${wifi_temp}" "  "
-
-	echo ""
-	echo -e "${Bleu}Zones ACPI${Reset}"
-	grep -E 'temp[1-5]:' "${ACPIfile}" | while read -r line; do
-	    lbl=$(echo "${line}" | awk '{print $1}' | sed 's/\ //g' || true)
-	    val=$(echo "${line}" | awk '{print $2}' | sed 's/\ //g' || true)
-	    [[ -n "${val}" ]] && get_status "${val}" "${lbl#temp}"
-	done || true
-	echo ""
 	sleep 1
 	printf '\033[H' #\033[2J'
 done
