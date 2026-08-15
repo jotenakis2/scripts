@@ -5,26 +5,25 @@ NAS_MOUNT="/media/NAS/backup/data2restore"
 
 # dossiers à sauvegarder
 declare -A SOURCES=(
-   ["FIREFOX"]=".mozilla/firefox/"
-   ["BRAVE"]=".config/BraveSoftware/Brave-Browser/"
-   ["HELIUM"]=".config/net.imput.helium/"
-   ["SSH"]=".ssh/"
-   ["IPTVNATOR"]=".config/iptvnator/"
-   ["SSHMANAGER"]=".local/share/sshmanager"
+   ["HELIUM"]=".config/net.imput.helium"
+   ["LIBREWOLF"]=".config/librewolf"
+   ["SSH"]=".ssh"
+   ["IPTVNATOR"]=".iptvnator"
    ["MSMTP"]=".config/msmtp"
    ["IMAGES"]="Pictures"
    ["DOCUMENTS"]="Documents"
    ["MOK"]="mok-cachyos"
    ["DISCORD"]=".config/vesktop"
+   ["PROJECTS"]="Projects"
+   ["ZSH_HISTORY"]=".local/share/zsh/zsh_history"
    # ajouter ici sur le modèle ["NOM-DU-PROFIL-DE-SAUVEGARDE"]="Dossier" où Dossier est un répertoire dans $HOME
 )
 
 # binaire à surveiller avant la sauvegarde 
 # (par exemple pour les profils navigateurs il est recommandé de fermer le navigateur avant sauvegarde/restauration
 declare -A COMMANDS=(
-   ["FIREFOX"]="firefox" 			# ici grace à cette entrée si firefox est lancé, le script refusera de faire la sauvegarde et le signalera
-   ["BRAVE"]="brave"
    ["HELIUM"]="helium"
+   ["LIBREWOLF"]="librewolf"
    ["IPTVNATOR"]="iptvnator.bin"
    ["DISCORD"]="vesktop"
    # ajouter ici sur le modèle ["NOM-DU-PROFIL-DE-SAUVEGARDE"]="nom-du-binaire"
@@ -46,7 +45,7 @@ declare -A COMMANDS=(
 ####################################################################################################################
 ####################################################################################################################
 set -euo pipefail
-VER=1.1
+VER=1.2
 SCRIPTNAME="${0##*/}"
 SCRIPTNAME="${SCRIPTNAME%.sh}"
 readonly VER SCRIPTNAME
@@ -177,9 +176,23 @@ backup() {
 		if [[ -n "${cmd}" ]] && pgrep -x "${cmd}" >/dev/null; then
 			_ERR "Ferme ${cmd} d'abord."
 		else
+			local psdclosed=''
+			if [[ "${profil}" = "HELIUM" ]] || [[ "${profil}" = "LIBREWOLF" ]]; then
+			    if systemctl --user is-active --quiet psd.service; then
+			        if systemctl --user stop psd.service; then
+			        	sleep 2
+			            psdclosed='yes'
+			        fi
+			    fi
+			fi
 			_RUN "Sauvegarde du profil ${profil} en cours..." tar -cvzf "${target}" -C "${HOME}" "${source}"
 		fi
     done
+    if [[ "${psdclosed}" = 'yes' ]]; then
+		if ! systemctl --user is-active --quiet psd.service; then
+		    systemctl --user start psd.service &>/dev/null
+		fi
+    fi
     echo
     find "${NAS_MOUNT}" -maxdepth 1 -type f -printf '%f\t%s\n' | awk -F '\t' '{ printf "%s (%d Mo)\n", $1, ($2/1024/1024)+1.0 }' | sort | grep "${DATE}" | column -t
 
@@ -314,6 +327,7 @@ restore() {
     fi
 
     local -a profils
+    # shellcheck disable=SC2312
     mapfile -t profils < <(printf '%s\n' "${!SOURCES[@]}" | sort)
 
     printf "\n%bChoisissez un profil à restaurer :%b\n\n" "${C_CYAN}" "${C_RESET}"
