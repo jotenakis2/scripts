@@ -276,7 +276,7 @@ sensor=$(sensors | awk -v filtre="${FiltreSensor}" '
 '
 )
 #---Réseau
-lan=$(ip route | grep "${ipfilter}" | awk '/^default/ {print $5}') # on récupère l'interface de la route par défaut (wlan0, eth0, ...)
+lan=$(ip route | grep "${ipfilter}" | awk '/^default/ {print $5}' || true) # on récupère l'interface de la route par défaut (wlan0, eth0, ...)
 
 if [[ -n "${lan}" ]]; then
     net_rx1=$(cat "/sys/class/net/${lan}/statistics/rx_bytes" || true)

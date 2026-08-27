@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Usage : ./private-data_backup.sh backup | restore [PROFIL] | delete_old | show 
 # Dossier de stockage des sauvegardes (par exemple un point de montage d'un NAS ou d'un disque externe)
-NAS_MOUNT="/media/NAS/backup/data2restore"
+NAS="/media/NAS"
+if findmnt "${NAS}" &>/dev/null; then
+	NAS_MOUNT="${NAS}/backup/data2restore"
+else
+	echo "NAS non monté (${NAS} n'est pas un point de montage)"
+	exit 1
+fi
 
 # dossiers à sauvegarder
 declare -A SOURCES=(
@@ -159,8 +165,9 @@ _CLEANUP() {
 ####################################################################################################################
 
 backup() {
-    local profil cmd source target selected
+    local profil cmd source target selected cmd1 cmd2
     selected=${1:-}
+    local psdclosed=''
     for profil in "${!SOURCES[@]}"; do
     	if [[ -n "${selected}" ]]; then
             selected="${selected^^}"
@@ -176,22 +183,27 @@ backup() {
 		if [[ -n "${cmd}" ]] && pgrep -x "${cmd}" >/dev/null; then
 			_ERR "Ferme ${cmd} d'abord."
 		else
-			local psdclosed=''
 			if [[ "${profil}" = "HELIUM" ]] || [[ "${profil}" = "LIBREWOLF" ]]; then
 			    if systemctl --user is-active --quiet psd.service; then
-			        if systemctl --user stop psd.service; then
-			        	sleep 2
-			            psdclosed='yes'
-			        fi
+			    	cmd1=${COMMANDS["HELIUM"]:-}
+			    	cmd2=${COMMANDS["LIBREWOLF"]:-}
+			    	if ! pgrep -x "${cmd1}" >/dev/null && ! pgrep -x "${cmd2}" >/dev/null; then
+				        if systemctl --user stop psd.service; then
+				        	sleep 2
+				            psdclosed="yes"
+				            _RUN "Sauvegarde du profil ${profil} en cours..." tar -cvzf "${target}" -C "${HOME}" "${source}"			
+				        fi
+				    fi
+				else
+					_RUN "Sauvegarde du profil ${profil} en cours..." tar -cvzf "${target}" -C "${HOME}" "${source}"
 			    fi
+			else
+				_RUN "Sauvegarde du profil ${profil} en cours..." tar -cvzf "${target}" -C "${HOME}" "${source}"			
 			fi
-			_RUN "Sauvegarde du profil ${profil} en cours..." tar -cvzf "${target}" -C "${HOME}" "${source}"
 		fi
     done
-    if [[ "${psdclosed}" = 'yes' ]]; then
-		if ! systemctl --user is-active --quiet psd.service; then
-		    systemctl --user start psd.service &>/dev/null
-		fi
+    if [[ "${psdclosed}" = "yes" ]] && ! systemctl --user is-active --quiet psd.service; then
+		systemctl --user start psd.service
     fi
     echo
     find "${NAS_MOUNT}" -maxdepth 1 -type f -printf '%f\t%s\n' | awk -F '\t' '{ printf "%s (%d Mo)\n", $1, ($2/1024/1024)+1.0 }' | sort | grep "${DATE}" | column -t

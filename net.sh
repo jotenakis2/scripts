@@ -1,29 +1,37 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2312
+ipv4_regex='^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])$'
 
 # --- IP LAN (interface non-loopback) ---
-lan_ip="$(ip -4 route | awk '/default/ {print $5}' | head -1)"
-lan_addr="$(ip -4 addr show "$lan_ip" +brd 0.0.0.0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -1)"
-if [[ -z "${lan_addrs}" ]]; then
-  lan_addr="$(hostname -I | awk '{print $1}')"
-fi
+lan_addr="$(hostname -I)"
 
 # --- IP WAN (publique) ---
-wan_ip="$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null | head -1)"
-if [[ -z "$wan_ip" ]]; then
-  wan_ip="$(curl -s --max-time 2 ipinfo.io/ip 2>/dev/null | head -1)"
+wan_ip="$(dig -4 +short myip.opendns.com @resolver1.opendns.com 2>/dev/null | head -1)"
+if [[ -z "${wan_ip}" ]] || [[ ! ${wan_ip} =~ ${ipv4_regex} ]]; then
+	wan_ip="$(curl -4 ifconfig.co 2>/dev/null | head -1)"
 fi
-if [[ -z "$wan_ip" ]]; then
-  wan_ip="$(curl -s --max-time 2 ipecho.net/plain 2>/dev/null | head -1)"
+if [[ -z "${wan_ip}" ]] || [[ ! ${wan_ip} =~ ${ipv4_regex} ]]; then
+	wan_ip="$(curl -4 ifconfig.me 2>/dev/null | head -1)"
+fi
+if [[ ! ${wan_ip} =~ ${ipv4_regex} ]]; then
+	wan_ip=''
 fi
 
 # --- GATEWAY ---
-gateway="$(ip -4 route | awk '/default/ {print $3}' | head -1)"
+gateway="$(ip -4 route | awk '/^default/ {print $3}' | head -1)"
+if [[ -z "${gateway}" ]] || [[ ! ${gateway} =~ ${ipv4_regex} ]]; then
+	gateway=''
+fi
 
 # --- DNS (de /etc/resolv.conf) ---
 dns="$(resolvectl status | awk '/^  Current DNS Server:/ {print $4; exit}' | sed 's/#.*//')"
+if [[ -z "${dns}" ]] || [[ ! ${dns} =~ ${ipv4_regex} ]]; then
+	dns=''
+fi
 
-# --- Affichage aligné (champ fixe 15 chars) ---
-printf "%-10s %15s\n" "WAN :" "${wan_ip:-N/A}"
-printf "%-10s %15s\n" "LAN :" "${lan_addr:-N/A}"
-printf "%-10s %15s\n" "GATE:" "${gateway:-N/A}"
-printf "%-10s %15s\n" "DNS :" "${dns:-N/A}"
+
+# --- Affichage aligné 
+printf "%-5s %23s\n" "WAN :" "${wan_ip:-N/A}"
+printf "%-5s %24s\n" "LAN :" "${lan_addr:-N/A}"
+printf "%-5s %23s\n" "GATE:" "${gateway:-N/A}"
+printf "%-5s %23s\n" "DNS :" "${dns:-N/A}"
