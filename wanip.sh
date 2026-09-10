@@ -2,10 +2,16 @@
 # shellcheck disable=SC2312
 apikey='eb53c884836b49bdb81db609d425319f' # compte api.ipgeolocation.io
 max_age=900 # cache refresh every 15 min to limit api call
+timeout=1 # 1s timeout max for curl to retrieve data
 
 emoji=''
 wan_ip=''
 kernel=''
+Bleu="\033[0;34m"
+Reset="\033[0m"
+spaceafter="   "
+Rouge="\033[0;31m"
+
 ipv4_regex='^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])$'
 
 # curl & jq are required
@@ -17,11 +23,11 @@ fi
 # retrieve IP WAN - 3 methods
 command -v dig >/dev/null && wan_ip=$(dig -4 +short myip.opendns.com @resolver1.opendns.com 2>/dev/null | head -1)
 if [[ -z "${wan_ip}" ]] || [[ ! ${wan_ip} =~ ${ipv4_regex} ]]; then
-	wan_ip="$(curl -4 ifconfig.co 2>/dev/null | head -1)"
+	wan_ip=$(curl --connect-timeout "${timeout}" -4 ifconfig.co 2>/dev/null | head -1)
 	[[ -n "${wan_ip}" ]] && echo "${wan_ip} (ifconfig.co)" >> /tmp/method
 fi
 if [[ -z "${wan_ip}" ]] || [[ ! ${wan_ip} =~ ${ipv4_regex} ]]; then
-	wan_ip="$(curl -4 ifconfig.me 2>/dev/null | head -1)"
+	wan_ip=$(curl --connect-timeout "${timeout}" -4 ifconfig.me 2>/dev/null | head -1)
 	[[ -n "${wan_ip}" ]] && echo "${wan_ip} (ifconfig.me)" >> /tmp/method
 fi
 
@@ -31,7 +37,7 @@ if [[ ${wan_ip} =~ ${ipv4_regex} ]]; then
     
     if [[ ! -e "${file}" ]] || [[ $(($(date +%s) - $(stat -c %Y "${file}"))) -gt ${max_age} ]]; then
     	rm -f "${file}"
-        curl -sS "https://api.ipgeolocation.io/v3/ipgeo?apiKey=${apikey}" > "${file}" 2>/dev/null
+        curl --connect-timeout "${timeout}" -sS "https://api.ipgeolocation.io/v3/ipgeo?apiKey=${apikey}" > "${file}" 2>/dev/null
     fi
     
     # JSON is valid
@@ -57,7 +63,21 @@ else
 fi
 
 # kernel
+strkernel=''
 kernel=$(uname -r | awk -F ".fc" '{print $1}' || true)
+if [[ "${kernel}" = *cachyos* ]]; then
+	strkernel="${Bleu}${Reset} ${kernel}${spaceafter}"
+else
+	strkernel="${Rouge}${Reset} ${kernel:-?}${spaceafter}"
+fi
+
+# ip
+strIP=''
+if [[ -z "${wan_ip}" ]]; then
+	strIP="${Rouge}󰩟${Reset} ?"
+else
+	strIP="${Bleu}󰩟${Reset} ${wan_ip:-?} ${emoji:-}"
+fi
 
 # display
-echo -e " ${kernel:-?} 󰩟 ${wan_ip:-?}${emoji:-?}"
+echo -e "${strkernel}${strIP}"

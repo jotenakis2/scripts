@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-version="0.4"
+version="0.5"
 declare -ag pkg_url
 pkg_url=(
 			github.com/zi0p4tch0/radiogogo@latest
@@ -115,14 +115,14 @@ STOP-SPINNER() {
     fi
 }
 ###############################################################################################################
-UPDATE() {
+INSTALL() {
 	local pkg=$1
 	local msg=$2
 	if [[ -t 1 ]]; then
 		{ echo ">>> ${msg^} de ${pkg}" ; go install "${pkg}" ; echo ; }  &>>"${LOG}"
 	else
 		echo "${msg^} de ${pkg}"
-		go install "${pkg}"
+		go install "${pkg}" &>>"${LOG}"
 	fi
 }
 ###############################################################################################################
@@ -146,15 +146,17 @@ MAIN(){
 	echo "${C_YELLOW}"
 	{ trap STOP-SPINNER EXIT && START-SPINNER "${msg^}"; }
 	for pkg in "${pkg_url[@]}"; do
-		UPDATE "${pkg}" "${msg}"
+		INSTALL "${pkg}" "${msg}"
 	done
-	{ STOP-SPINNER && echo "${C_GREEN}terminée.${C_RESET}"; }
+	{ STOP-SPINNER && [[ -t 1 ]] && echo "${C_GREEN}terminée.${C_RESET}"; }
 
+	# shellcheck disable=SC2312
+    mapfile -t list < <(find "${GOBIN}" -maxdepth 1 -mindepth 1 -type f -printf '%f\n')
 	if [[ -n "${list[*]}" ]]; then
 		# symlink vers /usr/local/bin
 		local link
 		for link in "${list[@]}"; do
-			ln -sf "${GOBIN}/${link}" /usr/local/bin/"${link}"
+			ln -svf "${GOBIN}/${link}" /usr/local/bin/"${link}" >>"${LOG}"
 		done
 
 		# listing
@@ -163,26 +165,33 @@ MAIN(){
 		if [[ -t 1 ]]; then
 		    EZA_OPTS+=(--color-scale all --color always)
 		fi
+		local view
+		view="ls -l"
+		command -v eza &>/dev/null && view="eza ${EZA_OPTS[*]}"
 		for link in "${list[@]}"; do
-			eza "${EZA_OPTS[@]}" /usr/local/bin/"${link}"
+			${view} /usr/local/bin/"${link}"
 		done
 	else
-		echo "${C_RED} /!\ Relancer le script pour regénérer les liens symboliques dans /usr/local/bin /!\ ${C_RESET}"
+		echo "${C_RED} /!\ Problème : aucun binaire détecté dans ${GOBIN} /!\ ${C_RESET}"
+		exit 1
 	fi
 	echo
-	echo "Log : ${LOG}"
+	[[ "${LOG}" = "/dev/null" ]] || echo "Log : ${LOG}"
 	date
 }
 
 ###############################################################################################################
 GO_UPDATE() {
 	local current latest arch os gofile urlGO
-	urlGO="https://go.dev/dl/?mode=json"
-	current=$(go version 2>/dev/null | awk '{print $3}') || true
-    latest=$(curl -fsSL "${urlGO}" | jq -r '.[0].version') || true
-    arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') || true
-    os=$(uname | tr '[:upper:]' '[:lower:]') || true
-    gofile="${latest}.${os}-${arch}.tar.gz"
+	echo -n "${C_YELLOW}"
+    { trap STOP-SPINNER EXIT && START-SPINNER "Vérification de la version de la toolchain GO"; }
+		urlGO="https://go.dev/dl/?mode=json"
+		current=$(go version 2>/dev/null | awk '{print $3}') || true
+	    latest=$(curl -fsSL "${urlGO}" | jq -r '.[0].version') || true
+	    arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') || true
+	    os=$(uname | tr '[:upper:]' '[:lower:]') || true
+	    gofile="${latest}.${os}-${arch}.tar.gz"
+	{ STOP-SPINNER && [[ -t 1 ]] && echo "${C_GREEN}terminée.${C_RESET}"; }   	
 
     if [[ "${current}" = "${latest}" ]]; then
         echo "${C_GREEN}La toolchain GO est à jour (${latest})${C_RESET}"
@@ -193,17 +202,18 @@ GO_UPDATE() {
     	echo ">>> Installation de la toolchain GO" >>"${LOG}"
     	{ trap STOP-SPINNER EXIT && START-SPINNER "Téléchargement de la toolchain GO"; }
         	curl -LO "https://go.dev/dl/${gofile}" &>>"${LOG}"
-    	{ STOP-SPINNER && echo "${C_GREEN}terminé.${C_RESET}"; }   	
+    	{ STOP-SPINNER && [[ -t 1 ]] && echo "${C_GREEN}terminé.${C_RESET}"; }   	
     	echo >>"${LOG}"
         local dest
         dest=$(dirname "${GOROOT}")
         if [[ -f "${gofile}" ]]; then
-            tar -C "${dest}" -xzf "${gofile}"
-            rm -f -- "${gofile}"
+            tar -C "${dest}" -xvzf "${gofile}" &>>"${LOG}" 
+            { rm -vf -- "${gofile}" ; echo ; } >>"${LOG}"
             echo
         else
             echo "${C_RED}Échec du Téléchargement de la toolchain GO${C_RESET}"
             echo "Échec du Téléchargement de la toolchain GO" >>"${LOG}"
+            exit 1
         fi
     fi
 }
@@ -211,21 +221,24 @@ GO_UPDATE() {
 ################################################################################################################
 INIT(){
 	local suffix logdir
-	suffix=$(date +%d_%m_%Y-%H.%M.%S)
-	logdir="${HOME}/.local/log" 
-	
+	 
 	export GOROOT=/opt/go
 	export GOPATH=/opt/go/workspace
 	export GOBIN=/opt/go/workspace/bin
 	mkdir -p "${GOBIN}" 
-	#sudo chown -R "${USER}":"${USER}" "${GOROOT}"
-	mkdir -p "${logdir}"
 
-	LOG="${logdir}/go-${suffix}.log"
-	: > "${LOG}"
+	if [[ -t 1 ]]; then
+		suffix=$(date +%d_%m_%Y-%H.%M.%S)
+		logdir="${HOME}/.local/log" 
+		mkdir -p "${logdir}"
+		LOG="${logdir}/go-${suffix}.log"
+		: > "${LOG}"
+		clear
+	else
+		LOG="/dev/null"
+	fi	
 	
 	_ENABLE_COLORS
-	[[ -t 1 ]] && clear
 	date
 	echo
 	echo "${C_MAGENTA}>>>>>>>>>>  Script d'installation et de mise à jour des paquets GO (version ${version})  <<<<<<<<<<< ${C_RESET}"

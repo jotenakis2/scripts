@@ -11,15 +11,15 @@ FiltreSensor="Tctl:"
 # filtre pour chercher le device de la batterie
 FiltreBatt="batt"
 # mise en forme
-spaceafter=" "
+spaceafter="    "
 padd="%4s"
-padd2="%3s"
+padd2="%4s"
 seuilcpu=90    # %
 seuilgpu=90    # %
 seuilmem=90    # %
 seuilswap=80   # %
 seuilload=50   # %
-seuilnet=1024  # ko/s
+seuilnet=1000  # ko/s
 seuilsensor=70 #°C
 seuilbatt=10   # %
 #-----------------------------------------------------------------------------
@@ -53,7 +53,7 @@ define_default_colors(){
 
 #-------------------------------------------------------
 define_icons(){
-	cpu_icon="󰻠"
+	cpu_icon=""
 	gpu_icon=""
 	load_icon="󱇯"
 	mem_icon="󰑭"
@@ -136,10 +136,10 @@ battery(){
 #-------------------------------------------------------
 format_net_value(){
 	local value=$1
-	if [[ "${value}" -ge 1024 ]]; then
-		awk "BEGIN {printf \"%5.1fMo/s\", ${value} / 1024}"
+	if [[ "${value}" -ge 1000 ]]; then
+		awk "BEGIN {printf \"%4dMo/s\", ${value} / 1024}"
 	else
-		printf "%5dko/s" "${value}"
+		printf "%4dko/s" "${value}"
 	fi
 }
 
