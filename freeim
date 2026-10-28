@@ -6,7 +6,7 @@
 ###########################################################################################################################################################
 set -euo pipefail
 # init variables
-version=2.4             # numéro de version du script
+version=2.6             # numéro de version du script
 export LC_NUMERIC=C     # pour éviter pb de symbole de la décimale
 name="$(basename "$0")" # nom du script
 ZRAM_DETECTED=false     # gestion ZRAM
@@ -124,10 +124,11 @@ header_box() {
     shift
     local text="$*"
     local fg
-    case "${color}" in
-    red) fg=31 ;; green) fg=32 ;; yellow) fg=33 ;; blue) fg=34 ;;
-    magenta) fg=35 ;; cyan) fg=36 ;; white) fg=37 ;; *) fg=39 ;;
-    esac
+    fg=''
+	case "${color}" in
+	    red) fg=31 ;; green) fg=32 ;; yellow) fg=33 ;; blue) fg=34 ;;
+	    magenta) fg=35 ;; cyan) fg=36 ;; white) fg=37 ;; *) fg=39 ;;
+	esac
     local w=$((cols - 2))
     ((w < 1)) && return
     local len=${#text}
@@ -172,7 +173,7 @@ pad_right() {
 help() {
     local color=""
     [[ ${NOCOLOR} == false ]] && color="cyan"
-    header_box "${color}" "AIDE"
+    [[ -t 1 ]] && header_box "${color}" "AIDE" || echo ">>> AIDE <<<"
     echo -e "${C_BLUE}[Description]${Reset}"
     echo -e "${C_GREEN}=> ${name} calcule et affiche les données d'occupation de la mémoire virtuelle.${Reset}"
     echo ""
@@ -281,9 +282,9 @@ compute_meminfo() {
     done </proc/meminfo
 
     # stockage data RAM et calculs
-    mem_total=${mem[MemTotal]}
-    mem_avail=${mem[MemAvailable]}
-    mem_free=${mem[MemFree]}
+    mem_total=${mem[MemTotal]:-0}
+    mem_avail=${mem[MemAvailable]:-0}
+    mem_free=${mem[MemFree]:-0}
     mem_used=$((mem_total - mem_avail))
     temp=$(echo "scale=1; 100 * ${mem_used} / ${mem_total}" | bc)
     mem_used_pct=$(printf "%.1f" "${temp}")
@@ -291,17 +292,17 @@ compute_meminfo() {
     mem_free_pct=$(printf "%.1f" "${temp}")
     [[ "${mem_used_pct}" = "100.0" ]] && mem_used_pct="100."
     [[ "${mem_free_pct}" = "0.0" ]] && mem_free_pct="0.00"
-    buffers=${mem[Buffers]}
-    cached=${mem[Cached]}
-    anon=${mem[AnonPages]}
-    shmem=${mem[Shmem]}
-    dirty=${mem[Dirty]}
-    writeback=${mem[Writeback]}
-    hardwarecorrupted=${mem[HardwareCorrupted]}
+    buffers=${mem[Buffers]:-0}
+    cached=${mem[Cached]:-0}
+    anon=${mem[AnonPages]:-0}
+    shmem=${mem[Shmem]:-0}
+    dirty=${mem[Dirty]:-0}
+    writeback=${mem[Writeback]:-0}
+    hardwarecorrupted=${mem[HardwareCorrupted]:-0}
     # Mémoire kernel complète
-    slab=${mem[Slab]}
-    kernel_stack=${mem[KernelStack]}
-    page_tables=${mem[PageTables]}
+    slab=${mem[Slab]:-0}
+    kernel_stack=${mem[KernelStack]:-0}
+    page_tables=${mem[PageTables]:-0}
     vmalloc_used=${mem[VmallocUsed]:-0}
     percpu=${mem[Percpu]:-0}
     sreclaimable=${mem[SReclaimable]:-0}
@@ -310,9 +311,9 @@ compute_meminfo() {
     # stockage data SWAP et calculs
     zswap=${mem[Zswap]:-0}
     zswapped=${mem[Zswapped]:-0}
-    swap_total=${mem[SwapTotal]}
-    swap_free=${mem[SwapFree]}
-    swapcached=${mem[SwapCached]}
+    swap_total=${mem[SwapTotal]:-0}
+    swap_free=${mem[SwapFree]:-0}
+    swapcached=${mem[SwapCached]:-0}
     swap_used=$((swap_total - swap_free))
     if ((swap_total > 0)); then
         temp=$(echo "scale=1; (${swap_used} * 100.0) / ${swap_total}" | bc)
@@ -425,7 +426,7 @@ display_RAM_extended() {
 display_RAM() {
     local color="" pad1 pad2 pad3 pad4 c1 c2 c3 c4 d1 d2 d3 d4
     [[ ${NOCOLOR} == false ]] && color="cyan"
-    header_box "${color}" "Mémoire vive (RAM)"
+    [[ -t 1 ]] && header_box "${color}" "Mémoire vive (RAM)" || echo ">>> Mémoire vive (RAM) <<<"
     # construction
     pad1="Totale            "
     pad2="Utilisée          "
@@ -456,7 +457,7 @@ display_swap_comp() { # zram ou zswap
     # gestion multi swap
     for dev in ${swap_devices}; do
         temp=$(pad_right "${C_BLUE}${dev}${Reset}")
-        printf " Périphérique     : %s %s\n" "${temp}" "${explain_device}"
+        printf "  Périphérique    : %s %s\n" "${temp}" "${explain_device}"
     done
 
     # construction
@@ -469,23 +470,23 @@ display_swap_comp() { # zram ou zswap
     c4=$(format_size "${pool_used}")
     d4=$(pad_right "${c4}")
     # affichage
-    printf " Compression      : %s   %s\n" "${d1}" "${explain_comp}"
-    printf " Swap en cache    : %s   %s\n" "${d2}" "${explain_cached}"
-    printf " Pool ${back} max   : %s   %s\n" "${d3}" "${explain_pool}"
-    printf " Pool ${back}       : %s   %s\n" "${d4}" "${explain_used}"
+    printf "  Compression     : %s   %s\n" "${d1}" "${explain_comp}"
+    printf "  Swap en cache   : %s   %s\n" "${d2}" "${explain_cached}"
+    printf "  Pool ${back} max  : %s   %s\n" "${d3}" "${explain_pool}"
+    printf "  Pool ${back}      : %s   %s\n" "${d4}" "${explain_used}"
 
     # gestion ratio de compression
     if ((data > 0)); then
         c5=$(format_size "${data}")
         d5=$(pad_right "${c5}")
-        printf " Données ${back}    : %s   %s\n" "${d5}" "${explain_data}"
+        printf "  Données ${back}   : %s   %s\n" "${d5}" "${explain_data}"
         if ((pool_used > 0)); then
             local ratio
             d6=$(echo "scale=1; ${data} / ${pool_used}" | bc)
             ratio=$(printf "%.1f" "${d6}")
             c7="${C_BLUE}x${ratio}${Reset}"
             d7=$(pad_right "${c7}")
-            printf " Efficacité       : %s   %s\n" "${d7}" "${explain_ratio}"
+            printf "  Efficacité      : %s   %s\n" "${d7}" "${explain_ratio}"
         fi
     fi
     return 0
@@ -535,7 +536,7 @@ display_SWAP() {
     local color="" pad1 pad2 pad3 c1 c2 c3 d1 d2 d3
     echo ""
     [[ ${NOCOLOR} == false ]] && color="cyan"
-    header_box "${color}" "Espace d'échange (SWAP)"
+    [[ -t 1 ]] && header_box "${color}" "Espace d'échange (SWAP)" || echo ">>> Espace d'échange (SWAP) <<<"
     # construction
     pad1="Total             "
     pad2="Utilisé           "
@@ -591,13 +592,15 @@ display_as_free() {
     printf "%-6s%s%s%s%s%s%s\n" "Mem :" "${d1}" "${d2}" "${d3}" "${d4}" "${d5}" "${d6}"
 
     # Swap
-    c1=$(format_size "${swap_total}")
-    d1=$(pad_col "${c1}")
-    c2=$(format_size "${swap_used}")
-    d2=$(pad_col "${c2}")
-    c3=$(format_size "${swap_free}")
-    d3=$(pad_col "${c3}")
-    [[ "${c1}" == "0" ]] && printf "%-6s%s%s%s\n" "Swap:" "${d1}" "${d2}" "${d3}"
+    if [[ "${swap_total}" != "0" ]]; then 
+	    c1=$(format_size "${swap_total}")
+	    d1=$(pad_col "${c1}")
+	    c2=$(format_size "${swap_used}")
+	    d2=$(pad_col "${c2}")
+	    c3=$(format_size "${swap_free}")
+	    d3=$(pad_col "${c3}")
+	    printf "%-6s%s%s%s\n" "Swap:" "${d1}" "${d2}" "${d3}"
+	fi
     exit 0
 }
 #---------------------------------------------------------/ FONCTIONS--------------------------------------------------------------------------------------

@@ -156,7 +156,7 @@ MAIN(){
 		# symlink vers /usr/local/bin
 		local link
 		for link in "${list[@]}"; do
-			ln -svf "${GOBIN}/${link}" /usr/local/bin/"${link}" >>"${LOG}"
+			sudo ln -svf "${GOBIN}/${link}" /usr/local/bin/"${link}" >>"${LOG}"
 		done
 
 		# listing
@@ -222,9 +222,9 @@ GO_UPDATE() {
 INIT(){
 	local suffix logdir
 	 
-	export GOROOT=/opt/go
-	export GOPATH=/opt/go/workspace
-	export GOBIN=/opt/go/workspace/bin
+	export GOROOT="${HOME}/go"
+	export GOPATH="${HOME}/go/workspace"
+	export GOBIN="${HOME}/go/workspace/bin"
 	mkdir -p "${GOBIN}" 
 
 	if [[ -t 1 ]]; then

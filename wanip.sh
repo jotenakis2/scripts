@@ -62,13 +62,15 @@ else
     emoji=''
 fi
 
-# kernel
 strkernel=''
-kernel=$(uname -r | awk -F ".fc" '{print $1}' || true)
-if [[ "${kernel}" = *cachyos* ]]; then
-	strkernel="${Bleu}${Reset} ${kernel}${spaceafter}"
-else
-	strkernel="${Rouge}${Reset} ${kernel:-?}${spaceafter}"
+if [[ "${1:-}" = "-k" ]]; then
+	# kernel
+	kernel=$(uname -r | awk -F ".fc" '{print $1}' || true)
+	if [[ "${kernel}" = *cachyos* ]]; then
+		strkernel="${Bleu}${Reset} ${kernel}${spaceafter}"
+	else
+		strkernel="${Rouge}${Reset} ${kernel:-?}${spaceafter}"
+	fi
 fi
 
 # ip
