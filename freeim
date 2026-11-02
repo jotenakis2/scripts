@@ -14,7 +14,7 @@
 ##############################################################################
 set -euo pipefail
 
-readonly version="3.0"
+readonly version="3.0.1"
 readonly name="${0##*/}"
 export LC_NUMERIC=C
 
@@ -24,7 +24,7 @@ declare -i TTY=0 cols=110
 declare -i ZRAM_DETECTED=0 ZSWAP_DETECTED=0
 declare -i mem_total=0 mem_avail=0 mem_free=0 mem_used=0
 declare -i buffers=0 cached=0 anon=0 shmem=0 dirty=0 writeback=0 hardwarecorrupted=0
-declare -i kernel_mem=0 sreclaimable=0
+declare -i kernel_mem=0 sreclaimable=0 sunreclaim=0
 declare -i zswap=0 zswapped=0 swap_total=0 swap_free=0 swap_used=0 swapcached=0
 declare -i zram_size=0 zram_data=0 zram_used=0
 declare swap_devices="" comp_algo_zswap="" comp_algo_zram=""
@@ -257,7 +257,7 @@ parse_options() {
 compute_meminfo() {
     local -A mem=()
     local key value _ d10
-    local -i slab kernel_stack page_tables vmalloc_used percpu
+    local -i kernel_stack page_tables vmalloc_used percpu
 
     while IFS=': ' read -r key value _; do
         [[ -n "${key}" ]] && mem["${key%%[[:space:]]*}"]="${value%%[[:space:]]*}"
@@ -283,12 +283,14 @@ compute_meminfo() {
     writeback=${mem[Writeback]:-0}
     hardwarecorrupted=${mem[HardwareCorrupted]:-0}
     sreclaimable=${mem[SReclaimable]:-0}
-    slab=${mem[Slab]:-0}
+    sunreclaim=${mem[SUnreclaim]:-0}
     kernel_stack=${mem[KernelStack]:-0}
     page_tables=${mem[PageTables]:-0}
     vmalloc_used=${mem[VmallocUsed]:-0}
     percpu=${mem[Percpu]:-0}
-    kernel_mem=$(( slab + kernel_stack + page_tables + vmalloc_used + percpu ))
+    # Noyau = mémoire non récupérable (SUnreclaim) + piles + tables + vmalloc + percpu.
+    # SReclaimable est exclu : c'est du cache libérable (déjà du côté « Cache » de free).
+    kernel_mem=$(( sunreclaim + kernel_stack + page_tables + vmalloc_used + percpu ))
 
     zswap=${mem[Zswap]:-0}
     zswapped=${mem[Zswapped]:-0}
@@ -378,7 +380,7 @@ display_RAM_extended() {
         expl_cache="(mémoire utilisée pour mettre en cache les fichiers lus)"
         expl_anon="(mémoire utilisée par les processus/applications)"
         expl_shmem="(mémoire partagée, tmpfs et certains GPU intégrés)"
-        expl_kernel="(mémoire utilisée par le noyau Linux)"
+        expl_kernel="(mémoire non récupérable du noyau Linux)"
         expl_dirty="(mémoire en attente d'écriture sur les disques)"
         expl_writeback="(mémoire en cours d'écriture sur les disques)"
         expl_corrupted="(mémoire marquée comme corrompue par le noyau Linux)"
