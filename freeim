@@ -1,297 +1,280 @@
 #!/usr/bin/env bash
-###########################################################################################################################################################
-# script pour remplacer la commande free en utilisant /proc/meminfo (et données de /sys) avec une meilleure lisibilité et plus de détails.
-# LICENCE GPLv3
-# AUTHOR jotenakis
-###########################################################################################################################################################
+# shellcheck enable=all
+##############################################################################
+# freeim — remplacement lisible de « free », à partir de /proc/meminfo et /sys.
+#
+# Auteur original : jotenakis (GPLv3). Réécriture corrective 2026.
+#
+# Aucune dépendance externe : tout est calculé en bash (ni bc, ni sed, ni
+# grep, ni xargs, ni tput pour les couleurs). Les couleurs sont des séquences
+# ANSI directes, désactivées hors terminal, avec --nocolor ou NO_COLOR.
+#
+# Options : -h/--help  -v/--version  -s/--simple  -n/--nocolor  -f/--free
+#           -0/--noexplain  -m/--mib
+##############################################################################
 set -euo pipefail
-# init variables
-version=2.6             # numéro de version du script
-export LC_NUMERIC=C     # pour éviter pb de symbole de la décimale
-name="$(basename "$0")" # nom du script
-ZRAM_DETECTED=false     # gestion ZRAM
-ZSWAP_DETECTED=false    # gestion ZSWAP
-SIMPLE=false            # affichage simplifié
-HELP=false              # affichage aide
-VER=false               # affichage version
-NOEXPLAIN=false         # affichage sans explications
-FREE=false              # affichage comme la commande free
-NOCOLOR=false           # affichage non coloré
-FORCE_MIB=false         # affichage "tout en MiB"
-cols=110                # largeur par défaut
 
-# fonction principale
-main() {
-    gestion-options "$@"
-    [[ ${NOCOLOR} = true ]] && NO_COLOR="yes" || NO_COLOR=""
-    _ENABLE_COLORS
-    [[ ${HELP} = true ]] && help
-    [[ ${VER} = true ]] && ver
-    { ${HELP} || ${VER}; } && exit 0
-    check_dependance
-    detect_swap
-    compute_meminfo
-    [[ ${FREE} = true ]] && display_as_free
-    display_RAM
-    if [[ -n "${swap_devices}" ]]; then
-        display_SWAP
-    else
-        if [[ ${SIMPLE} = false ]] && [[ ${NOEXPLAIN} = false ]]; then
-            echo -e "\n${C_CYAN}Note\n  ${C_GREEN}${name} n'a pas détecté d'espace d'échange (swap).${Reset}"
-        fi
+readonly version="3.0"
+readonly name="${0##*/}"
+export LC_NUMERIC=C
+
+# État
+declare -i SIMPLE=0 HELP=0 VER=0 NOEXPLAIN=0 FREE=0 NOCOLOR=0 FORCE_MIB=0
+declare -i TTY=0 cols=110
+declare -i ZRAM_DETECTED=0 ZSWAP_DETECTED=0
+declare -i mem_total=0 mem_avail=0 mem_free=0 mem_used=0
+declare -i buffers=0 cached=0 anon=0 shmem=0 dirty=0 writeback=0 hardwarecorrupted=0
+declare -i kernel_mem=0 sreclaimable=0
+declare -i zswap=0 zswapped=0 swap_total=0 swap_free=0 swap_used=0 swapcached=0
+declare -i zram_size=0 zram_data=0 zram_used=0
+declare swap_devices="" comp_algo_zswap="" comp_algo_zram=""
+declare mem_used_pct="0.0" mem_free_pct="0.0" swap_used_pct="0.0" swap_free_pct="0.0"
+declare SZ="" SZ_C=""
+
+# Couleurs (vides par défaut = aucune séquence ANSI)
+C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_CYAN="" Reset=""
+
+##############################################################################
+# Utilitaires
+##############################################################################
+err() { printf 'Erreur : %s\n' "$*" >&2; }
+
+enable_colors() {
+    if (( TTY == 1 )) && (( NOCOLOR == 0 )) && [[ -z "${NO_COLOR:-}" ]] \
+        && [[ "${TERM:-dumb}" != "dumb" ]]; then
+        C_RED=$'\033[31m'
+        C_GREEN=$'\033[32m'
+        C_YELLOW=$'\033[33m'
+        C_BLUE=$'\033[34m'
+        C_CYAN=$'\033[36m'
+        Reset=$'\033[0m'
     fi
     return 0
 }
-###########################################################################################################################################################
 
-#------------------------------------------------------------FONCTIONS-------------------------------------------------------------------------------------
-# shellcheck disable=SC2034
-_ENABLE_COLORS() {
-    if [[ -t 1 ]] && command -v tput &>/dev/null && [[ -z "${NO_COLOR:-}" ]]; then
-        # texte
-        C_BLACK=$(tput setaf 0)
-        C_RED=$(tput setaf 1)
-        C_GREEN=$(tput setaf 2)
-        C_YELLOW=$(tput setaf 3)
-        C_BLUE=$(tput setaf 4)
-        C_MAGENTA=$(tput setaf 5)
-        C_CYAN=$(tput setaf 6)
-        C_WHITE=$(tput setaf 7)
+detect_cols() {
+    local c=""
+    if (( TTY == 1 )); then
+        c=$(tput cols 2>/dev/null || true)
+    fi
+    [[ "${c}" =~ ^[0-9]+$ ]] || c="${COLUMNS:-110}"
+    [[ "${c}" =~ ^[0-9]+$ ]] || c=110
+    (( c > 110 )) && c=110     # évite des cadres démesurés sur grand écran
+    (( c < 50 ))  && c=50      # plancher lisible
+    cols=$(( c - 1 ))          # marge de sécurité : pas de retour à la ligne
+    return 0
+}
 
-        # attribut
-        C_BOLD=$(tput bold)
-        C_DIM=$(tput dim)
-        Reset=$(tput sgr0)
-        C_UNDERLINE=$(tput smul)
-        C_RESET_UNDERLINE=$(tput rmul)
-
-        # background
-        BKGND_BLACK=$(tput setab 0)
-        BKGND_RED=$(tput setab 1)
-        BKGND_GREEN=$(tput setab 2)
-        BKGND_YELLOW=$(tput setab 3)
-        BKGND_BLUE=$(tput setab 4)
-        BKGND_MAGENTA=$(tput setab 5)
-        BKGND_CYAN=$(tput setab 6)
-        BKGND_WHITE=$(tput setab 7)
+# $1 = KiB -> renseigne SZ (texte) et SZ_C (couleur)
+size_fmt() {
+    local kb=$1 d
+    if (( FORCE_MIB == 1 )); then
+        SZ="$(( kb / 1024 )) MiB"
+        SZ_C="${C_YELLOW}"
+    elif (( kb >= 1048576 )); then
+        d=$(( kb * 10 / 1048576 ))
+        SZ="$(( d / 10 )).$(( d % 10 )) GiB"
+        SZ_C="${C_RED}"
+    elif (( kb >= 1024 )); then
+        SZ="$(( kb / 1024 )) MiB"
+        SZ_C="${C_YELLOW}"
     else
-        # texte
-        C_BLACK=''
-        C_RED=''
-        C_GREEN=''
-        C_YELLOW=''
-        C_BLUE=''
-        C_MAGENTA=''
-        C_CYAN=''
-        C_WHITE=''
-
-        # attribut
-        C_BOLD=''
-        C_DIM=''
-        Reset=''
-        C_UNDERLINE=''
-        C_RESET_UNDERLINE=''
-
-        # background
-        BKGND_BLACK=''
-        BKGND_RED=''
-        BKGND_GREEN=''
-        BKGND_YELLOW=''
-        BKGND_BLUE=''
-        BKGND_MAGENTA=''
-        BKGND_CYAN=''
-        BKGND_WHITE=''
+        SZ="${kb} KiB"
+        SZ_C="${C_GREEN}"
     fi
-    local vars=(
-        C_BLACK C_RED C_GREEN C_YELLOW C_BLUE C_MAGENTA C_CYAN C_WHITE
-        C_BOLD C_DIM Reset C_UNDERLINE C_RESET_UNDERLINE
-        BKGND_BLACK BKGND_RED BKGND_GREEN BKGND_YELLOW
-        BKGND_BLUE BKGND_MAGENTA BKGND_CYAN BKGND_WHITE
-    )
-    export "${vars[@]}"
+    return 0
 }
 
-#----------------------------------------------------------------------------------------------------------------------------------------------------------
-check_dependance() {
-    if ! command -v bc >/dev/null 2>&1; then
-        echo "/!\ Le paquet bc est requis, veuillez installer avant de relancer ${name}..."
-        exit 1
-    fi
+# $1 = dixièmes de pourcent -> renseigne PCT
+pct_fmt() {
+    local n=$1
+    PCT="$(( n / 10 )).$(( n % 10 ))"
 }
-#----------------------------------------------------------------------------------------------------------------------------------------------------------
-header_box() {
+
+# Cadre coloré (ou simple bandeau si la sortie n'est pas un terminal)
+title() {
     local color=$1
     shift
     local text="$*"
-    local fg
-    fg=''
-	case "${color}" in
-	    red) fg=31 ;; green) fg=32 ;; yellow) fg=33 ;; blue) fg=34 ;;
-	    magenta) fg=35 ;; cyan) fg=36 ;; white) fg=37 ;; *) fg=39 ;;
-	esac
-    local w=$((cols - 2))
-    ((w < 1)) && return
-    local len=${#text}
-    ((len > w)) && text=${text:0:w} && len=w
-    local padl=$(((w - len) / 2))
-    local padr=$((w - len - padl))
-
-    local TL=$'\xE2\x95\x94' TR=$'\xE2\x95\x97'
-    local BL=$'\xE2\x95\x9A' BR=$'\xE2\x95\x9D'
-    local H=$'\xE2\x95\x90' V=$'\xE2\x95\x91'
-    local hline
-    hline=$(printf '%*s' "${w}" '' | sed "s/ /${H}/g")
-
-    # Si NOCOLOR, pas de codes ANSI
-    if ${NOCOLOR}; then
-        printf '%s%s%s\n' "${TL}" "${hline}" "${TR}"
-        printf '%s%*s%s%*s%s\n' "${V}" "${padl}" '' "${text}" "${padr}" '' "${V}"
-        printf '%s%s%s\n' "${BL}" "${hline}" "${BR}"
-    else
-        printf '\033[%sm%s%s%s\033[0m\n' "${fg}" "${TL}" "${hline}" "${TR}"
-        printf '\033[%sm%s%*s%s%*s%s\033[0m\n' "${fg}" "${V}" "${padl}" '' "${text}" "${padr}" '' "${V}"
-        printf '\033[%sm%s%s%s\033[0m\n' "${fg}" "${BL}" "${hline}" "${BR}"
-    fi
-    return 0
-}
-#----------------------------------------------------------------------------------------------------------------------------------------------------------
-ver() {
-    echo -e "${C_GREEN}version ${C_BLUE}v${version}${Reset}"
-    [[ ${HELP} == false ]] && exit 0 || return 0
-}
-#----------------------------------------------------------------------------------------------------------------------------------------------------------
-pad_right() {
-    local colored width plain pad
-    colored="$1"
-    width=18
-    plain=$(echo "${colored}" | sed 's/\x1b\[[0-9;]*m//g' | xargs)
-    pad=$((width - ${#plain}))
-    printf '%*s%s' "${pad}" '' "${colored}"
-    return 0
-}
-#----------------------------------------------------------------------------------------------------------------------------------------------------------
-help() {
-    local color=""
-    [[ ${NOCOLOR} == false ]] && color="cyan"
-    [[ -t 1 ]] && header_box "${color}" "AIDE" || echo ">>> AIDE <<<"
-    echo -e "${C_BLUE}[Description]${Reset}"
-    echo -e "${C_GREEN}=> ${name} calcule et affiche les données d'occupation de la mémoire virtuelle.${Reset}"
-    echo ""
-    echo -e "${C_GREEN}=> ${name} n'utilise que les données disponibles dans /proc et /sys.${Reset}"
-    echo ""
-    echo -e "${C_GREEN}=> Les unités sont ajustées automatiquement avec un affichage coloré.${Reset}"
-    echo -e "   - GiB = Go = giga-octets (facteur 1024), en ${C_RED}rouge${Reset}."
-    echo -e "   - MiB = Mo = mega-octets (facteur 1024), en ${C_YELLOW}jaune${Reset}."
-    echo -e "   - KiB = Ko = kilo-octets (facteur 1024), en ${C_GREEN}vert${Reset}."
-    echo ""
-    echo -e "${C_BLUE}[Options]${Reset}"
-    echo -e "${C_YELLOW}  --simple,    -s, -S${Reset} : affichage concis.${Reset}"
-    echo -e "${C_YELLOW}  --nocolor,   -n, -N${Reset} : affichage non coloré.${Reset}"
-    echo -e "${C_YELLOW}  --free,      -f, -F${Reset} : affichage comme la commande free.${Reset}"
-    echo -e "${C_YELLOW}  --noexplain, -0    ${Reset} : affichage sans explication.${Reset}"
-    echo -e "${C_YELLOW}  --mib,       -m, -M${Reset} : affichage forcé en MiB.${Reset}"
-    echo -e "${C_YELLOW}  --help,      -h, -H${Reset} : affichage de l'aide.${Reset}"
-    echo -e "${C_YELLOW}  --version,   -v, -V${Reset} : affichage du numéro de version.${Reset}"
-    echo ""
-    echo -e "${C_BLUE}[Dépendance]${Reset}"
-    echo -e "${C_YELLOW}  bc${Reset}, outil de calcul."
-    echo ""
-    [[ ${VER} == false ]] && exit 0 || return 0
-}
-#----------------------------------------------------------------------------------------------------------------------------------------------------------
-gestion-options() {
-    local OPTIND=1 opt # Reset OPTIND pour réutilisable
-    while getopts "fFhHvVsSnN0nM-:help:mib:free:nocolor:noexplain:simple" opt; do
-        case ${opt} in
-        h | H) HELP=true ;;
-        v | V) VER=true ;;
-        s | S) SIMPLE=true ;;
-        f | F) FREE=true ;;
-        0) NOEXPLAIN=true ;;
-        n | N) NOCOLOR=true ;;
-        m | M) FORCE_MIB=true ;;
-        -) # Long option
-            case "${OPTARG}" in
-            help) HELP=true ;;
-            version) VER=true ;;
-            simple) SIMPLE=true ;;
-            noexplain) NOEXPLAIN=true ;;
-            free) FREE=true ;;
-            nocolor) NOCOLOR=true ;;
-            mib) FORCE_MIB=true ;;
-            *)
-                echo "erreur inattendue dans getopts" >&2
-                exit 1
-                ;;
-            esac
-            ;;
-        ?)
-            echo "erreur, option inconnue : ${opt}."
-            exit 1
-            ;; # Invalid
-        *)
-            echo "erreur inattendue dans getopts" >&2
-            exit 1
-            ;;
-        esac
-    done
-    shift $((OPTIND - 1))
-    [[ $# -gt 0 ]] && {
-        echo "erreur, option inconnue : $1" >&2
-        exit 1
-    } # Invalid
-    ${NOEXPLAIN} && cols=55
-    ${HELP} && cols=80
-    return 0
-}
-#----------------------------------------------------------------------------------------------------------------------------------------------------------
-format_size() {
-    local kb=$1 val cal
-    # Si flag -m activé, forcer MiB sans décimale
-    if ${FORCE_MIB}; then
-        val=$(echo "${kb}/1024" | bc)
-        printf "%b%d MiB%b" "${C_YELLOW}" "${val}" "${Reset}"
+    if (( TTY == 0 )); then
+        printf '>>> %s <<<\n' "${text}"
         return 0
     fi
-    # Auto : 1 décimale si GiB, 0 sinon
-    if ((kb >= 1048576)); then
-        cal=$(echo "scale=1; ${kb}/1048576" | bc)
-        val=$(printf "%.1f" "${cal}")
-        printf "%b%.1f GiB%b" "${C_RED}" "${val}" "${Reset}"
-    elif ((kb >= 1024)); then
-        val=$(echo "${kb}/1024" | bc)
-        printf "%b%d MiB%b" "${C_YELLOW}" "${val}" "${Reset}"
+    local fg=""
+    case "${color}" in
+        red) fg="${C_RED}" ;; green) fg="${C_GREEN}" ;; yellow) fg="${C_YELLOW}" ;;
+        blue) fg="${C_BLUE}" ;; cyan) fg="${C_CYAN}" ;; *) fg="" ;;
+    esac
+    local w=$(( cols - 2 ))
+    (( w < 10 )) && return 0
+    local len=${#text}
+    if (( len > w )); then
+        text="${text:0:w}"
+        len=${w}
+    fi
+    local padl padr
+    padl=$(( (w - len) / 2 ))
+    padr=$(( w - len - padl ))
+    local hline
+    printf -v hline '%*s' "${w}" ''
+    hline="${hline// /═}"
+    printf '%s╔%s╗%s\n' "${fg}" "${hline}" "${Reset}"
+    printf '%s║%*s%s%*s║%s\n' "${fg}" "${padl}" '' "${text}" "${padr}" '' "${Reset}"
+    printf '%s╚%s╝%s\n' "${fg}" "${hline}" "${Reset}"
+    return 0
+}
+
+# Ligne principale : "Label             :       15.0 GiB   40.5%"
+emit_main() {
+    local label=$1 kb=$2 pct=${3:-}
+    local pad lp
+    size_fmt "${kb}"
+    pad=$(( 18 - ${#SZ} ))
+    lp=$(( 18 - ${#label} ))
+    (( pad < 0 )) && pad=0
+    (( lp < 0 )) && lp=0
+    if [[ -n "${pct}" ]]; then
+        printf '%s%*s: %*s%s%s%s   %s%5s%%%s\n' \
+            "${label}" "${lp}" '' "${pad}" '' "${SZ_C}" "${SZ}" "${Reset}" "${C_BLUE}" "${pct}" "${Reset}"
     else
-        printf "%b%d KiB%b" "${C_GREEN}" "${kb}" "${Reset}"
+        printf '%s%*s: %*s%s%s%s\n' \
+            "${label}" "${lp}" '' "${pad}" '' "${SZ_C}" "${SZ}" "${Reset}"
     fi
     return 0
 }
 
-#----------------------------------------------------------------------------------------------------------------------------------------------------------
-compute_meminfo() {
-    local -A mem                                            # toutes les données de meminfo sont stockés dans ce tableau associatif local
-    local slab kernel_stack page_tables vmalloc_used percpu # pour calcul local de la mémoire kernel
-    declare -g mem_total mem_avail mem_free mem_used mem_used_pct mem_free_pct buffers cached anon shmem dirty writeback hardwarecorrupted kernel_mem
-    declare -g zswap zswapped swap_total swap_free swapcached swap_used swap_used_pct swap_free_pct
-    declare -g sreclaimable
-    local temp
+# Ligne de détail : "  Label           :     834 MiB   (explication)"
+emit_detail() {
+    local label=$1 kb=$2 expl=${3:-}
+    local pad lp
+    size_fmt "${kb}"
+    pad=$(( 18 - ${#SZ} ))
+    lp=$(( 16 - ${#label} ))
+    (( pad < 0 )) && pad=0
+    (( lp < 0 )) && lp=0
+    if [[ -n "${expl}" ]]; then
+        local room=$(( cols - 41 ))
+        if (( room < 12 )); then
+            expl=""
+        elif (( ${#expl} > room )); then
+            expl="${expl:0:$(( room - 1 ))}…"
+        fi
+    fi
+    if [[ -n "${expl}" ]]; then
+        printf '  %s%*s: %*s%s%s%s   %s\n' \
+            "${label}" "${lp}" '' "${pad}" '' "${SZ_C}" "${SZ}" "${Reset}" "${expl}"
+    else
+        printf '  %s%*s: %*s%s%s%s\n' \
+            "${label}" "${lp}" '' "${pad}" '' "${SZ_C}" "${SZ}" "${Reset}"
+    fi
+    return 0
+}
 
-    # parsing /proc/meminfo
+##############################################################################
+# Options
+##############################################################################
+show_version() {
+    printf '%sversion %s%s%s\n' "${C_GREEN}" "${C_BLUE}" "${version}" "${Reset}"
+    return 0
+}
+
+show_help() {
+    local saved_cols=${cols}
+    (( cols > 80 )) && cols=80
+    title cyan "AIDE"
+    cols=${saved_cols}
+    printf '%s[Description]%s\n' "${C_BLUE}" "${Reset}"
+    printf '%s=> %s calcule et affiche les données d'"'"'occupation de la mémoire virtuelle.%s\n\n' "${C_GREEN}" "${name}" "${Reset}"
+    printf '%s=> %s n'"'"'utilise que les données de /proc et /sys.%s\n\n' "${C_GREEN}" "${name}" "${Reset}"
+    printf '%s=> Les unités sont ajustées automatiquement avec un affichage coloré.%s\n' "${C_GREEN}" "${Reset}"
+    printf '   - GiB = Go = giga-octets (facteur 1024), en %srouge%s.\n' "${C_RED}" "${Reset}"
+    printf '   - MiB = Mo = mega-octets (facteur 1024), en %sjaune%s.\n' "${C_YELLOW}" "${Reset}"
+    printf '   - KiB = Ko = kilo-octets (facteur 1024), en %svert%s.\n\n' "${C_GREEN}" "${Reset}"
+    printf '%s[Options]%s\n' "${C_BLUE}" "${Reset}"
+    printf '%s  --simple,    -s, -S%s : affichage concis.\n' "${C_YELLOW}" "${Reset}"
+    printf '%s  --nocolor,   -n, -N%s : affichage non coloré (ou NO_COLOR).\n' "${C_YELLOW}" "${Reset}"
+    printf '%s  --free,      -f, -F%s : affichage comme la commande free.\n' "${C_YELLOW}" "${Reset}"
+    printf '%s  --noexplain, -0    %s : affichage sans explication.\n' "${C_YELLOW}" "${Reset}"
+    printf '%s  --mib,       -m, -M%s : affichage forcé en MiB.\n' "${C_YELLOW}" "${Reset}"
+    printf '%s  --help,      -h, -H%s : affichage de l'"'"'aide.\n' "${C_YELLOW}" "${Reset}"
+    printf '%s  --version,   -v, -V%s : affichage du numéro de version.\n\n' "${C_YELLOW}" "${Reset}"
+    printf '%s[Dépendance]%s\n' "${C_BLUE}" "${Reset}"
+    printf '  %saucune%s : tout est calculé en bash (ni bc, ni sed, ni grep).\n\n' "${C_GREEN}" "${Reset}"
+    return 0
+}
+
+parse_options() {
+    local opt
+    local OPTIND=1
+    while getopts ":fFhHvVsSnN0mM-:" opt; do
+        # '-' + ':' dans l'optstring : getopts renvoie '-' pour les options longues
+        # shellcheck disable=SC2214
+        case "${opt}" in
+            f|F) FREE=1 ;;
+            h|H) HELP=1 ;;
+            v|V) VER=1 ;;
+            s|S) SIMPLE=1 ;;
+            n|N) NOCOLOR=1 ;;
+            0)   NOEXPLAIN=1 ;;
+            m|M) FORCE_MIB=1 ;;
+            -)
+                case "${OPTARG}" in
+                    free)      FREE=1 ;;
+                    help)      HELP=1 ;;
+                    version)   VER=1 ;;
+                    simple)    SIMPLE=1 ;;
+                    nocolor)   NOCOLOR=1 ;;
+                    noexplain) NOEXPLAIN=1 ;;
+                    mib)       FORCE_MIB=1 ;;
+                    *) err "option inconnue : --${OPTARG}"; exit 1 ;;
+                esac
+                ;;
+            :)
+                err "l'option -${OPTARG} attend un argument"
+                exit 1
+                ;;
+            \?)
+                err "option inconnue : -${OPTARG}"
+                exit 1
+                ;;
+            *)
+                err "erreur inattendue dans getopts"
+                exit 1
+                ;;
+        esac
+    done
+    shift $(( OPTIND - 1 ))
+    if (( $# > 0 )); then
+        err "argument inattendu : $1"
+        exit 1
+    fi
+    return 0
+}
+
+##############################################################################
+# Lecture de /proc et /sys
+##############################################################################
+compute_meminfo() {
+    local -A mem=()
+    local key value _ d10
+    local -i slab kernel_stack page_tables vmalloc_used percpu
+
     while IFS=': ' read -r key value _; do
-        mem["${key%%[[:space:]]*}"]="${value%%[[:space:]]*}"
+        [[ -n "${key}" ]] && mem["${key%%[[:space:]]*}"]="${value%%[[:space:]]*}"
     done </proc/meminfo
 
-    # stockage data RAM et calculs
     mem_total=${mem[MemTotal]:-0}
     mem_avail=${mem[MemAvailable]:-0}
     mem_free=${mem[MemFree]:-0}
-    mem_used=$((mem_total - mem_avail))
-    temp=$(echo "scale=1; 100 * ${mem_used} / ${mem_total}" | bc)
-    mem_used_pct=$(printf "%.1f" "${temp}")
-    temp=$(echo "scale=1; 100 - ${mem_used_pct}" | bc)
-    mem_free_pct=$(printf "%.1f" "${temp}")
-    [[ "${mem_used_pct}" = "100.0" ]] && mem_used_pct="100."
-    [[ "${mem_free_pct}" = "0.0" ]] && mem_free_pct="0.00"
+    mem_used=$(( mem_total - mem_avail))
+    if (( mem_total > 0 )); then
+        d10=$(( mem_used * 1000 / mem_total ))
+    else
+        d10=0
+    fi
+    pct_fmt "${d10}"      ; mem_used_pct="${PCT}"
+    pct_fmt $(( 1000 - d10 )); mem_free_pct="${PCT}"
+
     buffers=${mem[Buffers]:-0}
     cached=${mem[Cached]:-0}
     anon=${mem[AnonPages]:-0}
@@ -299,312 +282,269 @@ compute_meminfo() {
     dirty=${mem[Dirty]:-0}
     writeback=${mem[Writeback]:-0}
     hardwarecorrupted=${mem[HardwareCorrupted]:-0}
-    # Mémoire kernel complète
+    sreclaimable=${mem[SReclaimable]:-0}
     slab=${mem[Slab]:-0}
     kernel_stack=${mem[KernelStack]:-0}
     page_tables=${mem[PageTables]:-0}
     vmalloc_used=${mem[VmallocUsed]:-0}
     percpu=${mem[Percpu]:-0}
-    sreclaimable=${mem[SReclaimable]:-0}
-    kernel_mem=$((slab + kernel_stack + page_tables + vmalloc_used + percpu))
+    kernel_mem=$(( slab + kernel_stack + page_tables + vmalloc_used + percpu ))
 
-    # stockage data SWAP et calculs
     zswap=${mem[Zswap]:-0}
     zswapped=${mem[Zswapped]:-0}
     swap_total=${mem[SwapTotal]:-0}
     swap_free=${mem[SwapFree]:-0}
     swapcached=${mem[SwapCached]:-0}
-    swap_used=$((swap_total - swap_free))
-    if ((swap_total > 0)); then
-        temp=$(echo "scale=1; (${swap_used} * 100.0) / ${swap_total}" | bc)
-        swap_used_pct=$(printf "%.1f" "${temp}")
-        temp=$(echo "scale=1; 100 - ${swap_used_pct}" | bc)
-        swap_free_pct=$(printf "%.1f" "${temp}")
-        [[ "${swap_used_pct}" = "100.0" ]] && swap_used_pct="100."
-        [[ "${swap_free_pct}" = "0.0" ]] && swap_free_pct="0.00"
-        [[ "${swap_used_pct}" = "0.0" ]] && swap_used_pct="0.00"
-        [[ "${swap_free_pct}" = "100.0" ]] && swap_free_pct="100."
+    swap_used=$(( swap_total - swap_free ))
+    if (( swap_total > 0 )); then
+        d10=$(( swap_used * 1000 / swap_total ))
+    else
+        d10=0
+    fi
+    pct_fmt "${d10}"      ; swap_used_pct="${PCT}"
+    pct_fmt $(( 1000 - d10 )); swap_free_pct="${PCT}"
+    return 0
+}
+
+# Extrait l'algorithme actif d'un fichier comp_algorithm : "lzo lz4 [lz4hc]"
+read_active_algo() {   # $1 = fichier -> stdout (peut être vide)
+    local line=""
+    [[ -r "$1" ]] || return 0
+    line=$(<"$1")
+    if [[ "${line}" =~ \[([^]]+)\] ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
     fi
     return 0
 }
-#----------------------------------------------------------------------------------------------------------------------------------------------------------
-detect_swap() { # detect swap, zswap et zram
-    declare -g swap_devices=""
-    declare -g zram_size comp_algo_zram comp_algo_zswap
-    declare -g zram_data zram_used
-    local syszram num_zram filename zswap_status
-    if [[ -f /proc/swaps ]]; then # on lit /proc/swaps
+
+detect_swap() {
+    local filename num syszram algo
+    local -i disksize=0 data=0 used=0
+    local -a algos=()
+
+    if [[ -r /proc/swaps ]]; then
         while read -r filename _ _ _ _; do
-            if [[ "${filename}" != "Filename" ]]; then # pour ignorer le header
-                if [[ "${filename}" == /dev/zram* ]]; then
-                    ZRAM_DETECTED=true
-                    num_zram=${filename##*zram} # on extrait 0 si /dev/zram0
-                    syszram="/sys/block/zram${num_zram}"
-                    zram_size=$(($(<"${syszram}/disksize") / 1024))
-                    read -r zram_data _ zram_used _ <"${syszram}/mm_stat"
-                    zram_data=$((zram_data / 1024))
-                    zram_used=$((zram_used / 1024))
-                    comp_algo_zram=$(grep -oP '\[\K[^\]]+' "/sys/block/zram${num_zram}/comp_algorithm")
+            [[ "${filename}" == "Filename" ]] && continue
+            [[ -n "${filename}" ]] || continue
+            swap_devices="${swap_devices:+${swap_devices} }${filename}"
+            if [[ "${filename}" == /dev/zram* ]]; then
+                ZRAM_DETECTED=1
+                num="${filename##*zram}"
+                syszram="/sys/block/zram${num}"
+                if [[ -r "${syszram}/disksize" ]]; then
+                    disksize=$(<"${syszram}/disksize")
+                    zram_size=$(( zram_size + disksize / 1024 ))
                 fi
-                swap_devices="${swap_devices:+${swap_devices} }${filename}"
+                if [[ -r "${syszram}/mm_stat" ]]; then
+                    read -r data _ used _ <"${syszram}/mm_stat" || true
+                    zram_data=$(( zram_data + data / 1024 ))
+                    zram_used=$(( zram_used + used / 1024 ))
+                fi
+                algo=$(read_active_algo "${syszram}/comp_algorithm")
+                [[ -n "${algo}" ]] && algos+=("${algo}")
             fi
         done </proc/swaps
     fi
-    # Detection zswap
-    if [[ -f /sys/module/zswap/parameters/enabled ]]; then
-        zswap_status=$(cat /sys/module/zswap/parameters/enabled 2>/dev/null || echo "N")
-        if [[ "${zswap_status}" = "Y" ]]; then
-            ZSWAP_DETECTED=true
-            comp_algo_zswap=$(</sys/module/zswap/parameters/compressor)
+    if (( ${#algos[@]} > 0 )); then
+        local a out=""
+        for a in "${algos[@]}"; do
+            [[ " ${out} " == *" ${a} "* ]] && continue
+            out="${out:+${out},}${a}"
+        done
+        comp_algo_zram="${out}"
+    fi
+
+    if [[ -r /sys/module/zswap/parameters/enabled ]]; then
+        if [[ "$(< /sys/module/zswap/parameters/enabled)" == "Y" ]]; then
+            ZSWAP_DETECTED=1
+            if [[ -r /sys/module/zswap/parameters/compressor ]]; then
+                comp_algo_zswap=$(< /sys/module/zswap/parameters/compressor)
+            fi
         fi
     fi
     return 0
 }
-#----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+##############################################################################
+# Affichage
+##############################################################################
 display_RAM_extended() {
-    local explain_buffer explain_cache explain_anon explain_shmem explain_kernel explain_dirty explain_writeback explain_corrupted
-    local pad1 pad2 pad3 pad4 pad5 pad6 pad7 pad8 c1 c2 c3 c4 c5 c6 c7 c8 d1 d2 d3 d4 d5 d6 d7 d8
-    echo ""
-    echo -e "${C_CYAN}Détails${Reset}"
-    if ${NOEXPLAIN}; then
-        explain_buffer=""
-        explain_cache=""
-        explain_anon=""
-        explain_shmem=""
-        explain_kernel=""
-        explain_dirty=""
-        explain_writeback=""
-        explain_corrupted=""
-    else
-        explain_buffer="(mémoire utilisée pour optimiser les entrées/sorties des disques)"
-        explain_cache="(mémoire utilisée pour mettre en cache les fichiers lus)"
-        explain_anon="(mémoire utilisée par les processus/applications)"
-        explain_shmem="(mémoire partagée, tmpfs et certains GPU intégrés)"
-        explain_kernel="(mémoire utilisée par le noyau Linux)"
-        explain_dirty="(mémoire en attente d'écriture sur les disques)"
-        explain_writeback="(mémoire en cours d'écriture sur les disques)"
-        explain_corrupted="(mémoire marquée comme corrompue par le noyau Linux)"
+    local expl_buffer="" expl_cache="" expl_anon="" expl_shmem=""
+    local expl_kernel="" expl_dirty="" expl_writeback="" expl_corrupted=""
+
+    printf '\n%sDétails%s\n' "${C_CYAN}" "${Reset}"
+    if (( NOEXPLAIN == 0 )); then
+        expl_buffer="(mémoire utilisée pour optimiser les entrées/sorties des disques)"
+        expl_cache="(mémoire utilisée pour mettre en cache les fichiers lus)"
+        expl_anon="(mémoire utilisée par les processus/applications)"
+        expl_shmem="(mémoire partagée, tmpfs et certains GPU intégrés)"
+        expl_kernel="(mémoire utilisée par le noyau Linux)"
+        expl_dirty="(mémoire en attente d'écriture sur les disques)"
+        expl_writeback="(mémoire en cours d'écriture sur les disques)"
+        expl_corrupted="(mémoire marquée comme corrompue par le noyau Linux)"
     fi
-    # construction
-    pad1="Tampons         "
-    pad2="Cache           "
-    pad3="Anonyme         "
-    pad4="Partagée        "
-    pad5="Noyau           "
-    pad6="Attente         "
-    pad7="Écriture        "
-    pad8="Corrompue       "
-    c1="$(format_size "${buffers}")"
-    d1=$(pad_right "${c1}")
-    c2="$(format_size "${cached}")"
-    d2=$(pad_right "${c2}")
-    c3="$(format_size "${anon}")"
-    d3=$(pad_right "${c3}")
-    c4="$(format_size "${shmem}")"
-    d4=$(pad_right "${c4}")
-    c5="$(format_size "${kernel_mem}")"
-    d5=$(pad_right "${c5}")
-    c6="$(format_size "${dirty}")"
-    d6=$(pad_right "${c6}")
-    c7="$(format_size "${writeback}")"
-    d7=$(pad_right "${c7}")
-    c8="$(format_size "${hardwarecorrupted}")"
-    d8=$(pad_right "${c8}")
-    # affichage
-    printf "  %s: %s   %s\n" "${pad1}" "${d1}" "${explain_buffer}"
-    printf "  %s: %s   %s\n" "${pad2}" "${d2}" "${explain_cache}"
-    printf "  %s: %s   %s\n" "${pad3}" "${d3}" "${explain_anon}"
-    printf "  %s: %s   %s\n" "${pad4}" "${d4}" "${explain_shmem}"
-    printf "  %s: %s   %s\n" "${pad5}" "${d5}" "${explain_kernel}"
-    printf "  %s: %s   %s\n" "${pad6}" "${d6}" "${explain_dirty}"
-    printf "  %s: %s   %s\n" "${pad7}" "${d7}" "${explain_writeback}"
-    printf "  %s: %s   %s\n" "${pad8}" "${d8}" "${explain_corrupted}"
+
+    emit_detail "Tampons"   "${buffers}"           "${expl_buffer}"
+    emit_detail "Cache"     "${cached}"            "${expl_cache}"
+    emit_detail "Anonyme"   "${anon}"              "${expl_anon}"
+    emit_detail "Partagée"  "${shmem}"             "${expl_shmem}"
+    emit_detail "Noyau"     "${kernel_mem}"        "${expl_kernel}"
+    emit_detail "Attente"   "${dirty}"             "${expl_dirty}"
+    emit_detail "Écriture"  "${writeback}"         "${expl_writeback}"
+    emit_detail "Corrompue" "${hardwarecorrupted}" "${expl_corrupted}"
     return 0
 }
 
-#----------------------------------------------------------------------------------------------------------------------------------------------------------
 display_RAM() {
-    local color="" pad1 pad2 pad3 pad4 c1 c2 c3 c4 d1 d2 d3 d4
-    [[ ${NOCOLOR} == false ]] && color="cyan"
-    [[ -t 1 ]] && header_box "${color}" "Mémoire vive (RAM)" || echo ">>> Mémoire vive (RAM) <<<"
-    # construction
-    pad1="Totale            "
-    pad2="Utilisée          "
-    pad3="Disponible        "
-    pad4="Libre             "
-    c1="$(format_size "${mem_total}")"
-    d1=$(pad_right "${c1}")
-    c2="$(format_size "${mem_used}")"
-    d2=$(pad_right "${c2}")
-    c3="$(format_size "${mem_avail}")"
-    d3=$(pad_right "${c3}")
-    c4="$(format_size "${mem_free}")"
-    d4=$(pad_right "${c4}")
-    # affichage
-    printf "%s: %s\n" "${pad1}" "${d1}"
-    printf "%s: %s   ${C_BLUE}%-4s%%${Reset}\n" "${pad2}" "${d2}" "${mem_used_pct}"
-    printf "%s: %s   ${C_BLUE}%-4s%%${Reset}\n" "${pad3}" "${d3}" "${mem_free_pct}"
-    printf "%s: %s\n" "${pad4}" "${d4}"
-    [[ ${SIMPLE} == false ]] && display_RAM_extended
+    title cyan "Mémoire vive (RAM)"
+    emit_main "Totale"     "${mem_total}"
+    emit_main "Utilisée"   "${mem_used}" "${mem_used_pct}"
+    emit_main "Disponible" "${mem_avail}" "${mem_free_pct}"
+    emit_main "Libre"      "${mem_free}"
+    if (( SIMPLE == 0 )); then
+        display_RAM_extended
+    fi
     return 0
 }
-#----------------------------------------------------------------------------------------------------------------------------------------------------------
-display_swap_comp() { # zram ou zswap
-    local back="$1" comp_algo="$2" pool_max="$3" pool_used="$4" data="$5"
-    local explain_pool="$6" explain_used="$7" explain_data="$8"
-    local dev temp c1 c2 c3 c4 c5 c6 c7 d1 d2 d3 d4 d5 d6 d7
 
-    # gestion multi swap
+# Bloc zswap ou zram (les textes sont passés en argument : pas de portée dynamique)
+display_swap_comp() {
+    local back=$1 algo=$2 pool_max=$3 pool_used=$4 data=$5
+    local exp_pool=$6 exp_used=$7 exp_data=$8
+    local d10 ratio pad
+
+    printf '  %s%*s: %s%s(%s)%s\n' "Compression" $(( 16 - 11 )) '' "${C_BLUE}" "${back}" "${algo}" "${Reset}"
+    emit_detail "Swap en cache" "${swapcached}" ""
+    emit_detail "Pool ${back} max" "${pool_max}" "${exp_pool}"
+    emit_detail "Pool ${back}" "${pool_used}" "${exp_used}"
+    if (( data > 0 )); then
+        emit_detail "Données ${back}" "${data}" "${exp_data}"
+        if (( pool_used > 0 )); then
+            d10=$(( data * 10 / pool_used ))
+            ratio="$(( d10 / 10 )).$(( d10 % 10 ))"
+            pad=$(( 18 - ${#ratio} - 1 ))
+            (( pad < 0 )) && pad=0
+            printf '  %s%*s: %*s%sx%s%s\n' "Efficacité" $(( 16 - 10 )) '' "${pad}" '' "${C_BLUE}" "${ratio}" "${Reset}"
+        fi
+    fi
+    return 0
+}
+
+display_SWAP_extended() {
+    local exp_pool="" exp_zswap="" exp_zswapped="" exp_zram="" exp_zrammed=""
+    local exp_zramsize=""
+    local dev
+    local -i pc_zswap=20 pool_zswap=0
+
+    printf '\n%sDétails%s\n' "${C_CYAN}" "${Reset}"
+    if (( NOEXPLAIN == 0 )); then
+        exp_pool="(mémoire utilisable par zswap)"
+        exp_zswap="(mémoire utilisée par zswap)"
+        exp_zswapped="(valeur non compressée des données en zswap)"
+        exp_zram="(mémoire utilisée par zram)"
+        exp_zrammed="(valeur non compressée des données en zram)"
+        exp_zramsize="(mémoire utilisable par zram)"
+    fi
+
     for dev in ${swap_devices}; do
-        temp=$(pad_right "${C_BLUE}${dev}${Reset}")
-        printf "  Périphérique    : %s %s\n" "${temp}" "${explain_device}"
+        printf '  %s%*s: %s%s%s\n' "Périphérique" $(( 16 - 12 )) '' "${C_BLUE}" "${dev}" "${Reset}"
     done
 
-    # construction
-    c1="${C_BLUE}${back}(${comp_algo})${Reset}"
-    d1=$(pad_right "${c1}")
-    c2=$(format_size "${swapcached}")
-    d2=$(pad_right "${c2}")
-    c3=$(format_size "${pool_max}")
-    d3=$(pad_right "${c3}")
-    c4=$(format_size "${pool_used}")
-    d4=$(pad_right "${c4}")
-    # affichage
-    printf "  Compression     : %s   %s\n" "${d1}" "${explain_comp}"
-    printf "  Swap en cache   : %s   %s\n" "${d2}" "${explain_cached}"
-    printf "  Pool ${back} max  : %s   %s\n" "${d3}" "${explain_pool}"
-    printf "  Pool ${back}      : %s   %s\n" "${d4}" "${explain_used}"
-
-    # gestion ratio de compression
-    if ((data > 0)); then
-        c5=$(format_size "${data}")
-        d5=$(pad_right "${c5}")
-        printf "  Données ${back}   : %s   %s\n" "${d5}" "${explain_data}"
-        if ((pool_used > 0)); then
-            local ratio
-            d6=$(echo "scale=1; ${data} / ${pool_used}" | bc)
-            ratio=$(printf "%.1f" "${d6}")
-            c7="${C_BLUE}x${ratio}${Reset}"
-            d7=$(pad_right "${c7}")
-            printf "  Efficacité      : %s   %s\n" "${d7}" "${explain_ratio}"
+    if (( ZSWAP_DETECTED == 1 )); then
+        if [[ -r /sys/module/zswap/parameters/max_pool_percent ]]; then
+            pc_zswap=$(< /sys/module/zswap/parameters/max_pool_percent)
+            [[ "${pc_zswap}" =~ ^[0-9]+$ ]] || pc_zswap=20
         fi
+        pool_zswap=$(( pc_zswap * mem_total / 100 ))
+        display_swap_comp "Zswap" "${comp_algo_zswap}" "${pool_zswap}" "${zswap}" "${zswapped}" \
+            "${exp_pool}" "${exp_zswap}" "${exp_zswapped}"
+    fi
+    if (( ZRAM_DETECTED == 1 )); then
+        display_swap_comp "Zram" "${comp_algo_zram}" "${zram_size}" "${zram_used}" "${zram_data}" \
+            "${exp_zramsize}" "${exp_zram}" "${exp_zrammed}"
     fi
     return 0
 }
-#----------------------------------------------------------------------------------------------------------------------------------------------------------
-display_SWAP_extended() {
-    local pc_zswap pool_zswap ratio
-    local explain_cached explain_pool explain_zswap explain_zswapped explain_ratio
-    local explain_zramsize explain_zram explain_zrammed explain_device explain_comp
-    echo
-    if ${NOEXPLAIN}; then # on n'affiche pas d'explications
-        explain_cached=""
-        explain_pool=""
-        explain_zswap=""
-        explain_zswapped=""
-        explain_zram=""
-        explain_zrammed=""
-        explain_ratio=""
-        explain_zramsize=""
-        explain_device=""
-        explain_comp=""
-    else
-        explain_cached="(données en échange et en mémoire)"
-        explain_pool="(mémoire utilisable par zswap)"
-        explain_zswap="(mémoire utilisée par zswap)"
-        explain_zswapped="(valeur non compressée des données en zswap)"
-        explain_zram="(mémoire utilisée par zram)"
-        explain_zrammed="(valeur non compressée des données en zram)"
-        explain_ratio="(taux de compression)"
-        explain_zramsize="(mémoire utilisable par zram)"
-        explain_device=""
-        explain_comp="(dispositif de compression d'échange en mémoire)"
-    fi
-    echo -e "${C_CYAN}Détails${Reset}"
-    if ${ZSWAP_DETECTED}; then
-        pc_zswap="$(cat /sys/module/zswap/parameters/max_pool_percent)"
-        pool_zswap=$((pc_zswap * mem_total / 100))
-        display_swap_comp "Zswap" "${comp_algo_zswap}" "${pool_zswap}" "${zswap}" "${zswapped}" "${explain_pool}" "${explain_zswap}" "${explain_zswapped}"
-    fi
-    if ${ZRAM_DETECTED}; then
-        display_swap_comp "Zram " "${comp_algo_zram}" "${zram_size}" "${zram_used}" "${zram_data}" "${explain_zramsize}" "${explain_zram}" "${explain_zrammed}"
-    fi
-    return 0
-}
-#----------------------------------------------------------------------------------------------------------------------------------------------------------
+
 display_SWAP() {
-    local color="" pad1 pad2 pad3 c1 c2 c3 d1 d2 d3
-    echo ""
-    [[ ${NOCOLOR} == false ]] && color="cyan"
-    [[ -t 1 ]] && header_box "${color}" "Espace d'échange (SWAP)" || echo ">>> Espace d'échange (SWAP) <<<"
-    # construction
-    pad1="Total             "
-    pad2="Utilisé           "
-    pad3="Disponible        "
-    c1="$(format_size "${swap_total}")"
-    d1=$(pad_right "${c1}")
-    c2="$(format_size "${swap_used}")"
-    d2=$(pad_right "${c2}")
-    c3="$(format_size "${swap_free}")"
-    d3=$(pad_right "${c3}")
-    # affichage
-    printf "%s: %s\n" "${pad1}" "${d1}"
-    printf "%s: %s   ${C_BLUE}%-4s%%${Reset}\n" "${pad2}" "${d2}" "${swap_used_pct}"
-    printf "%s: %s   ${C_BLUE}%-4s%%${Reset}\n" "${pad3}" "${d3}" "${swap_free_pct}"
-    [[ ${SIMPLE} == false ]] && display_SWAP_extended
+    printf '\n'
+    title cyan "Espace d'échange (SWAP)"
+    emit_main "Total"      "${swap_total}"
+    emit_main "Utilisé"    "${swap_used}" "${swap_used_pct}"
+    emit_main "Disponible" "${swap_free}" "${swap_free_pct}"
+    if (( SIMPLE == 0 )); then
+        display_SWAP_extended
+    fi
     return 0
 }
-#----------------------------------------------------------------------------------------------------------------------------------------------------------
-display_as_free() {
-    local pad=12 c1 c2 c3 c4 c5 c6 d1 d2 d3 d4 d5 d6 bufcache
 
-	pad_col() {
-	    local colored="$1" stripped len spaces
-	    stripped=$(printf '%s' "${colored}" | sed -E 's/\x1b\[[0-9;]*m//g; s/\x1b\(B//g')
-	    len=${#stripped}
-	    spaces=$((pad - len))
-	    printf '%*s%s' "${spaces}" '' "${colored}"
-	}
-
-    # header
-    c1=$(pad_col "total")
-    c2=$(pad_col "utilisé")
-    c3=$(pad_col "libre")
-    c4=$(pad_col "partagé")
-    c5=$(pad_col "tamp/cache")
-    c6=$(pad_col "disponible")
-    printf "%-6s%s%s%s%s%s%s\n" "" "${c1}" "${c2}" "${c3}" "${c4}" "${c5}" "${c6}"
-
-    # Mem
-    bufcache=$((buffers + cached + sreclaimable)) # la commande free calcule buff/cache = Buffers + Cached + SReclaimable
-    c1=$(format_size "${mem_total}")
-    d1=$(pad_col "${c1}")
-    c2=$(format_size "${mem_used}")
-    d2=$(pad_col "${c2}")
-    c3=$(format_size "${mem_free}")
-    d3=$(pad_col "${c3}")
-    c4=$(format_size "${shmem}")
-    d4=$(pad_col "${c4}")
-    c5=$(format_size "${bufcache}")
-    d5=$(pad_col "${c5}")
-    c6=$(format_size "${mem_avail}")
-    d6=$(pad_col "${c6}")
-    printf "%-6s%s%s%s%s%s%s\n" "Mem :" "${d1}" "${d2}" "${d3}" "${d4}" "${d5}" "${d6}"
-
-    # Swap
-    if [[ "${swap_total}" != "0" ]]; then 
-	    c1=$(format_size "${swap_total}")
-	    d1=$(pad_col "${c1}")
-	    c2=$(format_size "${swap_used}")
-	    d2=$(pad_col "${c2}")
-	    c3=$(format_size "${swap_free}")
-	    d3=$(pad_col "${c3}")
-	    printf "%-6s%s%s%s\n" "Swap:" "${d1}" "${d2}" "${d3}"
-	fi
-    exit 0
+# Tableau au format de « free » (colonnes de 12, alignées à droite)
+free_cell() {   # VAR texte couleur
+    local p
+    p=$(( 12 - ${#2} ))
+    (( p < 0 )) && p=0
+    printf -v "$1" '%*s%s%s%s' "${p}" '' "$3" "$2" "${Reset}"
+    return 0
 }
-#---------------------------------------------------------/ FONCTIONS--------------------------------------------------------------------------------------
 
-######################################################## Corps du script ##################################################################################
+display_as_free() {
+    local c1 c2 c3 c4 c5 c6
+    local -i bufcache
+
+    free_cell c1 "total"      "";        free_cell c2 "utilisé"   ""
+    free_cell c3 "libre"      "";        free_cell c4 "partagé"   ""
+    free_cell c5 "tamp/cache" "";        free_cell c6 "disponible" ""
+    printf '%-6s%s%s%s%s%s%s\n' "" "${c1}" "${c2}" "${c3}" "${c4}" "${c5}" "${c6}"
+
+    bufcache=$(( buffers + cached + sreclaimable ))
+    size_fmt "${mem_total}";      free_cell c1 "${SZ}" "${SZ_C}"
+    size_fmt "${mem_used}";       free_cell c2 "${SZ}" "${SZ_C}"
+    size_fmt "${mem_free}";       free_cell c3 "${SZ}" "${SZ_C}"
+    size_fmt "${shmem}";          free_cell c4 "${SZ}" "${SZ_C}"
+    size_fmt "${bufcache}";       free_cell c5 "${SZ}" "${SZ_C}"
+    size_fmt "${mem_avail}";      free_cell c6 "${SZ}" "${SZ_C}"
+    printf '%-6s%s%s%s%s%s%s\n' "Mem :" "${c1}" "${c2}" "${c3}" "${c4}" "${c5}" "${c6}"
+
+    if (( swap_total > 0 )); then
+        size_fmt "${swap_total}"; free_cell c1 "${SZ}" "${SZ_C}"
+        size_fmt "${swap_used}";  free_cell c2 "${SZ}" "${SZ_C}"
+        size_fmt "${swap_free}";  free_cell c3 "${SZ}" "${SZ_C}"
+        printf '%-6s%s%s%s\n' "Swap:" "${c1}" "${c2}" "${c3}"
+    fi
+    return 0
+}
+
+##############################################################################
+# Main
+##############################################################################
+main() {
+    TTY=0
+    [[ -t 1 ]] && TTY=1
+
+    parse_options "$@"
+    enable_colors
+    detect_cols
+
+    if (( HELP == 1 )); then show_help; fi
+    if (( VER == 1 )); then show_version; fi
+    (( HELP == 1 || VER == 1 )) && exit 0
+
+    compute_meminfo
+    detect_swap
+
+    if (( FREE == 1 )); then
+        display_as_free
+        exit 0
+    fi
+
+    display_RAM
+    if [[ -n "${swap_devices}" ]]; then
+        display_SWAP
+    elif (( SIMPLE == 0 && NOEXPLAIN == 0 )); then
+        printf '\n%sNote%s\n  %s%s%s n'"'"'a pas détecté d'"'"'espace d'"'"'échange (swap).\n' \
+            "${C_CYAN}" "${Reset}" "${C_GREEN}" "${name}" "${Reset}"
+    fi
+    return 0
+}
+
 main "$@"
-###########################################################################################################################################################
