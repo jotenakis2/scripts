@@ -1,1140 +1,1212 @@
 #!/usr/bin/env bash
-######################################################################################################################################
-# script pour mettre en forme la commande ps pour une meilleure lisibilité.
-# 2 dépendances : ps et awk (gnu awk)
-# LICENCE GPLv3
-# AUTHOR jotenakis
-# TODO : récup pid ligne courante pour kill ou renice ?
-######################################################################################################################################
+# shellcheck enable=all
+##############################################################################
+# psim — mise en forme lisible de la sortie de ps.
+#
+# Auteur original : jotenakis (GPLv3). Réécriture corrective 2026.
+#
+# Différences avec psim (0.999) :
+#   * utilisable dans un pipe/un fichier (plus de COLUMNS non lié, plus de
+#     séquences ANSI, sortie non tronquée, une ligne par processus) ;
+#   * plus aucun plantage sur un filtre sans correspondance ou invalide ;
+#   * terminal toujours restauré (trap EXIT + signaux) ;
+#   * une seule invocation de ps par rafraîchissement (total exact inclus) ;
+#   * %CPU réel (l'ancienne version divisait par le nombre de cœurs) ;
+#   * troncature/alignement corrects (plus de lignes de 194 colonnes) ;
+#   * configuration validée clé par clé (plus d'évaluation de shell) ;
+#   * options --no-header/--no-footer/--no-tips indépendantes ;
+#   * journal borné (rotation) et statistiques optionnelles ;
+#   * options inconnues, arguments en trop et valeurs invalides refusés.
+#
+# Dépendances : ps (procps-ng), awk (gawk, mawk ou busybox awk).
+#               tput est optionnel.
+##############################################################################
 set -euo pipefail
-readonly VER=0.999                                      # numéro de version du script
-readonly NAME="${0##*/}"                                # nom du script
-readonly MYPID="$$"                                     # pid du script, pour filtrer lui et les descendants.
-readonly DIR="${HOME}/.config/psim"                     # dossier de conf
-readonly CONFIG="${DIR}/default.conf"                   # fichier de conf pour écraser les valeurs hardcodées
 
-#---------------------------------------------------------------------------------
-MAIN(){
-    local blanks displayed_real
-    START_TIME=${SECONDS}
-	INITIALCONF
-	DEFINE_COLORS
-	MANAGE-ARGS "$@"
-    if [[ "${STATIC}" -eq 1 ]]; then
-        DISPLAY_STATIC
-    else
-        trap CLEANUP INT TERM
-        printf '\033[?25l\033[?1049h\033[H'
-        while true; do
-            printf '\033[H' # on position le curseur en haut à gauche
-            DISPLAY_DYNAMIC
-            if [[ -n "${FILTER}" ]]; then
-                # on récupère le nb de lignes affichées par awk
-                displayed_real=0
-                [[ -s "${DRAWN_FILE}" ]] && read -r displayed_real < "${DRAWN_FILE}"
-                # on ajoute des lignes blanches pour aller jusqu'en bas du terminal
-                blanks=$(( LIMIT - displayed_real ))
-                [[ ${blanks} -lt 0 ]] && blanks=0
-                for ((i=0; i<blanks; i++)); do
-                    printf '\033[K\n'
-                done
-                # si pas de bandeau je rajoute une ligne vide
-                [[ ${TIPS_STATE} -eq 0 ]] && printf '\033[K'
-            fi
-            # on affiche le bandeau tout en bas si demandé
-            [[ "${TIPS_STATE}" -ge 1 ]] && DISPLAY-TIPS
-            # on gère les raccourcis clavier
-            MANAGE-KEYS
-        done
-    fi
-    exit 0
-}
-#---------------------------------------------------------------------------------
+readonly VER="1.0.0"
+readonly NAME="${0##*/}"
+readonly CONF_NAME="psim"       # config et cache : ~/.config/psim et ~/.cache/psim
+readonly SELF_PID="${BASHPID:-$$}"
 
+# Seuils
+readonly THIN_W=100        # en dessous : mode simplifié forcé
+readonly MIN_W=60          # en dessous : refus du mode dynamique
+readonly MIN_H=6
+readonly INTERVAL_MAX=3599 # au-delà : gel
+readonly LOG_MAX=262144    # rotation du journal (octets)
 
-# SCRIPTS AWK #######################################################################################################################
-#####################################################################################################################################
-#####################################################################################################################################
-_psawk(){ # construction de la ligne de commande ps xxx | awk yyy
-    local formatps awkscript maxps pscmd awkcmd noItSelf noKernel
-    formatps="$1"
-    maxps=$((WIDTH + 5))
-    noItSelf=(--deselect --pid "${MYPID}" --ppid "${MYPID}")
+# Glyphes Nerd Font du bandeau (identiques à psim 0.999)
+readonly ICON_LEAD=$'\uF400'      # icône « info » du bandeau
+readonly ICON_CLOCK=$'\uF449'
+readonly ICON_MODE=$'\uEBCB'      # flèches gauche/droite (bandeau large)
+readonly ICON_MODE_SHORT=$'\uF0B2'
+readonly ICON_SCROLL=$'\u2195'
 
-    [[ ${NEWBIE} -eq 1 ]] && awkscript="${AWKNOOB}"                 || awkscript="${AWKSIMPLE}"
-    [[ ${KERNEL} -eq 0 ]] && noKernel=(--deselect --pid 2 --ppid 2) || noKernel=()
+# État
+declare -i WIDTH=120 HEIGHT=40
+declare -i LIMIT=0 OFFSET=0 TOTAL=0
+declare -i ALT=0 SESSION=0 CLEANED=0 TTY=0 STDIN_TTY=0
+declare -i FILTER_EDIT=0 FILTER_INVALID=0
+declare -i NEWBIE=1 INTERVAL=1 HEADER=1 FOOTER=1 TIPS=1 NO_COLOR=0
+declare -i KERNEL=0 STATIC=1 SHOW_OPTS=0 FREEZE=0 LOG=1 DEBUG=0 CPU_MODE=0
+declare SORT="-%cpu"
+declare FILTER="" FILTER_BUF="" FILTER_SAVE=""
+declare -i NCPU=1
+declare PS_BIN="" AWK_BIN="" CONFIG="" CACHE_DIR="" DRAW_FILE="" LOG_FILE="" ME=""
+declare STTY_SAVE=""
+declare lead="" plain="" colored=""
+declare -a CLUSTER_ARGS=()
+declare crit_p="" tail_p="" tail_c="" filt_p="" filt_c=""
 
-    pscmd=("${PS}" -o "${formatps}" --sort="${SORT}" --cols="${maxps}")
-    awkcmd=("${AWK}" \
-            -v limit="${LIMIT}"        -v width="${WIDTH}"           -v ncpu="${NCPU}"          -v sort="${SORT}" \
-            -v noheader="${NO_HEADER}" -v nofooter="${NO_FOOTER}"    -v kernel="${KERNEL}"      -v nocolor="${NO_COLOR}" \
-            -v offset="${OFFSET}"      -v totalproc="${TOTAL_PROCS}" -v showopts="${SHOW_OPTS}" -v me="${ME}" \
-            -v filter="${FILTER}"      -v drawn_file="${DRAWN_FILE}" "${awkscript}")
+# Couleurs (remplies par DEFINE_COLORS)
+Rouge="" Vert="" VertBold="" Jaune="" Bleu="" BleuBold="" Magenta="" Cyan="" Blanc=""
+RougeBold="" Gris="" BgGris="" Reset="" ResetFg="" Underline=""
 
-    "${pscmd[@]}" "${noKernel[@]}" "${noItSelf[@]}" 2>/dev/null | "${awkcmd[@]}" 2>/dev/null
+##############################################################################
+# Utilitaires
+##############################################################################
+ERR() { printf '%sErreur%s : %s\n' "${RougeBold}" "${Reset}" "$*" >&2; }
+WARN() { printf '%sAttention%s : %s\n' "${Jaune}" "${Reset}" "$*" >&2; }
 
-    return 0
-}
-#####################################################################################################################################
-_awk(){ # initialisation des scripts awk dans des variables globales AWKSIMPLE et AWKNOOB
-
-# script mode simple => variable globale
-AWKSIMPLE=$(cat <<'EOF'
-# DÉFINITION des codes ansi (couleurs,...)
-    BEGIN{
-       if(nocolor){
-            RED=""
-            GREEN=""
-            YELLOW=""
-            BLUE=""
-            MAGENTA=""
-            CYAN=""
-            WHITE=""
-            GREY=""
-            BG_GREY=""
-            RESET=""
-            RESET_FG=""
-            RESET_BG=""
-            RESET_UL=""
-            UNDERLINE=""
-            EL="\033[0K"
-       } else {
-            RED="\033[31m"
-            GREEN="\033[32m"
-            YELLOW="\033[33m"
-            BLUE="\033[34m"
-            MAGENTA="\033[35m"
-            CYAN="\033[36m"
-            WHITE="\033[37m"
-            GREY="\033[37m"
-            BG_GREY="\033[100m"
-            RESET_FG="\033[39m"
-            RESET_BG="\033[49m"
-            RESET="\033[0m"
-            RESET_UL="\033[24m"
-            UNDERLINE="\033[4m"
-            EL="\033[0K"
-       }
-   }
-# HEADER
-   NR==1{
-        if (noheader) next
-        # couleurs et noms des catégories du header en fonction du tri choisi
-          pid_start = (sort ~ /^-?pid$/) ? UNDERLINE MAGENTA : MAGENTA
-          ppid_start = (sort ~ /^-?ppid$/) ? UNDERLINE CYAN : CYAN
-          mib_start = (sort ~ /^-?rss$/) ? UNDERLINE GREEN : GREEN
-          cpu_start = (sort ~ /^-?%?cpu$/) ? UNDERLINE GREEN : GREEN
-          user_start = (sort ~ /^-?%?user$/) ? UNDERLINE BLUE : BLUE
-          prog_col = "  COMMAND"
-          if(showopts == 1) prog_col = "  CMD"
-          opts_col = ""
-          pcolor = (sort ~ /^-?%?cmd$/) ? UNDERLINE YELLOW : YELLOW
-
-        # Affichage header
-          printf BG_GREY pid_start "%7s" RESET_UL " " ppid_start "%7s" RESET_UL " " user_start "%-10s" RESET_UL WHITE " %3s " mib_start "%6s" RESET_UL " " GREEN "%6s" RESET_FG " " cpu_start "%6s" RESET_UL " " pcolor "%-52s" RESET_UL WHITE " %s", $1, $2, $3, $4, "MiB", "%MEM", "%CPU", prog_col, opts_col
-        # je complète par des espaces jusqu'au bout de la ligne et puis je passe à la ligne
-          printf "\033[K\033[0m\n"
-
-        next
-   }
-# PROCESSUS ($1=PID  $2=PPID  $3=USER  $4=NICE  $5=RSS  $6=%MEM  $7=%CPU  $8=CMD => $9, $10,... = arguments de la commande)
-   {
-        # Gestion des lignes et scrolling (data_row est un compteur de ligne qu'on incrémente)
-          data_row++
-          if(data_row <= offset) next
-
-        # Définition des valeurs à afficher RAM, %MEM, %CPU, PID, PPID,...
-          ram=$5/1024
-          mem=$6
-          cpu=$7
-          pid_str=sprintf("%7d",$1)
-          ppid_str=sprintf("%7d",$2)
-          user_str=sprintf("%-10s",$3)
-          nice_str=sprintf("%3s",$4)
-          mib_str=sprintf("%6.0f",ram)
-          mem_str=sprintf("%6.1f",mem)
-          cpu_str=sprintf("%6.1f",cpu/ncpu)
-          cmd=$8
-
-        # Détection des processus noyau (entre crochets dans ps)
-          is_kernel=(cmd~/^\[/)
-        # Si la ligne correspond à un processus noyau et que l'option d'affichage des processus noyau n'est pas sélectionnée, on zappe.
-          if (kernel == 0 && is_kernel) next
-        # Si la ligne ne correspond pas à un processus noyau et que l'option d'affichage des processus noyau est sélectionnée sur "noyau only", on zappe.
-          if (kernel == 2 && !is_kernel) next
-        # Si la ligne ne correspond pas à un processus noyau, on prépare des filtres.
-          if(!is_kernel){
-             if(cmd~"ps" && $9=="-o") next                              # on zappe si ps -o
-             if(cmd~"awk" && $9=="-v") next                             # on zappe si awk -v
-             if (!showopts) sub(/^.*\//,"",cmd)                         # on supprime le chemin complet pour ne conserver que basename
-          }
-        # on tronque le champ cmd à 52 caractères fixes, alignés à gauche
-          cmd_padded=sprintf("%-60s",cmd)
-        # on concatène les arguments de cmd dans 1 seule variable (opts)
-          opts=""
-          if(NF>8){ for(i=9;i<=NF;i++) opts=opts (i>9?" ":"") $i }
-        # on tronque opts pour tenir sur 1 seule ligne donc on calcule la longueur des champs déjà affichés puis on soustrait.
-          opts_truncated=""
-          if(opts!="" && showopts==1){
-            base_len=length(pid_str " " ppid_str " " user_str " " nice_str " " mib_str " " mem_str " " cpu_str "   " cmd_padded " ")
-            if(width>base_len) opts_truncated=substr(opts,1,width-base_len)
-          }
-        # filtre par mot clé sur les champs user, cmd et opts (tronqué)
-        search_text=$3 " " cmd
-        if(opts!="") search_text=search_text " " opts_truncated
-        if(filter != "" && tolower(search_text) !~ tolower(filter)) next
-
-        # Définition des couleurs
-          # PID
-          pid_col=MAGENTA pid_str " " CYAN ppid_str RESET
-          # USER
-          if($3=="root")
-              user_col=RED user_str RESET
-          else if ($3==me)
-              user_col=BLUE user_str RESET
-          else
-              user_col=WHITE user_str RESET
-          # NICE
-          if($4=="-")
-              nice_col=GREY nice_str RESET
-          else if($4<0)
-              nice_col=YELLOW nice_str RESET
-          else
-              nice_col=CYAN nice_str RESET
-          # MIB
-          mib_col=GREEN mib_str " " mem_str " " cpu_str RESET
-          # CMD
-            if(is_kernel){
-                cmd_col=CYAN cmd_padded RESET
-            } else {
-                slash = match(cmd, /\/[^\/]*$/)
-                if(showopts==1 && slash){
-                    dir_part = substr(cmd, 1, RSTART)
-                    base_part = substr(cmd, RSTART+1)
-                    cmd_col = GREY dir_part RESET YELLOW base_part RESET
-                    # PAD fixe pour 52 cols VISIBLES (compense ANSI)
-                    cmd_col = cmd_col sprintf("%-*s", 60-length(base_part)-length(dir_part), " ")
-                } else {
-                    cmd_col = YELLOW cmd_padded RESET
-                }
-            }
-
-
-        # Définition et affichage de la ligne complète en couleur
-          line_color=pid_col " " user_col " " nice_col " " mib_col "   " cmd_col
-          if(opts_truncated!="") line_color=line_color " " GREY opts_truncated RESET
-          print line_color EL  # EL pour remplir d'espace vide jusqu'au bout de la ligne
-          fflush()             # vide buffer awk
-
-        # Calculs pour le FOOTER
-          total_ram+=ram
-          total_cpu+=cpu
-          total_mem+=mem
-          count++
-          displayed++
-
-        # Sortie si on a affiché le max de ligne possible
-          if(limit>0&&displayed==limit) exit
-    }
-# FOOTER
-    END{
-        if(nofooter) exit
-        printf RED "%2s %2s %-20s %3s %6.0f %6.1f %6.1f %5s %s\033[K\n" RESET, "" , "" , "TOTAL (displayed):" , "" , total_ram , total_mem , total_cpu/ncpu , " ("count, "proc out of " totalproc ")"
-        print displayed > drawn_file
-        close(drawn_file)
-    }
-EOF
-)
-#
-# script mode newbie => variable globale
-AWKNOOB=$(cat <<'EOF'
-# DÉFINITION des codes ansi (couleurs,...)
-    BEGIN{
-        if(nocolor){
-            RED=""
-            GREEN=""
-            YELLOW=""
-            BLUE=""
-            MAGENTA=""
-            CYAN=""
-            WHITE=""
-            GREY=""
-            BG_GREY=""
-            RESET_FG=""
-            RESET_BG=""
-            RESET=""
-            RESET_UL=""
-            UNDERLINE=""
-            EL="\033[0K"
-        } else {
-            RED="\033[31m"
-            GREEN="\033[32m"
-            YELLOW="\033[33m"
-            BLUE="\033[34m"
-            MAGENTA="\033[35m"
-            CYAN="\033[36m"
-            WHITE="\033[37m"
-            GREY="\033[37m"
-            BG_GREY="\033[100m"
-            RESET_FG="\033[39m"
-            RESET_BG="\033[49m"
-            RESET_UL="\033[24m"
-            RESET="\033[0m"
-            UNDERLINE="\033[4m"
-            EL="\033[0K"
-        }
-    }
-# HEADER
-    NR==1{
-            if (noheader) next
-        # couleurs et noms des catégories du header en fonction du tri choisi
-            pid_start = (sort ~ /^-?pid$/) ? UNDERLINE MAGENTA : MAGENTA
-            mib_start = (sort ~ /^-?rss$/) ? UNDERLINE GREEN : GREEN
-            cpu_start = (sort ~ /^-?%?cpu$/) ? UNDERLINE GREEN : GREEN
-            user_start = (sort ~ /^-?%?user$/) ? UNDERLINE BLUE : BLUE
-            prog_col = "  COMMAND"
-            if(showopts == 1) prog_col = "  CMD"
-            opts_col = ""
-            pcolor = (sort ~ /^-?%?cmd$/) ? UNDERLINE YELLOW : YELLOW
-
-        # Affichage header
-            printf BG_GREY pid_start "%7s" RESET_UL " " user_start "%-8s" RESET_UL " " mib_start "%6s" RESET_UL " " cpu_start "%6s" RESET_UL " " pcolor "%-52s" RESET_UL WHITE " %s", $1, $2, "MiB", "%CPU", prog_col, opts_col
-        # je complète par des espaces jusqu'au bout de la ligne et puis je passe à la ligne
-            printf "\033[K\033[0m\n"
-
-            next
-    }
-# PROCESSUS ($1=PID $2=USER $3=RSS $4=%CPU $5=CMD => $6, $7,... = arguments de la commande)
-    {
-        # Gestion des lignes et scrolling (data_row est un compteur de ligne qu'on incrémente)
-          data_row++
-          if(data_row <= offset) next
-
-        # Définition des valeurs à afficher RAM, %MEM, %CPU, PID,...
-          ram=$3/1024
-          cpu=$4
-          pid_str=sprintf("%7d",$1)
-          user_str=sprintf("%-8s",$2)
-          mib_str=sprintf("%6.0f",ram)
-          cpu_str=sprintf("%6.1f",cpu/ncpu)
-          cmd=$5
-
-        # Détection des processus noyau (entre crochets dans ps)
-          is_kernel=(cmd~/^\[/)
-        # Si la ligne correspond à un processus noyau et que l'option d'affichage des processus noyau n'est pas sélectionnée, on zappe.
-          if (kernel == 0 && is_kernel) next
-        # Si la ligne ne correspond pas à un processus noyau et que l'option d'affichage des processus noyau est sélectionnée sur "noyau only", on zappe.
-          if (kernel == 2 && !is_kernel) next
-        # Si la ligne ne correspond pas à un processus noyau, on prépare des filtres.
-          if(!is_kernel){
-              if(cmd~"ps" && $6=="-o") next
-              if(cmd~"awk" && $6=="-v") next
-              if (!showopts) sub(/^.*\//,"",cmd)
-          }
-        # on tronque le champ cmd à 52 caractères fixes, alignés à gauche
-          cmd_padded=sprintf("%-60s",cmd)
-        # on concatène les arguments de cmd dans 1 seule variable (opts)
-          opts=""
-          if(NF>5){ for(i=6;i<=NF;i++) opts=opts (i>6?" ":"") $i }
-        # on tronque opts pour tenir sur 1 seule ligne donc on calcule la longueur des champs déjà affichés puis on soustrait.
-          opts_truncated=""
-          if(opts!="" && showopts==1){
-              base_len=length(pid_str " " user_str " " mib_str " " cpu_str "   " cmd_padded " ")
-              if(width>base_len) opts_truncated=substr(opts,1,width-base_len)
-          }
-        # filtre par mot clé sur les champs user cmd et opts (tronqué)
-        search_text=$2 " " cmd
-        if(opts!="") search_text=search_text " " opts_truncated
-        if(filter != "" && tolower(search_text) !~ tolower(filter)) next
-
-        # Définition des couleurs
-          # PID
-          pid_col=MAGENTA pid_str RESET
-          # USER
-          if($2=="root")
-              user_col=RED user_str RESET
-          else if ($2==me)
-              user_col=BLUE user_str RESET
-          else
-              user_col=WHITE user_str RESET
-          # MIB
-          mib_col=GREEN mib_str RESET
-          # CPU
-          cpu_col=GREEN cpu_str RESET
-          # CMD
-            if(is_kernel){
-                cmd_col=CYAN cmd_padded RESET
-            } else {
-                slash = match(cmd, /\/[^\/]*$/)
-                if(showopts==1 && slash){
-                    dir_part = substr(cmd, 1, RSTART)
-                    base_part = substr(cmd, RSTART+1)
-                    cmd_col = GREY dir_part RESET YELLOW base_part RESET
-                    # PAD fixe pour 52 cols VISIBLES (compense ANSI)
-                    cmd_col = cmd_col sprintf("%-*s", 60-length(base_part)-length(dir_part), " ")
-                } else {
-                    cmd_col = YELLOW cmd_padded RESET
-                }
-            }
-
-        # Définition et affichage de la ligne complète en couleur
-          line_color=pid_col " " user_col " " mib_col " " cpu_col "   " cmd_col
-          if(opts_truncated!="") line_color=line_color " " GREY opts_truncated RESET
-          print line_color EL  # EL pour remplir d'espace vide jusqu'au bout de la ligne
-          fflush()             # vide buffer awk
-
-        # Calculs pour le FOOTER
-          total_ram+=ram
-          total_cpu+=cpu
-          count++
-          displayed++
-
-        # Sortie si on a affiché le max de ligne possible
-          if(limit>0&&displayed==limit) exit
-    }
-    END{
-        if(nofooter) exit
-        printf RED "%0s %-15s %6.0f %6.1f %5s %s" RESET "\033[K\n","","TOTAL (disp.):",total_ram,total_cpu/ncpu," ("count, "proc out of " totalproc ")"
-        print displayed > drawn_file
-        close(drawn_file)
-    }
-EOF
-)
-
-# on protège les 2 variables
-readonly AWKNOOB
-readonly AWKSIMPLE
-
-return 0
-}
-
-
-
-# FONCTIONS BASH ####################################################################################################################
-#####################################################################################################################################
-#####################################################################################################################################
-CLEANUP() {
-    local END_TIME
-    printf '\033[?25h\033[?1049l\033[H\033[2J'
-    LOG
-    STATS
-    END_TIME=${SECONDS}
-    echo -e "${Jaune}Fichier de log ${Reset}: ${Bleu}${LOGFILE}${Reset}"
-    echo -e "\n󱠢  Au revoir... (${Jaune}${NAME}${Reset} v${Bleu}${VER}${Reset} a fonctionné pendant ${Bleu}$((END_TIME - START_TIME))${Reset}s)"
-    exit 0
-}
-#####################################################################################################################################
-ERROR() {
-    local END_TIME
-    printf '\033[?25h\033[?1049l\033[H\033[2J'
-    echo -e "\n${RougeBold}  Terminal trop petit, affichage correct impossible\n"
-    END_TIME=${SECONDS}
-    echo -e "=> Arrêt forcé.${Reset}(${Jaune}${NAME}${Reset} v${Bleu}${VER}${Reset} a fonctionné pendant ${Bleu}$((END_TIME - START_TIME))${Reset}s)${Reset}"
-    LOG
-    exit 1
-}
-#####################################################################################################################################
-EXISTS() {
-    command -v "$1" >/dev/null 2>&1
-}
-#####################################################################################################################################
-#shellcheck disable=SC2310
-INITIALCONF() { # définition des variables globales principales
-    if EXISTS ps && EXISTS awk ; then
-        PS=$(command -v ps 2>/dev/null)
-        AWK=$(command -v awk 2>/dev/null)
-        DIRCACHE="${HOME}/.cache/psim"
-	    mkdir -p "${DIRCACHE}"
-        SORT="-%cpu"
-        LIMIT=0
-        NEWBIE=1
-        INTERVAL=1
-        NO_HEADER=0
-        KERNEL=0
-        NO_COLOR=0
-        OFFSET=0
-        TOTAL_PROCS=0
-        FREEZE=0
-        STATIC=0
-        FILTER=""
-        NCPU=$(nproc)
-        ME=$(whoami)
-        FORCE_HEADER=0
-        DRAWN_FILE="${DIRCACHE}/drawn"
-        : > "${DRAWN_FILE}"
-
-
-        # TIPS_STATE : 0 = ni tips ni footer / 1 = tips + footer / 2 = tips sans footer
-        TIPS_STATE=1
-
-        # en mode noob par défaut on ne montre pas la colonne OPTIONS et le chemin des PROGRAM
-        [[ ${NEWBIE} -eq 1 ]] && SHOW_OPTS=0 || SHOW_OPTS=1
-
-        SEUILFREEZE=3599
-        PSNOOB="pid,user:8,rss,%cpu,cmd"                  # format ps -o 'newbie'
-        PSSIMPLE="pid,ppid,user:8,nice,rss,%mem,%cpu,cmd" # format ps -o 'normal'
-
-        readonly PSNOOB PSSIMPLE PS AWK SEUILFREEZE ME NCPU
-
-        # Chargement d'un éventuel fichier de conf qui écrase les valeurs initiales hardcodées
-        mkdir -p "${DIR}"
-        if [[ -f "${CONFIG}" ]]; then
-            # shellcheck source=/dev/null
-            source "${CONFIG}"
+RESTORE_SCREEN() {
+    if (( ALT == 1 )); then
+        if [[ -n "${STTY_SAVE}" ]]; then
+            stty "${STTY_SAVE}" 2>/dev/null || true
         fi
-
-        # j'initialise les 2 scripts awk dans des variables globales en lecture seule.
-        _awk
-        return 0
-    else # pb de dépendances
-        echo ""
-        EXISTS ps  || echo -e "\033[31mLa commande ps est manquante...\033[0m"
-        EXISTS awk || echo -e "\033[31mLa commande awk est manquante...\033[0m"
-        echo -e "\n 󱠢  Au revoir..."
-        exit 1
-    fi
-}
-#####################################################################################################################################
-# shellcheck disable=SC2249
-APPLY_TIPS_STATE() {
-    case "${TIPS_STATE}" in
-        0) NO_FOOTER=1 ;;
-        1) NO_FOOTER=0 ;;
-        2) NO_FOOTER=1 ;;
-    esac
-}
-#####################################################################################################################################
-LOG() { # on stocke les valeurs utilisées
-    local heure date format versionps versionawk
-    LOGDIR="${DIRCACHE}"
-    LOGFILE="${LOGDIR}/log"
-    [[ -e "${LOGFILE}" ]] || touch "${LOGFILE}"
-
-    [[ ${NEWBIE} -eq 1 ]] && format="${PSNOOB}" || format="${PSSIMPLE}"
-    heure="$(date '+%T')"
-    date="$(date '+%A %d %B %Y')"
-    versionps=$("${PS}" --version)
-    versionawk=$("${AWK}" --version | head -1)
-
-    {   echo "Nom         : ${NAME}"
-        echo "Date        : ${heure}, le ${date}"
-        echo "Version     : ${VER}"
-        echo "USER        : ${ME}"
-        echo "ncpu        : ${NCPU}"
-        echo "PS          : ${PS} (${versionps})"
-        echo "AWK         : ${AWK} (${versionawk})"
-        echo "Tri         : ${SORT}"
-        echo "Mode Newbie : ${NEWBIE}"
-        echo "Format ps   : ${format}"
-        echo "Refresh     : ${INTERVAL}"
-        echo "NO header   : ${NO_HEADER}"
-        echo "TIPS        : ${TIPS_STATE}"
-        echo "Kernel mode : ${KERNEL}"
-        echo "NO color    : ${NO_COLOR}"
-        echo "Static      : ${STATIC}"
-        echo "show opts   : ${SHOW_OPTS}"
-        echo "Filtre      : ${FILTER}"
-        echo "Terminal    : ${TERM}"
-        echo "Colonnes    : ${COLUMNS}"
-        echo "Lignes      : ${LINES}"
-        echo "---------------------------------------------------------------------------"
-        echo ""
-    } >> "${LOGFILE}"
-
-    return 0
-}
-#####################################################################################################################################
-COUNT_PROCS(){ # calcule le nb total de processus en excluant ps lui-même
-    local debug="${DIRCACHE}/debug" maxps
-    maxps="${WIDTH}"
-    if [[ -n "${FILTER}" ]]; then
-        "${PS}" --no-headers --deselect --pid 2 --ppid 2 --deselect --pid "${MYPID}" --ppid "${MYPID}" \
-        -o user=,cmd= --cols="${maxps}" 2>/dev/null | grep -Ei "${FILTER}" > "${debug}"
-    else
-        case "${KERNEL}" in
-            0)  # USERLAND only
-                "${PS}" --no-headers --deselect --pid 2 --ppid 2 --deselect --pid "${MYPID}" --ppid "${MYPID}" 2>/dev/null > "${debug}"
-                ;;
-
-            1)  # KERNEL + USERLAND
-                "${PS}" --no-headers --deselect --pid "${MYPID}" --ppid "${MYPID}" 2>/dev/null > "${debug}"
-                ;;
-
-            2)  # KERNEL only
-                "${PS}" --no-headers --pid 2 --ppid 2  2>/dev/null > "${debug}"
-                ;;
-
-            *) ;;
-        esac
-    fi
-    TOTAL_PROCS=$(wc -l < "${debug}")
-    rm -f "${debug}"
-    return 0
-}
-#####################################################################################################################################
-DISPLAY-TIPS(){ # Barre d'aide
-    local scroll_info="" seuilsimple=160
-    local cc cm cp cu ck ch cf CF cC co cP
-    local int base_plain base_color filterstr="" available intcolor
-
-    [[ ${OFFSET} -gt 0 ]] && scroll_info=" [+${OFFSET}]"
-
-    cc="${BleuBold}" ; cm="${BleuBold}" ; cp="${BleuBold}" ; cu="${BleuBold}" ; cC="${BleuBold}"
-    ck="${BleuBold}" ; ch="${BleuBold}" ; cf="${BleuBold}" ; CF="${BleuBold}" ; co="${BleuBold}" ; cP="${BleuBold}"
-
-    case "${SORT}" in
-        -%cpu|%cpu) cc="${Vert}" ;;
-        -rss|rss) cm="${Vert}" ;;
-        -pid|pid) cp="${Vert}" ;;
-        -ppid|ppid) cP="${Vert}" ;;
-        -user|user) cu="${Vert}" ;;
-        -cmd|cmd) cC="${Vert}" ;;
-        *) ;;
-    esac
-
-    [[ ${KERNEL} -ne 0 ]] && ck="${Vert}"
-    [[ ${NO_HEADER} -eq 0 ]] && ch="${Vert}"
-    [[ ${TIPS_STATE} -ge 1 ]] && cf="${Vert}"
-    [[ ${FREEZE} -ge 1 ]] && CF="${Vert}"
-    [[ ${SHOW_OPTS} -eq 1 ]] && co="${Vert}"
-
-    intcolor="${Vert}${INTERVAL}${Gris}s"
-    int="${INTERVAL}s"
-
-    if [[ ${WIDTH} -lt ${seuilsimple} ]]; then
-        [[ ${INTERVAL} -ge ${SEUILFREEZE} ]] && { intcolor="${Vert}F${Gris}"; int="F"; }
-        base_plain="  [c]pu [m]em [p]id [P]pid [u]ser [C]md [o] [k] [h] [f] [] [q]uit [+/-] [F]   ${int}${scroll_info}"
-        base_color="   ${cc}[c]${ResetFg}pu ${cm}[m]${ResetFg}em ${cp}[p]${ResetFg}id ${cP}[P]${ResetFg}pid ${cu}[u]${ResetFg}ser ${cC}[C]${ResetFg}md ${co}[o]${ResetFg} ${ck}[k]${ResetFg} ${ch}[h]${ResetFg} ${cf}[f]${ResetFg} ${BleuBold}[] [q]${ResetFg}uit ${BleuBold}[+/-]${ResetFg} ${CF}[F]${ResetFg}   ${intcolor}${scroll_info}${ResetFg}"
-    else
-        [[ ${INTERVAL} -ge ${SEUILFREEZE} ]] && { intcolor="${Vert}FREEZE${Gris}"; int="FREEZE"; }
-        base_plain="  [c]pu | [m]em | [p]id | [P]pid | [u]ser | [C]md | [o]ptions | [k]ernel | [h]eader | [f]ooter | []mode | [↕]scroll | [q]uit | [+/-]refresh | [F]reeze   ${int}${scroll_info}"
-        base_color="   ${cc}[c]${ResetFg}pu | ${cm}[m]${ResetFg}em | ${cp}[p]${ResetFg}id | ${cP}[P]${ResetFg}pid | ${cu}[u]${ResetFg}ser | ${cC}[C]${ResetFg}md | ${co}[o]${ResetFg}ptions | ${ck}[k]${ResetFg}ernel | ${ch}[h]${ResetFg}eader | ${cf}[f]${ResetFg}ooter | ${BleuBold}[]${ResetFg}mode | ${BleuBold}[↕]${ResetFg}scroll | ${BleuBold}[q]${ResetFg}uit | ${BleuBold}[+/-]${ResetFg}refresh | ${CF}[F]${ResetFg}reeze   ${intcolor}${scroll_info}${ResetFg}"
-    fi
-
-    # on calcule la place restante pour afficher le FILTRE en croppant le moins possible
-    if [[ -n "${FILTER}" ]]; then
-        available=$(( WIDTH - ${#base_plain} - 6 ))
-        [[ ${available} -lt 0 ]] && available=0
-        if [[ ${#FILTER} -gt ${available} && ${available} -ge 2 ]]; then
-            filterstr=" ${Jaune}${FILTER:0:$((available - 1))}${Gris}>>${ResetFg}"
-        else
-            filterstr=" ${Jaune}${FILTER:0:available}${ResetFg}"
-        fi
-    fi
-
-    printf "%s%s%s\033[K%s" "${BgGrisFonce}" "${base_color}" "${filterstr}" "${Reset}"
-    return 0
-}
-
-
-# DISPLAY-TIPS2(){ # Barre d'aide
-#     local scroll_info="" seuilsimple=160 filterstr=""
-#     [[ ${OFFSET} -gt 0 ]] && scroll_info=" ${Jaune}[+${OFFSET}]${ResetFg}"
-#
-#     # Couleur dynamique selon état actif
-#     local cc cm cp cu ck ch cf CF cC co cP
-#     cc="${BleuBold}" ; cm="${BleuBold}" ; cp="${BleuBold}" ; cu="${BleuBold}" ; cC="${BleuBold}"
-#     ck="${BleuBold}" ; ch="${BleuBold}" ; cf="${BleuBold}" ; CF="${BleuBold}" ; co="${BleuBold}" ; cP="${BleuBold}"
-#     case "${SORT}" in
-#         -%cpu|%cpu)  cc="${Vert}" ;;
-#         -rss|rss)    cm="${Vert}" ;;
-#         -pid|pid)    cp="${Vert}" ;;
-#         -ppid|ppid)  cP="${Vert}" ;;
-#         -user|user)  cu="${Vert}" ;;
-#         -cmd|cmd)    cC="${Vert}" ;;
-#         *) ;;
-#     esac
-#     [[ ${KERNEL}    -ne 0 ]]  && ck="${Vert}"
-#     [[ ${NO_HEADER} -eq 0 ]]  && ch="${Vert}"
-#     [[ ${TIPS_STATE} -ge 1 ]] && cf="${Vert}"
-#     [[ ${FREEZE} -ge 1 ]]     && CF="${Vert}"
-#     [[ ${SHOW_OPTS} -eq 1 ]]  && co="${Vert}"
-#
-#     printf "%s" "${BgGrisFonce}"
-#     int="${Vert}${INTERVAL}${Gris}s"
-#     if [[ -n "${FILTER}" ]]; then
-#         filterstr=" ${Jaune}${FILTER:0:20}"
-#     fi
-#     if [[ ${WIDTH} -lt ${seuilsimple} ]]; then # simplifié (moins de place)
-#     	[[ ${INTERVAL} -ge ${SEUILFREEZE} ]] && int="${Vert}F${Gris}"
-#         echo -n "   ${cc}[c]${ResetFg}pu" \
-#                    "${cm}[m]${ResetFg}em" \
-#                    "${cp}[p]${ResetFg}id" \
-#                    "${cP}[P]${ResetFg}pid" \
-#                    "${cu}[u]${ResetFg}ser" \
-#                    "${cC}[C]${ResetFg}md" \
-#                    "${co}[o]${ResetFg}" \
-#                    "${ck}[k]${ResetFg}" \
-#                    "${ch}[h]${ResetFg}" \
-#                    "${cf}[f]${ResetFg}" \
-#                    "${BleuBold}[ ] [q]${ResetFg}uit" \
-#                    "${BleuBold}[+/-]${ResetFg}" \
-#                    "${CF}[F]${ResetFg}" \
-#                "    ${int}${filterstr}${scroll_info}${ResetFg}"
-#     else
-#     	[[ ${INTERVAL} -ge ${SEUILFREEZE} ]] && int="${Vert}FREEZE${Gris}"
-#         echo -n "   ${cc}[c]${ResetFg}pu |" \
-#                    "${cm}[m]${ResetFg}em |" \
-#                    "${cp}[p]${ResetFg}id |" \
-#                    "${cP}[P]${ResetFg}pid |" \
-#                    "${cu}[u]${ResetFg}ser |" \
-#                    "${cC}[C]${ResetFg}md |" \
-#                    "${co}[o]${ResetFg}ptions |" \
-#                    "${ck}[k]${ResetFg}ernel |" \
-#                    "${ch}[h]${ResetFg}eader |" \
-#                    "${cf}[f]${ResetFg}ooter |" \
-#                    "${BleuBold}[ ]${ResetFg}mode |" \
-#                    "${BleuBold}[↓↑]${ResetFg}scroll |" \
-#                    "${BleuBold}[q]${ResetFg}uit |" \
-#                    "${BleuBold}[+/-]${ResetFg}refresh |" \
-#                    "${CF}[F]${ResetFg}reeze  " \
-#                 "  ${int}${filterstr}${scroll_info}${ResetFg}"
-#     fi
-#     printf '\033[K'
-#     echo -ne "${Reset}"
-#     return 0
-# }
-
-#####################################################################################################################################
-MANAGE-KEYS(){ # gestion des raccourcis en mode dynamique
-    local key seq
-    # timeout fixé à la valeur de refresh, si pas de touche on sort sans rien faire.
-    if read -rt "${INTERVAL}" -n 1 key 2>/dev/null; then
-        # Capture séquence ESC (flèches = ESC [A ou ESC [B donc on capture ESC puis 2 caractères)
-        if [[ "${key}" == $'\e' ]]; then # ( nota : $'\e' = ESC )
-            read -rt 0.05 -n 2 seq 2>/dev/null || true
-            key+=${seq}
-        fi
-        case "${key}" in
-            # ------------------------------------- touches simples ------------------------------------- :
-            o) [[ -z "${FILTER}" ]] && SHOW_OPTS=$((1 - SHOW_OPTS)) ;; # options
-            k) KERNEL=$(( (KERNEL + 1) % 3 )) ; [[ -n "${FILTER}" ]] && KERNEL=0 ;; # process noyau
-            h) NO_HEADER=$((1 - NO_HEADER)) ;; # header
-            f) TIPS_STATE=$(( (TIPS_STATE + 1) % 3 )) ;; # footer
-            q|Q) CLEANUP ;; # sortie
-
-            # gestion délai avant refresh +/-/Freeze
-            +) ((INTERVAL < 120)) && ((INTERVAL++)) || true
-               ((INTERVAL >= SEUILFREEZE - 1 )) && INTERVAL=$(( INTERVALDEF + 1 )) || true
-               ;;
-
-            -) ((INTERVAL > 1)) && ((INTERVAL--)) || true
-               ((INTERVAL >= SEUILFREEZE - 1 )) && INTERVAL=$(( INTERVALDEF - 1 )) || true
-               ;;
-
-            F)  if [[ "${FREEZE}" -eq 1 ]]; then # on repasse en non gelé avec intervalle par défaut
-					FREEZE=0
-					INTERVAL=${INTERVALDEF}
-				else
-            		INTERVAL=${SEUILFREEZE}
-            		FREEZE=1
-            	fi
-            	;;
-
-            # Les différents tris de ps (cpu, mem, cmd, ...)
-            c)  if [[ "${SORT}" = "-%cpu" ]]; then
-                    SORT="%cpu"
-                elif [[ "${SORT}" = "%cpu" ]]; then
-                    SORT="-%cpu"
-                else
-                    SORT="-%cpu"
-                fi
-                OFFSET=0
-                ;;
-
-            C)  if [[ "${SORT}" = "-cmd" ]]; then
-                    SORT="cmd"
-                elif [[ "${SORT}" = "cmd" ]]; then
-                    SORT="-cmd"
-                else
-                    SORT="cmd"
-                fi
-                SHOW_OPTS=1 # force affichage chemin complet
-                OFFSET=0
-                ;;
-
-            u)  if [[ "${SORT}" = "-user" ]]; then
-                    SORT="user"
-                elif [[ "${SORT}" = "user" ]]; then
-                    SORT="-user"
-                else
-                    SORT="user"
-                fi
-                OFFSET=0
-                ;;
-
-            p)  if [[ "${SORT}" = "-pid" ]]; then
-                    SORT="pid"
-                elif [[ "${SORT}" = "pid" ]]; then
-                    SORT="-pid"
-                else
-                    SORT="pid"
-                fi
-                OFFSET=0
-                ;;
-
-            P)  if [[ "${SORT}" = "-ppid" ]]; then
-                    SORT="ppid"
-                elif [[ "${SORT}" = "ppid" ]]; then
-                    SORT="-ppid"
-                else
-                    SORT="ppid"
-                fi
-                OFFSET=0
-                ;;
-
-            m)  if [[ "${SORT}" = "-rss" ]]; then
-                    SORT="rss"
-                elif [[ "${SORT}" = "rss" ]]; then
-                    SORT="-rss"
-                else
-                    SORT="-rss"
-                fi
-                OFFSET=0
-                ;;
-
-            # ------------------------------------ /touches simples ---
-
-            # ------------------------------------ touches composées  ------------------------------------- :
-            $'\e[D') NEWBIE=1 ;; # flèche gauche
-            $'\e[C') NEWBIE=0 ;; # flèche droite
-            $'\e[A') # flèche haut
-                     ((OFFSET > 0)) && ((OFFSET--)) || true
-                     COUNT_PROCS
-                     ;;
-
-            $'\e[B') # flèche bas
-                     local max_offset=$(( TOTAL_PROCS - LIMIT ))
-                     [[ ${max_offset} -lt 0 ]] && max_offset=0
-                     ((OFFSET < max_offset)) && ((OFFSET++)) || true
-                     COUNT_PROCS
-                     ;;
-
-            $'\e[H') # Home/Début
-                     OFFSET=0
-                     COUNT_PROCS
-                     ;;
-
-            $'\e[F') # End/Fin
-                     max_offset=$(( TOTAL_PROCS - LIMIT ))
-                     (( max_offset < 0 )) && max_offset=0
-                     OFFSET="${max_offset}"
-                     COUNT_PROCS
-                     ;;
-                # ------------------------------------ /touches composées  ---
-            *) ;;
-        esac
+        printf '\033[?25h\033[?1049l\033[0m'
+        ALT=0
     fi
     return 0
 }
-#####################################################################################################################################
-# shellcheck disable=SC2034
+
+QUIT() { exit "${1:-0}"; }
+
 DEFINE_COLORS() {
-    if [[ ${NO_COLOR} -eq 1 ]] || [[ ! -t 1 ]]; then
-        Rouge=""
-        Vert=""
-        Jaune=""
-        Bleu=""
-        BleuBold=""
-        Cyan=""
-        Blanc=""
-        RougeBold=""
-        BgGrisFonce=""
-        ResetFg=""
-        ResetBg=""
-        Reset=$'\033[0m'
-        Underline=$'\033[4m'
+    if (( NO_COLOR == 1 )) || (( TTY == 0 )) || [[ "${TERM:-dumb}" == "dumb" ]]; then
+        Rouge="" Vert="" VertBold="" Jaune="" Bleu="" BleuBold="" Magenta="" Cyan="" Blanc=""
+        RougeBold="" Gris="" BgGris="" Reset="" ResetFg="" Underline=""
     else
-        Rouge=$'\033[31m'
-        Vert=$'\033[32m'
-        Jaune=$'\033[33m'
-        Bleu=$'\033[34m'
-        BleuBold=$'\033[1;34m'
-        Cyan=$'\033[36m'
-        Blanc=$'\033[37m'
-        RougeBold=$'\033[1;31m'
-        Gris=$'\033[37m'
-        BgGrisFonce=$'\033[100m'
-        ResetFg=$'\033[39m'
-        ResetBg=$'\033[49m'
-        Reset=$'\033[0m'
-        Underline=$'\033[4m'
+        Rouge=$'\033[31m' ; Vert=$'\033[32m' ; VertBold=$'\033[1;32m' ; Jaune=$'\033[33m'
+        Bleu=$'\033[34m'  ; BleuBold=$'\033[1;34m' ; Magenta=$'\033[35m'
+        Cyan=$'\033[36m'  ; Blanc=$'\033[37m' ; RougeBold=$'\033[1;31m'
+        Gris=$'\033[37m'  ; BgGris=$'\033[100m'
+        Reset=$'\033[0m'  ; ResetFg=$'\033[39m' ; Underline=$'\033[4m'
     fi
+    return 0
 }
 
-#####################################################################################################################################
-USAGE(){
-    echo -e "${Vert}USAGE${Reset}"
-    echo -e "   ${Jaune}${NAME}${Bleu} ${Reset}[${Bleu}--pid${Reset}|${Bleu}--ppid${Reset}|${Bleu}--cpu${Reset}|${Bleu}--mem${Reset}|${Bleu}--user${Reset}|${Bleu}--cmd${Reset}] [${Bleu}--newbie${Reset}] [${Bleu}--fullcmd${Reset}] [${Bleu}--filter${Reset}] [${Bleu}--watch ${Cyan}interval${Reset}] ${Reset}[${Bleu}--${Cyan}0${Reset}|${Bleu}--${Cyan}10${Reset}|${Bleu}--${Cyan}20${Reset}|${Bleu}--${Cyan}40${Reset}|${Bleu}--${Cyan}..${Reset}] [${Bleu}--kernel${Reset}|${Bleu}--kernel-only${Reset}] [${Bleu}--no-header${Reset}] [${Bleu}--no-footer${Reset}] [${Bleu}--no-color${Reset}]${Reset}"
-    echo ""
+##############################################################################
+# Configuration (parsing strict, aucune évaluation de shell)
+##############################################################################
+CONFIG_DEFAULTS() {
+    NEWBIE=1
+    INTERVAL=1
+    HEADER=1
+    FOOTER=1
+    TIPS=1
+    NO_COLOR=0
+    KERNEL=0
+    SHOW_OPTS=0
+    SORT="-%cpu"
+    FILTER=""
+    LOG=1
+    DEBUG=0
+    CPU_MODE=0
+    STATIC=0
     return 0
 }
-#####################################################################################################################################
-VERSION(){
-    echo -e "version ${Jaune}${VER}${Reset}"
+
+SET_BOOL() {  # SET_BOOL NOM VALEUR NUMÉRO_DE_LIGNE
+    local name="$1" val="$2"
+    local -i line="$3"
+    case "${val}" in
+        0|1) printf -v "${name}" '%s' "${val}" ;;
+        *)   WARN "${CONFIG}:${line}: ${name} doit valoir 0 ou 1 (ligne ignorée)"; return 1 ;;
+    esac
     return 0
 }
-#####################################################################################################################################
-HELP(){
+
+LOAD_CONFIG() {
+    local line key val
+    local -i n=0 bad=0
+
+    [[ -f "${CONFIG}" ]] || return 0
+    if [[ ! -r "${CONFIG}" ]]; then
+        WARN "${CONFIG} illisible : configuration ignorée"
+        return 0
+    fi
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        n=$((n + 1))
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "${line}" ]] && continue
+
+        if [[ ! "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            WARN "${CONFIG}:${n}: ligne ignorée (format attendu CLÉ=VALEUR)"
+            bad=$((bad + 1))
+            continue
+        fi
+        key="${BASH_REMATCH[1]}"
+        val="${BASH_REMATCH[2]}"
+        val="${val%\"}" ; val="${val#\"}"
+        val="${val%\'}" ; val="${val#\'}"
+
+        case "${key}" in
+            NEWBIE|HEADER|FOOTER|TIPS|NO_COLOR|SHOW_OPTS|LOG|DEBUG|CPU_MODE)
+                # volontaire : une valeur invalide est comptée et le chargement continue
+                # shellcheck disable=SC2310
+                SET_BOOL "${key}" "${val}" "${n}" || bad=$((bad + 1))
+                ;;
+            INTERVAL)
+                if [[ "${val}" =~ ^[0-9]+$ ]] && (( 10#${val} <= INTERVAL_MAX )); then
+                    INTERVAL=$((10#${val}))
+                    (( INTERVAL == 0 )) && STATIC=1
+                    (( INTERVAL >= INTERVAL_MAX )) && FREEZE=1
+                else
+                    WARN "${CONFIG}:${n}: INTERVAL attend un entier 0..${INTERVAL_MAX} (ignoré)"
+                    bad=$((bad + 1))
+                fi
+                ;;
+            KERNEL)
+                if [[ "${val}" =~ ^[0-2]$ ]]; then
+                    KERNEL="${val}"
+                else
+                    WARN "${CONFIG}:${n}: KERNEL doit valoir 0, 1 ou 2 (ignoré)"
+                    bad=$((bad + 1))
+                fi
+                ;;
+            SORT)
+                case "${val}" in
+                    pid|-pid|ppid|-ppid|user|-user|cmd|-cmd|rss|-rss|%cpu|-%cpu|%mem|-%mem|nice|-nice)
+                        SORT="${val}" ;;
+                    *) WARN "${CONFIG}:${n}: tri « ${val} » inconnu (ignoré)"; bad=$((bad + 1)) ;;
+                esac
+                ;;
+            STATS) : ;;   # ancienne clé, sans effet
+            FILTER) FILTER="${val}" ;;
+            *)
+                WARN "${CONFIG}:${n}: clé inconnue « ${key} » (ignorée)"
+                bad=$((bad + 1))
+                ;;
+        esac
+    done < "${CONFIG}"
+
+    (( bad == 0 )) || WARN "${bad} ligne(s) de ${CONFIG} ignorée(s)"
+    return 0
+}
+
+##############################################################################
+# Aide / arguments
+##############################################################################
+VERSION() { printf 'version %s%s%s — %s\n' "${Jaune}" "${VER}" "${Reset}" "${NAME}"; return 0; }
+
+USAGE() {
+    cat <<EOF
+${Vert}USAGE${Reset}
+   ${Jaune}${NAME}${Reset} [OPTIONS] [--N]
+
+${Vert}OPTIONS${Reset}
+   ${Bleu}-p, --pid${Reset}              tri par PID
+   ${Bleu}-P, --ppid${Reset}             tri par PPID
+   ${Bleu}-m, --mem${Reset}              tri par mémoire résidente
+   ${Bleu}-c, --cpu${Reset}              tri par %CPU
+   ${Bleu}-N, --nice${Reset}             tri par valeur nice (NI)
+   ${Bleu}-u, --user${Reset}             tri par propriétaire
+   ${Bleu}-C, --cmd${Reset}              tri par commande
+   ${Bleu}-n, --newbie${Reset}           affichage simplifié (PID USER MiB %CPU CMD)
+   ${Bleu}-k, --kernel${Reset}           inclure les threads noyau
+   ${Bleu}-K, --kernel-only${Reset}      uniquement les threads noyau
+   ${Bleu}-g, --filter MOTIF${Reset}     filtre ERE (utilisateur + commande + arguments)
+   ${Bleu}-w, --watch N${Reset}          rafraîchir toutes les N s (0 = statique)
+   ${Bleu}-H, --no-header${Reset}        masquer l'entête
+   ${Bleu}-F, --no-footer${Reset}        masquer le pied de page
+   ${Bleu}-T, --no-tips${Reset}          masquer le bandeau des raccourcis
+   ${Bleu}-O, --fullcmd${Reset}          chemin complet et arguments
+   ${Bleu}-0, --no-color${Reset}         sans couleurs
+   ${Bleu}-M, --machine-cpu${Reset}      %CPU des lignes en % de la machine (défaut : par cœur)
+   ${Bleu}    --per-core${Reset}         %CPU des lignes par cœur (défaut)
+   ${Bleu}    --debug${Reset}            ne pas masquer les erreurs ps/awk
+   ${Bleu}    --N${Reset}                N premiers processus, une seule fois (N=0 : tout)
+   ${Bleu}-v, --version${Reset}          version
+   ${Bleu}-h, --help${Reset}             cette aide
+EOF
+    return 0
+}
+
+HELP() {
     VERSION
     USAGE
-    echo -e "${Vert}DESCRIPTION${Reset}"
-    echo -e "   ${Jaune}${NAME}${Reset} affiche une liste des processus en cours en mettant en forme la sortie de la commande ps.${Reset}"
-    echo -e "   ${Jaune}${NAME}${Reset} possède 2 modes : Statique (état instantané) ou Dynamique (pour contrôle en temps réel à la ${Jaune}top${Reset}).${Reset}"
-    echo ""
-    echo -e "${Vert}OPTIONS${Reset}"
-    echo -e "${Bleu}   --pid,           -p  ${Reset}      : affichage trié par PID.${Reset}"
-    echo -e "${Bleu}   --ppid,          -P  ${Reset}      : affichage trié par PPID.${Reset}"
-    echo -e "${Bleu}   --mem,           -m  ${Reset}      : affichage trié par occupation mémoire.${Reset}"
-    echo -e "${Bleu}   --cpu,           -c  ${Reset}      : affichage trié par utilisation CPU.${Reset}"
-    echo -e "${Bleu}   --user,          -u  ${Reset}      : affichage trié par propriétaire du processus.${Reset}"
-    echo -e "${Bleu}   --cmd,           -C  ${Reset}      : affichage trié par cmd.${Reset}"
-    echo -e "${Bleu}   --newbie,        -n  ${Reset}      : affichage simplifié.${Reset}"
-    echo -e "${Bleu}   --watch ${Cyan}N${Bleu},       -w ${Cyan}N${Reset}      : affichage toutes les ${Cyan}N${Reset} secondes (${Bleu}--watch ${Cyan}0${Reset} : mode statique)."
-    echo -e "${Bleu}   --kernel,        -k  ${Reset}      : affichage forcé des processus du noyau Linux.${Reset}"
-    echo -e "${Bleu}   --kernel-only,   -K  ${Reset}      : affichage uniquement des processus du noyau Linux.${Reset}"
-    echo -e "${Bleu}   --no-color,      -0  ${Reset}      : affichage sans couleurs.${Reset}"
-    echo -e "${Bleu}   --no-header,     -H  ${Reset}      : affichage sans la ligne d'entête.${Reset}"
-    echo -e "${Bleu}   --no-footer,     -F  ${Reset}      : affichage sans la ligne de pied de page.${Reset}"
-    echo -e "${Bleu}   --fullcmd,       -O  ${Reset}      : affichage du chemin complet et des arguments.${Reset}"
-    echo -e "${Bleu}   --filter ${Cyan}String${Bleu}, -g ${Cyan}String${Reset} : affichage filtré par la chaine ${Cyan}String${Reset}."
-    echo -e "${Bleu}   --version,       -v  ${Reset}      : affichage du numéro de version du script.${Reset}"
-    echo -e "${Bleu}   --help,          -h  ${Reset}      : affichage de l'aide du script.${Reset}"
-    echo -e "${Bleu}   --${Cyan}XY               ${Reset}        : affichage des ${Cyan}XY${Reset} premiers processus selon le tri choisi (${Bleu}--${Cyan}0${Reset} : afficher tout${Reset})."
-    echo ""
-    echo -e "${Vert}COMPORTEMENT${Reset}"
-    echo -e "${Jaune}   Par défaut${Reset} : affichage coloré permanent rafraichit toutes les secondes,"
-    echo "                trié par utilisation CPU,"
-    echo "                avec l'entête, et le pied de page,"
-    echo "                avec le bandeau de rappel des raccourcis,"
-    echo "                sans les processus noyau Linux."
-    echo ""
-    echo -e "   En mode ${Bleu}--newbie${Reset}, les colonnes suivantes sont affichées : ${Jaune}PID${Reset} | ${Jaune}USER${Reset} | ${Jaune}MiB${Reset} | ${Jaune}%CPU${Reset} | ${Jaune}COMMAND${Reset}"
-    echo -e "   Sinon, les colonnes suivantes sont affichées : ${Jaune}PID${Reset} | ${Jaune}PPID${Reset} | ${Jaune}USER${Reset} | ${Jaune}MiB${Reset} | ${Jaune}%CPU${Reset} | ${Jaune}%MEM${Reset} | ${Jaune}COMMAND${Reset}"
-    echo ""
-    echo -e "   L'argument ${Bleu}--${Cyan}XY${Reset} force les modes statique (${Bleu}--watch ${Cyan}0${Reset}), ${Bleu}--no-header${Reset} et ${Bleu}--no-footer${Reset}."
-    echo ""
-    echo -e "${Vert}DÉPENDANCES${Reset}"
-    echo -e "${Jaune}   ps${Reset}, outil de surveillance des processus."
-    echo -e "${Jaune}   awk${Reset}, outil de filtrage et mise en forme."
-    echo ""
-    echo -e "${Vert}EXEMPLES${Reset}"
-    echo -e "   ${Jaune}alias ps${Reset}=\"${Jaune}${NAME}${Bleu} --0${Reset}\" fournit un équivalent fonctionnel coloré de ${Jaune}ps${Bleu} aux --no-headers${Reset} (ou ${Jaune}ps ${Bleu}-ef --no-headers${Reset})."
-    echo ""
-    echo -e "   Cet ${Jaune}alias${Reset} permet alors des manipulations classiques"
-    echo -e "          ❯ ${Jaune}ps${Reset} | ${Jaune}grep${Reset} -E 'systemd|ssh'                                  (liste les processus contenant systemd ou ssh)"
-    echo -e "      ou  ❯ ${Jaune}ps${Reset} | ${Jaune}grep${Reset} \$USER                                             (liste les processus de l'utilisateur courant)"
-    echo -e "      ou  ❯ ${Jaune}ps${Reset} | ${Jaune}wc${Bleu} -l${Reset}                                                  (compte le nombre de processus)"
-    echo -e "      ou  ❯ ${Jaune}ps${Reset} > list.txt                                               (stocke la liste des processus dans un fichier)"
-    echo ""
-    echo -e "   ❯ ${Jaune}psim ${Bleu}-g ${Cyan}'firefox|telegram'${Reset} affiche les processus de Firefox et de Telegram en mode dynamique."
-    echo -e "   En mode filtrage ${Bleu}--filter${Reset}, le mode ${Bleu}--fullcmd${Reset} est forcé pour garantir une recherche plus pertinente."
-    echo ""
-    echo -e "   La commande ${Jaune}${NAME}${Reset}, lancée sans argument, permet de monitorer en temps réel les processus."
-    echo -e "   Des raccourcis clavier sont gérés pour changer les paramètres à la volée (${BleuBold}f${Reset} pour afficher un bandeau de rappel)."
-    echo ""
-    exit 0
+    cat <<EOF
+
+${Vert}DESCRIPTION${Reset}
+   ${Jaune}${NAME}${Reset} met en forme la sortie de ${Jaune}ps${Reset} : couleurs, colonnes alignées,
+   totaux, tri, filtre. Deux modes :
+     • ${Bleu}dynamique${Reset} : rafraîchissement permanent + raccourcis (défaut sur un terminal) ;
+     • ${Bleu}statique${Reset}  : un seul affichage (--N, --watch 0, ou sortie redirigée).
+
+${Vert}PIED DE PAGE${Reset}
+   ${Jaune}TOTAL (displayed)${Reset} cumule les lignes affichées : RSS sous ${Jaune}MiB${Reset}, %MEM sous ${Jaune}%MEM${Reset},
+   et ${Jaune}%CPU${Reset} dans la ${Jaune}même unité que les lignes${Reset} : par défaut 100 % = 1 cœur,
+   ou en % de la machine après la touche ${Jaune}M${Reset} / ${Jaune}--machine-cpu${Reset}
+   (colonne alors intitulée ${Jaune}%CPU/m${Reset}, comportement de ${Jaune}psim${Reset}).
+
+${Vert}RACCOURCIS (dynamique)${Reset}
+   /  filtre     Enter valider  Échap annuler     Ctrl-U effacer
+   c/m/p/P/N/u/C tri            o  options        M  %CPU machine
+   k  noyau
+   h  entête     f  pied        t/?  bandeau      q  quitter
+   +/-  délai    F  gel/dégel   ↑↓/Home/End       ←/→  newbie/étendu
+
+${Vert}FILTRE INTERACTIF${Reset}
+   ${Jaune}/${Reset} ouvre la saisie : le motif se construit caractère par caractère et la liste
+   se filtre en direct (Entrée valide, Échap annule, Backspace efface, Ctrl-U vide).
+   Un motif invalide vide la liste et affiche ${RougeBold}invalide${Reset} dans le bandeau.
+
+${Vert}PIPE / REDIRECTION${Reset}
+   Sans terminal, ${Jaune}${NAME}${Reset} passe en statique, sans couleur ni échappement,
+   sans troncature ni padding : ${Jaune}${NAME} > liste.txt${Reset}, ${Jaune}${NAME} | grep ssh${Reset},
+   ${Jaune}${NAME} -k | wc -l${Reset} se comportent comme avec ${Jaune}ps${Reset}.
+
+${Vert}CONFIGURATION${Reset}
+   ${Bleu}${CONFIG}${Reset} — une clé par ligne, ${Jaune}CLÉ=VALEUR${Reset}.
+   Clés : NEWBIE INTERVAL KERNEL SORT SHOW_OPTS HEADER FOOTER TIPS NO_COLOR
+          LOG DEBUG CPU_MODE FILTER
+   Le fichier n'est jamais interprété comme du shell ; les clés inconnues
+   sont signalées puis ignorées.
+
+${Vert}EXEMPLES${Reset}
+   ${Jaune}${NAME}${Reset}                       moniteur temps réel
+   ${Jaune}${NAME} -g 'firefox|telegram'${Reset}  filtrer (ERE du awk installé)
+   ${Jaune}${NAME} --20${Reset}                  20 premiers processus
+   ${Jaune}${NAME} -K --0${Reset}                threads noyau uniquement
+   ${Jaune}${NAME} -k | grep kworker${Reset}     dans un pipe
+
+${Vert}FICHIERS${Reset}
+   ${Bleu}${CONFIG}${Reset}              configuration
+   ${Bleu}${CACHE_DIR:-~/.cache/${CONF_NAME}}/log${Reset}   journal (LOG=1, rotation à 256 Kio)
+
+${Vert}LICENCE${Reset}
+   GPLv3 — auteur original jotenakis.
+EOF
+    return 0
 }
-#####################################################################################################################################
-MANAGE-ARGS(){
-    local opts
-    local limit_arg=""
-    local args=()
 
-    # argument en --X 'mode statique X ligne affichée'
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --[0-9]*)
-                limit_arg=$1
-                shift
-                ;;
-            *)
-                args+=("$1")
-                shift
-                ;;
-        esac
-    done
-
-    # autres arguments longs ou courts
-    if ! opts=$(getopt \
-        -o ckpPmnuHFKOw:hvC0g: \
-        -l cpu,pid,ppid,mem,user,cmd,fullcmd,newbie,kernel,no-header,no-footer,no-color,watch:,kernel-only,help,version,filter: \
-        -n "${NAME}" -- "${args[@]}" 2>&1); then
-        echo ""
-        echo -e "${Rouge}Erreur${Reset} : option inconnue ou invalide." >&2
-        echo ""
-        USAGE
-        exit 1
-    fi
-    eval set -- "${opts}"
-
-    local k=0 konly=0
-
-    while true; do
-        case "$1" in
-            -p|--pid)         SORT="pid"                  ; shift   ;;
-            -P|--ppid)        SORT="ppid"                 ; shift   ;;
-            -c|--cpu)         SORT="-%cpu"                ; shift   ;;
-            -m|--mem)         SORT="-rss"                 ; shift   ;;
-            -u|--user)        SORT="user"                 ; shift   ;;
-            -C|--cmd)         SORT="cmd"                  ; shift   ;;
-            -0|--no-color)    NO_COLOR=1 && DEFINE_COLORS ; shift   ;;
-            -n|--newbie)      NEWBIE=1                    ; shift   ;;
-            -k|--kernel)      k=1                         ; shift   ;;
-            -K|--kernel-only) konly=1                     ; shift   ;;
-            -H|--no-header)   NO_HEADER=1                 ; shift   ;;
-            -F|--no-footer)   TIPS_STATE=0                ; shift   ;;
-            -O|--fullcmd)     SHOW_OPTS=1                 ; shift   ;;
-            -g|--filter)      FILTER="$2"                 ; shift 2 ;;
-            -h|--help)        HELP    ;;
-            -v|--version)     VERSION ; exit 0;;
-            --)               shift   ; break ;;
-            -w|--watch)
-                if [[ $2 =~ ^[0-9]+$ ]]; then
-                    INTERVAL=$2 ; shift 2
-                    [[ ${INTERVAL} -ge ${SEUILFREEZE} ]] && FREEZE=1 # au moins 1h on considère FREEZE
-                    [[ ${INTERVAL} -eq 0 ]] && STATIC=1
+# Éclate une option courte groupée : -pn -> -p -n, -w5 -> -w 5, -ngfirefox -> -n -g firefox
+EXPAND_CLUSTER() {
+    local rest="${1#-}" c
+    CLUSTER_ARGS=()
+    while [[ -n "${rest}" ]]; do
+        c="${rest:0:1}"
+        rest="${rest:1}"
+        case "${c}" in
+            w|g)
+                if [[ -n "${rest}" ]]; then
+                    CLUSTER_ARGS+=("-${c}" "${rest}")
+                    rest=""
                 else
-                    echo -e "${Rouge}Erreur${Reset} : l'option ${Bleu}-w/--watch${Reset} attend un entier >= 0." >&2
-                    exit 1
+                    CLUSTER_ARGS+=("-${c}")
                 fi
                 ;;
             *)
-                echo -e "${Rouge}Erreur${Reset} : Argument inattendu (bug interne) : ${Bleu}${1}${Reset}."
-                usage ; exit 1
+                CLUSTER_ARGS+=("-${c}")
+                ;;
+        esac
+    done
+    return 0
+}
+
+NEED_ARG() {
+    [[ -n "${2}" ]] && return 0
+    ERR "l'option ${1} attend un argument."
+    QUIT 2
+}
+
+PARSE_ARGS() {
+    local arg
+    local -i k=0 konly=0
+
+    while (( $# > 0 )); do
+        arg="$1"
+        case "${arg}" in
+            --) shift; break ;;
+            -p|--pid)   SORT="pid";   shift ;;
+            -P|--ppid)  SORT="ppid";  shift ;;
+            -c|--cpu)   SORT="-%cpu"; shift ;;
+            -N|--nice)  SORT="nice";   shift ;;
+            -m|--mem)   SORT="-rss";  shift ;;
+            -u|--user)  SORT="user";  shift ;;
+            -C|--cmd)   SORT="cmd";   shift ;;
+            -n|--newbie) NEWBIE=1; shift ;;
+            -k|--kernel) k=1; shift ;;
+            -K|--kernel-only) konly=1; shift ;;
+            -H|--no-header) HEADER=0; shift ;;
+            -F|--no-footer) FOOTER=0; shift ;;
+            -T|--no-tips) TIPS=0; shift ;;
+            -O|--fullcmd) SHOW_OPTS=1; shift ;;
+            -0|--no-color) NO_COLOR=1; shift ;;
+            -M|--machine-cpu) CPU_MODE=1; shift ;;
+            --per-core) CPU_MODE=0; shift ;;
+            --debug) DEBUG=1; shift ;;
+            -h|--help) HELP; QUIT 0 ;;
+            -v|--version) VERSION; QUIT 0 ;;
+            -w|--watch)
+                NEED_ARG "${arg}" "${2:-}"
+                if [[ ! "${2}" =~ ^[0-9]+$ ]] || (( 10#${2} > INTERVAL_MAX )); then
+                    ERR "${arg} attend un entier entre 0 et ${INTERVAL_MAX}."
+                    QUIT 2
+                fi
+                INTERVAL=$((10#${2}))
+                (( INTERVAL == 0 )) && STATIC=1
+                (( INTERVAL && LIMIT == 0 )) && STATIC=0          # -w N écrase un INTERVAL=0 de la config
+                (( INTERVAL >= INTERVAL_MAX )) && FREEZE=1
+                shift 2
+                ;;
+            -g|--filter)
+                NEED_ARG "${arg}" "${2:-}"
+                FILTER="$2"
+                shift 2
+                ;;
+            --*)
+                if [[ "${arg}" == --filter=* || "${arg}" == --watch=* ]]; then
+                    shift
+                    set -- "${arg%%=*}" "${arg#*=}" "$@"
+                    continue
+                fi
+                if [[ "${arg}" =~ ^--([0-9]+)$ ]]; then
+                    LIMIT=$((10#${BASH_REMATCH[1]}))
+                    STATIC=1
+                    shift
+                else
+                    ERR "option inconnue : ${arg}"
+                    USAGE >&2
+                    QUIT 2
+                fi
+                ;;
+            -*)
+                if [[ "${arg}" =~ ^-[A-Za-z0-9]{2,}$ ]]; then
+                    EXPAND_CLUSTER "${arg}"
+                    shift
+                    set -- "${CLUSTER_ARGS[@]}" "$@"
+                    continue
+                fi
+                ERR "option inconnue : ${arg}"
+                USAGE >&2
+                QUIT 2
+                ;;
+            *)
+                ERR "argument inattendu : ${arg}"
+                QUIT 2
                 ;;
         esac
     done
 
-# gestion des incompatibilités
-    # quand on force le nb de processus à afficher (--XX) on passe en mode statique obligatoirement
-    if [[ -n ${limit_arg} ]]; then
-        LIMIT="${limit_arg#--}"
-        STATIC=1
+    if (( $# > 0 )); then
+        ERR "argument inattendu : $1"
+        QUIT 2
     fi
 
-    # processus noyau
-    if [[ ${konly} -eq 1 && ${k} -eq 1 ]]; then
-        echo -e "\n${Rouge}NOTE\n${Reset}   Les options ${Bleu}--kernel${Reset} et ${Bleu}--kernel-only${Reset} sont incompatibles !" >&2
-        echo "" ; usage ; exit 1
+    if (( k == 1 && konly == 1 )); then
+        ERR "--kernel et --kernel-only sont incompatibles."
+        QUIT 2
     fi
-    [[ ${konly} -eq 1 ]] && KERNEL=2
-    [[ ${k}     -eq 1 ]] && KERNEL=1
+    (( konly == 1 )) && KERNEL=2
+    (( k == 1 )) && KERNEL=1
 
-    # force mode affichage fullcmd si tri par cmd et si FILTRE non vide
-    [[ "${SORT}" = "cmd" ]] && SHOW_OPTS=1
+    [[ "${SORT}" == "cmd" ]] && SHOW_OPTS=1
     [[ -n "${FILTER}" ]] && SHOW_OPTS=1
 
-    # force pas d'affichage KERNEL en mode filtrage
-    [[ -n "${FILTER}" ]] && KERNEL=0
-
-# stdout est envoyé dans un fichier => force static
-    if [[ ! -t 1 ]]; then
-        NO_COLOR=1 ; NO_HEADER=1 ; TIPS_STATE=0 ; INTERVAL=0 ; STATIC=1
+    # pas de terminal (sortie OU entrée) : mode statique, sans couleurs ni décor
+    if (( TTY == 0 || STDIN_TTY == 0 )); then
+        NO_COLOR=1
+        STATIC=1
+        HEADER=0
+        FOOTER=0
+        TIPS=0
     fi
-
-# on stocke les variables utilisées au lancement
-    INTERVALDEF=${INTERVAL}
-    LOG
+    # mode statique : lignes seules, comme ps
+    if (( STATIC == 1 )); then
+        HEADER=0
+        FOOTER=0
+        TIPS=0
+    fi
     return 0
 }
-#####################################################################################################################################
-STATS() {
-	local file1 file2 file3 file4 file5 allproc userlandproc kernelproc displayedtop=6 top=50 HEAD
-	SORT=pid ; LIMIT=0 ; STATIC=1 ; NEWBIE=0 ; OFFSET=0 ; NO_COLOR=1 ; FORCE_HEADER=1 ; SHOW_OPTS=1
-	FILTER=""
-	readonly file1="${DIRCACHE}/all"
-	readonly file2="${DIRCACHE}/userland"
-	readonly file3="${DIRCACHE}/kernel"
-	readonly file4="${DIRCACHE}/top${top}cpu"
-	readonly file5="${DIRCACHE}/top${top}mem"
 
-	KERNEL=1 ; DISPLAY_STATIC > "${file1}"
-	KERNEL=0 ; DISPLAY_STATIC > "${file2}"
-	KERNEL=2 ; DISPLAY_STATIC > "${file3}"
-	allproc=$(wc -l < "${file1}")      && ((allproc--))           # header à ne pas compter
-	userlandproc=$(wc -l < "${file2}") && ((userlandproc--))      # header à ne pas compter
-	kernelproc=$(wc -l < "${file3}")   && ((kernelproc--))        # header à ne pas compter
-
-	echo -e "${Jaune}Statistiques processus${Reset}"
-	printf "=> Utilisateurs : ${Vert}%4d\e[0m (${Bleu}%s${Reset})\n" "${userlandproc}" "${file2}"
-	printf "=> Noyau        : ${Vert}%4d\e[0m (${Bleu}%s${Reset})\n" "${kernelproc}"   "${file3}"
-	printf "=> Total        : ${Vert}%4d\e[0m (${Bleu}%s${Reset})\n" "${allproc}"      "${file1}"
-    echo ""
-
-	LIMIT=${top}
-	HEAD=$((displayedtop + 1))
-	NEWBIE=1 ; KERNEL=0 ; SHOW_OPTS=0 ;
-    SORT=-%cpu ; DISPLAY_STATIC > "${file4}"
-    SORT=-rss  ; DISPLAY_STATIC > "${file5}"
-    echo -e "${Jaune}Top par %CPU${Reset} (${Bleu}${file4}${Reset})${Vert}"
-    head -"${HEAD}" "${file4}"
-    echo -e "${Reset}  ...\n"
-    echo -e "${Jaune}Top par %MEM${Reset} (${Bleu}${file5}${Reset})${Vert}"
-    head -"${HEAD}" "${file5}"
-    echo -e "${Reset}  ...\n"
-	return 0
+##############################################################################
+# Environnement
+##############################################################################
+INIT_PATHS() {
+    local cfg_home cache_home
+    cfg_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
+    cache_home="${XDG_CACHE_HOME:-${HOME}/.cache}"
+    CONFIG="${cfg_home}/${CONF_NAME}/default.conf"
+    if [[ ! -f "${CONFIG}" && -f "${cfg_home}/psim/default.conf" ]]; then
+        CONFIG="${cfg_home}/psim/default.conf"   # reprise de l'ancienne config
+    fi
+    CACHE_DIR="${cache_home}/${CONF_NAME}"
+    DRAW_FILE="${CACHE_DIR}/drawn.${SELF_PID}"
+    LOG_FILE="${CACHE_DIR}/log"
+    return 0
 }
-#####################################################################################################################################
-DISPLAY_DYNAMIC() {
-    local formatps
-    WIDTH=${COLUMNS:-$(tput cols)} # tput en fallback
-    WIDTH=$((WIDTH - 1)) # -2 par sécurité.
-    HEIGHT=${LINES:-$(tput lines)} # tput en fallback
-    local NEED_TOTAL=$((OFFSET > 0 || TIPS_STATE >= 1 ? 1 : 0))
-    [[ ${NEED_TOTAL} -eq 1 ]] && COUNT_PROCS
-    APPLY_TIPS_STATE
 
-    # calcul de la hauteur dynamique
-    LIMIT=${HEIGHT}
-    [[ ${NO_HEADER}  -eq 0 ]] && LIMIT=$((LIMIT - 1))
-    [[ ${NO_FOOTER}  -eq 0 ]] && LIMIT=$((LIMIT - 1))
-    [[ ${TIPS_STATE} -ge 1 ]] && LIMIT=$((LIMIT - 1))
-    [[ ${LIMIT} -lt 1 ]] && LIMIT=10 # fallback
-    #-----------
+CHECK_DEPS() {
+    local -i missing=0
+    PS_BIN=$(command -v ps 2>/dev/null || true)
+    AWK_BIN=$(command -v awk 2>/dev/null || true)
+    if [[ -z "${PS_BIN}" ]]; then ERR "commande ps introuvable."; missing=1; fi
+    if [[ -z "${AWK_BIN}" ]]; then ERR "commande awk introuvable."; missing=1; fi
+    (( missing == 0 )) || QUIT 1
+    ME="${USER:-}"
+    [[ -n "${ME}" ]] || ME=$(id -un 2>/dev/null || printf '?')
+    NCPU=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')
+    [[ "${NCPU}" =~ ^[0-9]+$ ]] && (( NCPU > 0 )) || NCPU=1
+    return 0
+}
 
-    # Borne haute de l'offset recalculée après LIMIT connu
-    local max_offset=$(( TOTAL_PROCS - LIMIT ))
-    [[ ${max_offset} -lt 0 ]] && max_offset=0
-    [[ ${OFFSET} -gt ${max_offset} ]] && OFFSET=${max_offset}
-    #-----------
+PREPARE_CACHE() {
+    if ! mkdir -p "${CACHE_DIR}" 2>/dev/null; then
+        WARN "impossible de créer ${CACHE_DIR} : journal et défilement désactivés"
+        CACHE_DIR=""
+        DRAW_FILE=""
+        LOG_FILE=""
+        LOG=0
+        return 0
+    fi
+    chmod 700 "${CACHE_DIR}" 2>/dev/null || true
+    # ménage : fichiers d'état laissés par des instances tuées brutalement
+    rm -f "${CACHE_DIR}"/drawn.* 2>/dev/null || true
+    : > "${DRAW_FILE}" 2>/dev/null || DRAW_FILE=""
+    [[ -z "${DRAW_FILE}" ]] || chmod 600 "${DRAW_FILE}" 2>/dev/null || true
+    return 0
+}
 
-    # Gestion dynamique de l'affichage
-    local SEUILNOOB=110
-    local SEUILKO=100
-    [[ ${WIDTH} -le ${SEUILNOOB} ]] && NEWBIE=1
-    [[ ${WIDTH} -le ${SEUILKO} ]]   && ERROR
-    #-----------
-
-    # on définit le format de ps vs mode enclenché
-    [[ ${NEWBIE} -eq 1 ]] && formatps="${PSNOOB}" || formatps="${PSSIMPLE}"
-
-    # on affiche
-    if [[ ${TIPS_STATE} -eq 0 ]]; then
-        _psawk "${formatps}" | head -c -1 # workaround bug affichage en l'absence du TIPS
+READ_SIZE() {
+    local cols lines
+    if (( TTY == 1 )); then
+        cols=$(tput cols 2>/dev/null || printf '%s' "${COLUMNS:-0}")
+        lines=$(tput lines 2>/dev/null || printf '%s' "${LINES:-0}")
     else
-        _psawk "${formatps}"
+        cols="${COLUMNS:-0}"
+        lines="${LINES:-0}"
     fi
-    # ----------
+    [[ "${cols}"  =~ ^[0-9]+$ ]] || cols=0
+    [[ "${lines}" =~ ^[0-9]+$ ]] || lines=0
+    (( cols  > 0 )) || cols=120
+    (( lines > 0 )) || lines=40
+    WIDTH=$((cols - 1))
+    HEIGHT=$((lines))
+    (( WIDTH  < 1 )) && WIDTH=1
+    (( HEIGHT < 1 )) && HEIGHT=1
     return 0
 }
 
-#####################################################################################################################################
-DISPLAY_STATIC() {
-    local formatps
-    # en mode statique, pas de calcul automaque de la hauteur, pas de footer/header/tips,
-    # et largeur du terminal reste utilisée.
-    WIDTH=${COLUMNS:-$(tput cols)}
-    [[ "${FORCE_HEADER}" -eq 1 ]] && NO_HEADER=0 || NO_HEADER=1
-    NO_FOOTER=1
-    TIPS_STATE=0
-    COUNT_PROCS
-    [[ ${NEWBIE} -eq 1 ]] && formatps="${PSNOOB}" || formatps="${PSSIMPLE}"
-    _psawk "${formatps}"
+##############################################################################
+# Script awk (commun ; newbie=1/0)
+##############################################################################
+IFS= read -r -d '' AWK_MAIN <<'AWKEOF' || true
+BEGIN {
+    filter = ENVIRON["PSIM_FILTER"]
+    lfilter = tolower(filter)
+
+    if (newbie) {
+        f_user = 2; f_rss = 3; f_cpu = 4; f_cmd = 5; f_arg = 6
+        prefix = 7 + 1 + 10 + 1 + 6 + 1 + 6 + 3
+        hdr_cmd = (showopts ? "CMD" : "COMMAND")
+        hdr_cpu = cpu_mode ? "%CPU/m" : "%CPU"
+    } else {
+        f_ppid = 2; f_user = 3; f_nice = 4; f_rss = 5
+        f_mem = 6; f_cpu = 7; f_cmd = 8; f_arg = 9
+        prefix = 7 + 1 + 7 + 1 + 10 + 1 + 3 + 1 + 6 + 1 + 6 + 1 + 6 + 3
+        hdr_cmd = (showopts ? "CMD" : "COMMAND")
+        hdr_cpu = cpu_mode ? "%CPU/m" : "%CPU"
+    }
+    avail = width - prefix
+    if (avail < 10) avail = 10
+    cmdw = (avail > 60) ? 60 : avail
+    optw = avail - cmdw - 1
+    if (optw < 0) optw = 0
+
+    if (color) {
+        RED = red; GREEN = green; YELLOW = yellow; BLUE = blue
+        MAGENTA = magenta; CYAN = cyan; WHITE = white; GREY = grey
+        BG = bg; RESET = reset; RFG = resetfg; UL = underline
+        EL = "\033[0K"
+    } else {
+        RED = ""; GREEN = ""; YELLOW = ""; BLUE = ""
+        MAGENTA = ""; CYAN = ""; WHITE = ""; GREY = ""
+        BG = ""; RESET = ""; RFG = ""; UL = ""
+        EL = ""
+    }
+    if (!pad) { cmdw = 0; optw = 0 }
+    started = 0
+    uloff = color ? "\033[24m" : ""
+    mb = (length("é") == 1)
+    cont_re = "[" sprintf("%c", 128) "-" sprintf("%c", 191) "]$"
+    hdr_plain_len = prefix + length(hdr_cmd)
+    emit_header()
+}
+
+# Tronque sans couper un caractère UTF-8 (awk non multibyte : mawk, busybox)
+function cut(s, n) {
+    s = substr(s, 1, n)
+    if (!mb) { while (s ~ cont_re) s = substr(s, 1, length(s) - 1) }
+    return s
+}
+
+# Colonne d'en-tête colorée, soulignée si c'est la colonne de tri active.
+function hc(txt, col, active) {
+    return (active ? UL : "") col txt (active ? uloff : "") RFG
+}
+
+# Émet une ligne sans newline final : le curseur reste sur la dernière ligne,
+# ce qui évite de faire défiler l'écran d'une ligne à chaque rafraîchissement.
+function emit(s) {
+    if (!started) { printf "%s", s; started = 1 }
+    else          { printf "\n%s", s }
+}
+
+function emit_header() {
+    if (header && pad) {
+        if (newbie) {
+            hdr = BG \
+                hc(sprintf("%7s", "PID"), MAGENTA, sort ~ /^-?pid$/) " " \
+                hc(sprintf("%-10s", "USER"), BLUE, sort ~ /^-?user$/) " " \
+                hc(sprintf("%6s", "MiB"), GREEN, sort ~ /^-?rss$/) " " \
+                hc(sprintf("%6s", hdr_cpu), GREEN, sort ~ /^-?%?cpu$/) "   " \
+                hc(hdr_cmd, YELLOW, sort ~ /^-?%?cmd$/)
+        } else {
+            hdr = BG \
+                hc(sprintf("%7s", "PID"), MAGENTA, sort ~ /^-?pid$/) " " \
+                hc(sprintf("%7s", "PPID"), CYAN, sort ~ /^-?ppid$/) " " \
+                hc(sprintf("%-10s", "USER"), BLUE, sort ~ /^-?user$/) " " \
+                hc(sprintf("%3s", "NI"), WHITE, sort ~ /^-?nice$/) " " \
+                hc(sprintf("%6s", "MiB"), GREEN, sort ~ /^-?rss$/) " " \
+                hc(sprintf("%6s", "%MEM"), GREEN, 0) " " \
+                hc(sprintf("%6s", hdr_cpu), GREEN, sort ~ /^-?%?cpu$/) "   " \
+                hc(hdr_cmd, YELLOW, sort ~ /^-?%?cmd$/)
+        }
+        pad_h = width - hdr_plain_len
+        if (pad_h < 0) pad_h = 0
+        emit(sprintf("%s%s%s%s", hdr, sprintf("%*s", pad_h, ""), EL, RESET))
+    }
+}
+
+{
+    cmd = $f_cmd
+    is_kernel = (substr(cmd, 1, 1) == "[")
+
+    if (kernel == 0 && is_kernel) next
+    if (kernel == 2 && !is_kernel) next
+
+    args = ""
+    if (NF >= f_arg) {
+        for (i = f_arg; i <= NF; i++) args = args (i > f_arg ? " " : "") $i
+    }
+
+    if (filter != "") {
+        search = tolower($f_user " " cmd " " args)
+        if (search !~ lfilter) next
+    }
+
+    # mode « options » désactivé : nom de commande seul, sans chemin ni arguments
+    if (showopts == 0 && !is_kernel) {
+        sub(/^.*\//, "", cmd)
+        args = ""
+    }
+
+    total++
+    if (total <= offset) next
+    if (limit > 0 && shown >= limit) next
+
+    rss = $f_rss / 1024
+    cpu = cpu_mode ? $f_cpu / ncpu : $f_cpu
+    shown++
+    sum_rss += rss
+    sum_cpu += $f_cpu
+    if (!newbie) sum_mem += $f_mem
+
+    if (!pad) {
+        if (newbie)
+            printf "%s %s %.0f %.1f %s%s\n", $1, $f_user, rss, cpu, cmd, (args != "" ? " " args : "")
+        else
+            printf "%s %s %s %s %.0f %.1f %.1f %s%s\n", $1, $f_ppid, $f_user, $f_nice, rss, $f_mem, cpu, cmd, (args != "" ? " " args : "")
+        next
+    }
+
+    cmd_d = cut(cmd, cmdw)
+    pad_n = cmdw - length(cmd_d)
+    if (pad_n < 0) pad_n = 0
+
+    if (showopts && cmd_d ~ /\//) {
+        match(cmd_d, /\/[^\/]*$/)
+        dir_p = substr(cmd_d, 1, RSTART)
+        base_p = substr(cmd_d, RSTART + 1)
+        cmd_c = GREY dir_p RESET YELLOW base_p RESET sprintf("%*s", pad_n, "")
+    } else {
+        cmd_c = YELLOW cmd_d RESET sprintf("%*s", pad_n, "")
+    }
+
+    if ($f_user == "root")
+        user_c = RED substr($f_user, 1, 10) RESET sprintf("%*s", 10 - length(substr($f_user, 1, 10)), "")
+    else if ($f_user == me)
+        user_c = BLUE substr($f_user, 1, 10) RESET sprintf("%*s", 10 - length(substr($f_user, 1, 10)), "")
+    else
+        user_c = substr($f_user, 1, 10) sprintf("%*s", 10 - length(substr($f_user, 1, 10)), "")
+
+    if (newbie) {
+        line = MAGENTA sprintf("%7d", $1) RESET " " user_c " " \
+               GREEN sprintf("%6.0f", rss) RESET " " GREEN sprintf("%6.1f", cpu) RESET "   " cmd_c
+    } else {
+        if ($f_nice == "-")      nice_c = GREY sprintf("%3s", $f_nice) RESET
+        else if ($f_nice < 0)    nice_c = YELLOW sprintf("%3s", $f_nice) RESET
+        else                     nice_c = CYAN sprintf("%3s", $f_nice) RESET
+
+        line = MAGENTA sprintf("%7d", $1) RESET " " CYAN sprintf("%7d", $f_ppid) RESET " " \
+               user_c " " nice_c " " GREEN sprintf("%6.0f", rss) RESET " " \
+               GREEN sprintf("%6.1f", $f_mem) RESET " " GREEN sprintf("%6.1f", cpu) RESET "   " cmd_c
+    }
+
+    if (optw > 0 && args != "")
+        line = line " " GREY cut(args, optw) RESET
+
+    emit(line EL)
+}
+
+END {
+    if (drawfile != "")
+        printf "%d %d\n", shown, total > drawfile
+
+    if (pad) {
+        for (i = shown; i < limit; i++) emit(EL)
+    }
+    if (footer && pad) {
+        # le pied de page suit le mode d'affichage des lignes
+        norm = cpu_mode ? ((ncpu > 0) ? sum_cpu / ncpu : sum_cpu) : sum_cpu
+        tail = sprintf("%d/%d proc", shown, total)
+        if (newbie)
+            head = sprintf("%-18s %6.0f %6.1f   ", "TOTAL (displayed)", sum_rss, norm)
+        else
+            head = sprintf("%-30s %6.0f %6.1f %6.1f   ", "TOTAL (displayed)", sum_rss, sum_mem, norm)
+        room = width - length(head)
+        if (room < 0) room = 0
+        emit(RED head substr(tail, 1, room) RESET EL)
+    }
+}
+AWKEOF
+
+##############################################################################
+# Rendu
+##############################################################################
+RENDER() {
+    local -i pad="$1" limit="$2" header="$3" footer="$4"
+    local format
+    local -a pscmd awkcmd
+
+    if (( NEWBIE == 1 )); then
+        format="pid,user,rss,%cpu,cmd"
+    else
+        format="pid,ppid,user,nice,rss,%mem,%cpu,cmd"
+    fi
+
+    # le filtre passe par l'environnement : -v interpréterait les \
+    PSIM_FILTER="${FILTER}"
+    export PSIM_FILTER
+
+    awkcmd=("${AWK_BIN}"
+        -v newbie="${NEWBIE}"  -v width="${WIDTH}"    -v pad="${pad}"
+        -v limit="${limit}"    -v offset="${OFFSET}"  -v header="${header}"
+        -v footer="${footer}"  -v color="$(( NO_COLOR == 0 ? 1 : 0 ))"
+        -v showopts="${SHOW_OPTS}" -v kernel="${KERNEL}" -v sort="${SORT}" -v cpu_mode="${CPU_MODE}"
+        -v me="${ME}"          -v ncpu="${NCPU}"     -v drawfile="${DRAW_FILE}"
+        -v red="${Rouge}"      -v green="${Vert}"     -v yellow="${Jaune}"
+        -v blue="${Bleu}"      -v magenta="${Magenta}" -v cyan="${Cyan}"
+        -v white="${Blanc}"    -v grey="${Gris}"      -v bg="${BgGris}"
+        -v reset="${Reset}"    -v resetfg="${ResetFg}" -v underline="${Underline}"
+    )
+
+    # -ww : ne jamais laisser ps tronquer « cmd » à la largeur de COLUMNS
+    # (sinon le basename devient faux et le filtre rate les arguments)
+    # une seule sélection : tout sauf nous-mêmes (le filtrage noyau est fait par awk,
+    # ce qui évite de supposer que PID 2 est kthreadd)
+    pscmd=("${PS_BIN}" -ww -o "${format}" --sort="${SORT}" --no-headers)
+    if (( SELF_PID > 1 )); then
+        pscmd+=(--deselect --pid "${SELF_PID}" --ppid "${SELF_PID}")
+    else
+        pscmd+=(--deselect --pid "${SELF_PID}")
+    fi
+
+    local -i arc=0
+    if (( DEBUG == 1 )); then
+        if ! "${pscmd[@]}" | "${awkcmd[@]}" "${AWK_MAIN}"; then arc=${PIPESTATUS[1]}; fi
+    else
+        if ! "${pscmd[@]}" 2>/dev/null | "${awkcmd[@]}" "${AWK_MAIN}" 2>/dev/null; then arc=${PIPESTATUS[1]}; fi
+    fi
+    # awk échoue (code 2) sur une expression régulière invalide
+    if [[ -n "${FILTER}" ]] && (( arc != 0 )); then FILTER_INVALID=1; else FILTER_INVALID=0; fi
     return 0
 }
-#####################################################################################################################################
-#####################################################################################################################################
-#####################################################################################################################################
+
+##############################################################################
+# Bandeau
+##############################################################################
+# Construit le bandeau dans les variables globales plain/colored.
+TIPS_BUILD() {
+    local -i long="$1"
+    local -a sp sc
+    local cc cm cp cpp cu cC co ck ch cf ct cF
+    local -i budget i
+
+    cc="${BleuBold}"; cm="${BleuBold}"; cp="${BleuBold}"; cpp="${BleuBold}"
+    cu="${BleuBold}"; cC="${BleuBold}"; co="${BleuBold}"; ck="${BleuBold}"
+    ch="${BleuBold}"; cf="${BleuBold}"; ct="${BleuBold}"; cF="${BleuBold}"
+    cM="${BleuBold}"; cN="${BleuBold}"
+    case "${SORT}" in
+        -%cpu|%cpu) cc="${VertBold}" ;;
+        -rss|rss)   cm="${VertBold}" ;;
+        -pid|pid)   cp="${VertBold}" ;;
+        -ppid|ppid) cpp="${VertBold}" ;;
+        -user|user) cu="${VertBold}" ;;
+        -cmd|cmd)   cC="${VertBold}" ;;
+        -nice|nice) cN="${VertBold}" ;;
+        *) : ;;
+    esac
+    (( KERNEL != 0 ))    && ck="${VertBold}"
+    (( HEADER == 1 ))    && ch="${VertBold}"
+    (( FOOTER == 1 ))    && cf="${VertBold}"
+    (( TIPS == 1 ))      && ct="${VertBold}"
+    (( FREEZE == 1 ))    && cF="${VertBold}"
+    (( SHOW_OPTS == 1 )) && co="${VertBold}"
+    (( CPU_MODE == 1 ))  && cM="${VertBold}"
+
+    mode_icon="${ICON_MODE}"
+    (( long == 1 )) || mode_icon="${ICON_MODE_SHORT}"
+
+    if (( long == 1 )); then
+        sp=( "[c]pu" "[M]achine" "[m]em" "[p]id" "[P]pid" "[N]ice" "[u]ser" "[C]md"
+             "[o]ptions" "[k]ernel" "[h]eader" "[f]ooter" "[t]ips" "[/]filtre" )
+        sc=( "${cc}[c]${ResetFg}pu" "${cM}[M]${ResetFg}achine" "${cm}[m]${ResetFg}em"
+             "${cp}[p]${ResetFg}id" "${cpp}[P]${ResetFg}pid" "${cN}[N]${ResetFg}ice"
+             "${cu}[u]${ResetFg}ser" "${cC}[C]${ResetFg}md" "${co}[o]${ResetFg}ptions"
+             "${ck}[k]${ResetFg}ernel"
+             "${ch}[h]${ResetFg}eader" "${cf}[f]${ResetFg}ooter" "${ct}[t]${ResetFg}ips"
+             "${BleuBold}[/]${ResetFg}filtre" )
+        tail_p=" | [+/-]refresh | [F]reeze ${ICON_CLOCK}  ${int}${scroll}"
+        tail_c=" ${Gris}|${ResetFg} ${BleuBold}[+/-]${ResetFg}refresh ${Gris}|${ResetFg} ${cF}[F]${ResetFg}reeze ${Vert}${ICON_CLOCK}  ${int}${Gris}${scroll}${ResetFg}"
+    else
+        sp=( "[c]pu" "[M]" "[m]em" "[p]id" "[P]pid" "[N]" "[u]ser" "[C]md" "[o]"
+             "[k]" "[h]" "[f]" "[t]" "[/]" )
+        sc=( "${cc}[c]${ResetFg}pu" "${cM}[M]${ResetFg}" "${cm}[m]${ResetFg}em"
+             "${cp}[p]${ResetFg}id" "${cpp}[P]${ResetFg}pid" "${cN}[N]${ResetFg}"
+             "${cu}[u]${ResetFg}ser" "${cC}[C]${ResetFg}md" "${co}[o]${ResetFg}"
+             "${ck}[k]${ResetFg}"
+             "${ch}[h]${ResetFg}" "${cf}[f]${ResetFg}" "${ct}[t]${ResetFg}"
+             "${BleuBold}[/]${ResetFg}" )
+        tail_p=" [+/-] [F] ${ICON_CLOCK}  ${int}${scroll}"
+        tail_c=" ${BleuBold}[+/-]${ResetFg} ${cF}[F]${ResetFg} ${Vert}${ICON_CLOCK}  ${int}${Gris}${scroll}${ResetFg}"
+    fi
+
+    # segments toujours affichés : mode, défilement, quitter
+    crit_p=" [${mode_icon}]mode | [${ICON_SCROLL}]scroll | [q]uit"
+
+    budget=$(( WIDTH - 1 - ${#lead} - ${#crit_p} - ${#tail_p} - ${#filt_p} ))
+    (( budget < 0 )) && budget=0
+
+    plain="${lead}"
+    colored="${lead}"
+    first=1
+    for i in "${!sp[@]}"; do
+        local seg_p=" ${sp[i]}"
+        (( ${#seg_p} <= budget )) || continue
+        budget=$(( budget - ${#seg_p} ))
+        if (( long == 1 && first == 0 )); then
+            plain+=" | ${sp[i]}"
+            colored+=" ${Gris}|${ResetFg} ${sc[i]}"
+        else
+            plain+=" ${sp[i]}"
+            colored+=" ${sc[i]}"
+        fi
+        first=0
+    done
+
+    if (( long == 1 && first == 0 )); then
+        plain+=" | [${mode_icon}]mode | [${ICON_SCROLL}]scroll | [q]uit"
+        colored+=" ${Gris}|${ResetFg} ${BleuBold}[${mode_icon}]${ResetFg}mode ${Gris}|${ResetFg} ${BleuBold}[${ICON_SCROLL}]${ResetFg}scroll ${Gris}|${ResetFg} ${BleuBold}[q]${ResetFg}uit"
+    else
+        # pas de segment de tri : mode/scroll/quit démarrent le bandeau
+        plain+=" [${mode_icon}]mode [${ICON_SCROLL}]scroll [q]uit"
+        colored+=" ${BleuBold}[${mode_icon}]${ResetFg}mode ${BleuBold}[${ICON_SCROLL}]${ResetFg}scroll ${BleuBold}[q]${ResetFg}uit"
+    fi
+
+    plain+="${tail_p}${filt_p}"
+    colored+="${tail_c}${filt_c}"
+    return 0
+}
+
+# Construit filt_p / filt_c : motif, état de saisie, éventuel « invalide ».
+FILTER_INDICATOR() {
+    local label="${FILTER}" suffix="" color="${Jaune}" room
+    filt_p=""
+    filt_c=""
+    if (( FILTER_EDIT == 1 )); then
+        label="/${FILTER}"
+        suffix="_"
+    fi
+    (( FILTER_INVALID == 1 )) && color="${RougeBold}"
+    [[ -n "${label}" ]] || return 0
+    room=$(( WIDTH / 3 ))
+    (( room < 8 )) && room=8
+    (( ${#label} > room )) && label="${label:0:room}>"
+    filt_p=" ${label}${suffix}"
+    filt_c=" ${color}${label}${ResetFg}${suffix}"
+    if (( FILTER_INVALID == 1 )); then
+        filt_p+=" invalide"
+        filt_c+=" ${RougeBold}invalide${ResetFg}"
+    fi
+    return 0
+}
+
+# Ligne minimale : uniquement le motif (utilisée quand le bandeau est masqué,
+# pour ne jamais être aveugle sur le filtre en cours).
+PRINT_TIPS_MIN() {
+    FILTER_INDICATOR
+    [[ -n "${filt_c}" ]] || return 0
+    if [[ -n "${BgGris}" ]]; then
+        printf '%s%s\033[K%s' "${Reset}${BgGris}" "${filt_c}" "${Reset}"
+    else
+        printf '%s' "${filt_c}"
+    fi
+    return 0
+}
+
+PRINT_TIPS() {
+    local int scroll="" room trimmed
+    local -i long
+
+    (( OFFSET > 0 )) && scroll=" [+${OFFSET}]"
+    int="${INTERVAL}s"
+    (( FREEZE == 1 )) && int="GEL"
+    lead=" ${ICON_LEAD}  "
+
+    FILTER_INDICATOR
+
+    # bandeau complet seulement sur écran large (comme psim), puis version courte
+    for long in 1 0; do
+        (( long == 1 && WIDTH < 150 )) && continue
+        TIPS_BUILD "${long}"
+        (( ${#plain} <= WIDTH )) && break
+    done
+
+    if (( ${#plain} > WIDTH )); then
+        # bandeau trop long : on tronque, en gardant le marqueur de filtre
+        trimmed="${plain:0:WIDTH}"
+        [[ -z "${FILTER}" ]] || trimmed="${plain:0:$(( WIDTH > 0 ? WIDTH - 1 : 0 ))}>"
+        if [[ -n "${BgGris}" ]]; then
+            printf '%s%s\033[K%s' "${Reset}${BgGris}" "${trimmed}" "${Reset}"
+        else
+            printf '%s' "${trimmed}"
+        fi
+    elif [[ -n "${BgGris}" ]]; then
+        printf '%s%s\033[K%s' "${Reset}${BgGris}" "${colored}" "${Reset}"
+    else
+        printf '%s' "${colored}"
+    fi
+    return 0
+}
+
+##############################################################################
+# Clavier
+##############################################################################
+SORT_TOGGLE() {
+    if [[ "${SORT}" == "$1" ]]; then SORT="$2"; else SORT="$1"; fi
+    return 0
+}
+
+READ_DRAWN() {
+    local drawn="0" found="0"
+    if [[ -n "${DRAW_FILE}" && -s "${DRAW_FILE}" ]]; then
+        read -r drawn found < "${DRAW_FILE}" || true
+    fi
+    [[ "${drawn}" =~ ^[0-9]+$ ]] || drawn=0
+    [[ "${found}" =~ ^[0-9]+$ ]] || found=0
+    TOTAL=$((found))
+    return 0
+}
+
+# Mode saisie du filtre : chaque caractère met FILTER à jour (rendu en direct).
+FILTER_EDIT_KEY() {
+    local key="$1" seq=""
+    case "${key}" in
+        $'\e')
+            read -rt 0.05 -n 2 seq 2>/dev/null || true
+            if [[ -z "${seq}" ]]; then      # Échap seul : on annule
+                FILTER="${FILTER_SAVE}"
+                FILTER_EDIT=0
+                OFFSET=0
+            fi
+            ;;                              # sinon (flèche) : ignorée
+        ''|$'\r'|$'\n') FILTER_EDIT=0 ;;    # Entrée (read -n 1 rend une chaîne vide)
+        $'\x7f'|$'\b')                      # Retour arrière
+            FILTER_BUF="${FILTER_BUF%?}"
+            FILTER="${FILTER_BUF}"
+            OFFSET=0
+            ;;
+        $'\x15')                            # Ctrl-U : efface tout
+            FILTER_BUF=""
+            FILTER=""
+            OFFSET=0
+            ;;
+        *)                                    # caractère imprimable
+            FILTER_BUF+="${key}"
+            FILTER="${FILTER_BUF}"
+            OFFSET=0
+            ;;
+    esac
+    return 0
+}
+
+HANDLE_KEY() {
+    local key seq
+    local -i max_off
+
+    local -i rc=0
+    read -rt "${INTERVAL}" -n 1 key 2>/dev/null || rc=$?
+    if (( rc != 0 )); then
+        # 1 = EOF (entrée fermée) : on ne tourne pas à vide
+        (( rc > 128 )) || sleep "${INTERVAL}"
+        return 0
+    fi
+
+    if (( FILTER_EDIT == 1 )); then
+        FILTER_EDIT_KEY "${key}"
+        return 0
+    fi
+
+    if [[ "${key}" == $'\e' ]]; then
+        read -rt 0.05 -n 2 seq 2>/dev/null || true
+        key+="${seq}"
+    fi
+
+    case "${key}" in
+        /) FILTER_EDIT=1; FILTER_SAVE="${FILTER}"; FILTER_BUF="${FILTER}"; OFFSET=0 ;;
+        o) SHOW_OPTS=$((1 - SHOW_OPTS)) ;;
+        k) KERNEL=$(( (KERNEL + 1) % 3 )) ;;
+        h) HEADER=$((1 - HEADER)) ;;
+        f) FOOTER=$((1 - FOOTER)) ;;
+        t|'?') TIPS=$((1 - TIPS)) ;;   # '? = alias de t
+        q|Q) QUIT 0 ;;
+        +)
+            if (( INTERVAL >= 120 )); then INTERVAL=120; else INTERVAL=$((INTERVAL + 1)); fi
+            FREEZE=0
+            ;;
+        -)
+            if (( INTERVAL > 120 )); then INTERVAL=120; else INTERVAL=$(( INTERVAL > 1 ? INTERVAL - 1 : 1 )); fi
+            FREEZE=0
+            ;;
+        F)
+            if (( FREEZE == 1 )); then
+                FREEZE=0
+                INTERVAL=1
+            else
+                FREEZE=1
+                INTERVAL="${INTERVAL_MAX}"
+            fi
+            ;;
+        c) SORT_TOGGLE "-%cpu" "%cpu"; OFFSET=0 ;;
+        C) SORT_TOGGLE "cmd" "-cmd"; SHOW_OPTS=1; OFFSET=0 ;;
+        N) SORT_TOGGLE "nice" "-nice"; OFFSET=0 ;;
+        u) SORT_TOGGLE "user" "-user"; OFFSET=0 ;;
+        p) SORT_TOGGLE "pid" "-pid"; OFFSET=0 ;;
+        P) SORT_TOGGLE "ppid" "-ppid"; OFFSET=0 ;;
+        m) SORT_TOGGLE "-rss" "rss"; OFFSET=0 ;;
+        M) CPU_MODE=$((1 - CPU_MODE)) ;;
+        $'\e[D') NEWBIE=1 ;;
+        $'\e[C') NEWBIE=0 ;;
+        $'\e[A') (( OFFSET > 0 )) && OFFSET=$((OFFSET - 1)) ;;
+        $'\e[B')
+            READ_DRAWN
+            max_off=$(( TOTAL - LIMIT ))
+            (( max_off < 0 )) && max_off=0
+            (( OFFSET < max_off )) && OFFSET=$((OFFSET + 1))
+            ;;
+        $'\e[H') OFFSET=0 ;;
+        $'\e[F')
+            READ_DRAWN
+            max_off=$(( TOTAL - LIMIT ))
+            (( max_off < 0 )) && max_off=0
+            OFFSET="${max_off}"
+            ;;
+        *) : ;;
+    esac
+    return 0
+}
+
+##############################################################################
+# Modes
+##############################################################################
+RUN_DYNAMIC() {
+    local -i max_off
+    ALT=1
+    STTY_SAVE=$(stty -g 2>/dev/null || true)
+    [[ -z "${STTY_SAVE}" ]] || stty -echo 2>/dev/null || true
+    printf '\033[?25l\033[?1049h\033[H'
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+
+    while :; do
+        READ_SIZE
+        if (( WIDTH < MIN_W || HEIGHT < MIN_H )); then
+            RESTORE_SCREEN
+            ERR "terminal trop petit (${WIDTH}x${HEIGHT}), minimum ${MIN_W}x${MIN_H}."
+            QUIT 1
+        fi
+        (( WIDTH < THIN_W )) && NEWBIE=1
+
+        local -i bar=0
+        if (( TIPS == 1 || FILTER_EDIT == 1 )) || [[ -n "${FILTER}" ]]; then
+            bar=1
+        fi
+
+        LIMIT=$(( HEIGHT - HEADER - FOOTER - bar ))
+        (( LIMIT < 1 )) && LIMIT=1
+
+        READ_DRAWN
+        max_off=$(( TOTAL - LIMIT ))
+        (( max_off < 0 )) && max_off=0
+        (( OFFSET > max_off )) && OFFSET="${max_off}"
+
+        printf '\033[H'
+        RENDER 1 "${LIMIT}" "${HEADER}" "${FOOTER}"
+        # effacement avant le bandeau : un \033[J émis après effacerait le fond gris
+        printf '\033[J'
+        if (( bar == 1 )); then
+            printf '\n'
+            if (( TIPS == 1 )); then PRINT_TIPS; else PRINT_TIPS_MIN; fi
+        fi
+
+        HANDLE_KEY
+    done
+}
+
+RUN_STATIC() {
+    READ_SIZE
+    (( WIDTH < THIN_W )) && NEWBIE=1
+    RENDER "${TTY}" "${LIMIT}" "${HEADER}" "${FOOTER}"
+    return 0
+}
+
+##############################################################################
+# Journal / statistiques
+##############################################################################
+ROTATE_LOG() {
+    local -i size
+    [[ -f "${LOG_FILE}" ]] || return 0
+    size=$(wc -c < "${LOG_FILE}" 2>/dev/null || printf '0')
+    [[ "${size}" =~ ^[0-9]+$ ]] || size=0
+    (( size > LOG_MAX )) && mv -f "${LOG_FILE}" "${LOG_FILE}.1" 2>/dev/null || true
+    return 0
+}
+
+WRITE_LOG() {
+    local psver awkver
+    (( LOG == 1 )) && [[ -n "${LOG_FILE}" ]] || return 0
+    ROTATE_LOG
+    psver=$("${PS_BIN}" --version 2>/dev/null | head -n 1 || true)
+    awkver=$("${AWK_BIN}" --version 2>/dev/null | head -n 1 || true)
+    [[ -n "${awkver}" ]] || awkver=$("${AWK_BIN}" -W version 2>/dev/null | head -n 1 || true)
+    {
+        printf '=== %s — %s %s ===\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${NAME}" "${VER}"
+        printf 'durée       : %ss\n' "${SECONDS}"
+        printf 'utilisateur : %s\n' "${ME}"
+        printf 'terminal    : %sx%s (%s)\n' "${WIDTH}" "${HEIGHT}" "${TERM:-?}"
+        printf 'ps          : %s (%s)\n' "${PS_BIN}" "${psver}"
+        printf 'awk         : %s (%s)\n' "${AWK_BIN}" "${awkver}"
+        printf 'tri         : %s | filtre : %s\n' "${SORT}" "${FILTER}"
+        printf 'newbie      : %s | noyau : %s | options : %s\n' "${NEWBIE}" "${KERNEL}" "${SHOW_OPTS}"
+        printf 'entête      : %s | pied : %s | bandeau : %s | couleur : %s\n' \
+            "${HEADER}" "${FOOTER}" "${TIPS}" "$(( NO_COLOR == 0 ? 1 : 0 ))"
+        printf '\n'
+    } >> "${LOG_FILE}" 2>/dev/null || true
+    chmod 600 "${LOG_FILE}" 2>/dev/null || true
+    return 0
+}
+
+
+##############################################################################
+# Sortie
+##############################################################################
+ON_EXIT() {
+    local -i rc=$?
+    if (( CLEANED == 1 )); then return 0; fi
+    CLEANED=1
+    RESTORE_SCREEN
+    if (( SESSION == 1 )); then
+        [[ -z "${DRAW_FILE}" ]] || rm -f "${DRAW_FILE}" 2>/dev/null || true
+        WRITE_LOG
+    fi
+    return "${rc}"
+}
+
+# Valide le motif avec le moteur qui l'exécutera (awk), et non grep :
+# les deux dialectes diffèrent (\b, \w, \s...). Le motif est passé par
+# l'environnement, exactement comme lors du rendu (aucune interprétation de \ ).
+VALIDATE_FILTER() {
+    local -i rc=0
+    PSIM_FILTER="${FILTER}" "${AWK_BIN}" \
+        'BEGIN { f = ENVIRON["PSIM_FILTER"]; if (f != "" && "" !~ f) exit 0 }' \
+        >/dev/null 2>&1 || rc=$?
+    if (( rc != 0 )); then
+        ERR "filtre invalide (expression régulière) : ${FILTER}"
+        return 1
+    fi
+
+    # piège classique : dans gawk, \b est un backspace (grep : limite de mot)
+    if [[ "${FILTER}" == *'\b'* ]]; then
+        local ver
+        ver=$("${AWK_BIN}" --version 2>/dev/null | head -n 1 || true)
+        if [[ "${ver}" == *"GNU Awk"* ]]; then
+            WARN "dans gawk, « \\b » est un backspace : utilisez « \\y » pour une limite de mot"
+        fi
+    fi
+    return 0
+}
+
+##############################################################################
+# Main
+##############################################################################
+MAIN() {
+    TTY=0
+    [[ -t 1 ]] && TTY=1
+    STDIN_TTY=0
+    [[ -t 0 ]] && STDIN_TTY=1
+
+    INIT_PATHS
+    CONFIG_DEFAULTS
+    DEFINE_COLORS
+    CHECK_DEPS
+    LOAD_CONFIG
+    DEFINE_COLORS
+    PARSE_ARGS "$@"
+    DEFINE_COLORS
+
+    if [[ -n "${FILTER}" ]]; then
+        # volontaire : le code de retour pilote le message d'erreur déjà affiché
+        # shellcheck disable=SC2310
+        VALIDATE_FILTER || QUIT 2
+    fi
+
+    PREPARE_CACHE
+    READ_SIZE
+    SESSION=1
+    trap ON_EXIT EXIT
+
+    if (( STATIC == 1 )); then
+        RUN_STATIC
+        return 0
+    fi
+    RUN_DYNAMIC
+    return 0
+}
 
 MAIN "$@"
