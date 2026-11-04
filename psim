@@ -23,7 +23,7 @@
 ##############################################################################
 set -euo pipefail
 
-readonly VER="1.0.0"
+readonly VER="1.0.1"
 readonly NAME="${0##*/}"
 readonly CONF_NAME="psim"       # config et cache : ~/.config/psim et ~/.cache/psim
 readonly SELF_PID="${BASHPID:-$$}"
@@ -595,7 +595,9 @@ function emit_header() {
 
 {
     cmd = $f_cmd
-    is_kernel = (substr(cmd, 1, 1) == "[")
+    # thread noyau = nom entre crochets, mais PAS un zombie ([nom] <defunct>)
+    # (« <defunct> » est un champ séparé : on teste la ligne entière)
+    is_kernel = (substr(cmd, 1, 1) == "[" && $0 !~ /<defunct>$/)
 
     if (kernel == 0 && is_kernel) next
     if (kernel == 2 && !is_kernel) next
