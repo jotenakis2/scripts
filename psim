@@ -23,7 +23,7 @@
 ##############################################################################
 set -euo pipefail
 
-readonly VER="1.0.1"
+readonly VER="1.0.2"
 readonly NAME="${0##*/}"
 readonly CONF_NAME="psim"       # config et cache : ~/.config/psim et ~/.cache/psim
 readonly SELF_PID="${BASHPID:-$$}"
@@ -1080,11 +1080,14 @@ RUN_DYNAMIC() {
 
         printf '\033[H'
         RENDER 1 "${LIMIT}" "${HEADER}" "${FOOTER}"
-        # effacement avant le bandeau : un \033[J émis après effacerait le fond gris
-        printf '\033[J'
         if (( bar == 1 )); then
+            # pas d'effacement ici : la ligne du bandeau est réécrite par-dessus
+            # (un \033[J la blanchirait avant de la redessiner -> scintillement)
             printf '\n'
             if (( TIPS == 1 )); then PRINT_TIPS; else PRINT_TIPS_MIN; fi
+        else
+            # pas de bandeau : on nettoie ce qui reste sous le pied de page
+            printf '\033[J'
         fi
 
         HANDLE_KEY
