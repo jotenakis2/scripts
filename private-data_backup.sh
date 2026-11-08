@@ -612,12 +612,38 @@ show() {
 	fi
 	_collect_archives
 
-	local profil cmd src w_prof=6 w_src=20 w_cmd=12
-	local -a profils=()
-	mapfile -t profils < <(printf '%s\n' "${!SOURCES[@]}" | sort || true)
+	local -a profils=() orphelins=()
+	local -A connus=() vu=()
+	local profil cmd src i group total=0 orphan_total=0 snap_total=0 snap_count=0
 
+	mapfile -t profils < <(printf '%s\n' "${!SOURCES[@]}" | sort || true)
 	for profil in "${profils[@]}"; do
+		connus[${profil}]=1
+	done
+
+	# Profils présents sur le NAS mais absents de SOURCES (orphelins).
+	for i in "${!ARCH_GROUP[@]}"; do
+		group="${ARCH_GROUP[${i}]}"
+		[[ ${group} == "${SNAPSHOT_SUBDIR}/"* ]] && continue
+		[[ -n "${connus[${group}]:-}" ]] && continue
+		[[ -n "${vu[${group}]:-}" ]] && continue
+		vu[${group}]=1
+		orphelins+=("${group}")
+	done
+	if ((${#orphelins[@]} > 0)); then
+		mapfile -t orphelins < <(printf '%s\n' "${orphelins[@]}" | sort || true)
+	fi
+
+	local w_prof=6 w_src=20 w_cmd=12 w_arch=16
+	local base=""
+	for profil in "${profils[@]}" "${orphelins[@]}"; do
 		((${#profil} > w_prof)) && w_prof=${#profil}
+		if _latest_archive "${profil}"; then
+			base="${LATEST_PATH##*/}"
+			((${#base} > w_arch)) && w_arch=${#base}
+		fi
+	done
+	for profil in "${profils[@]}"; do
 		src="${SOURCES[${profil}]}"
 		((${#src} > w_src)) && w_src=${#src}
 		cmd="${COMMANDS[${profil}]:-}"
@@ -628,12 +654,18 @@ show() {
 	d_prof="$(_dashes "${w_prof}")"
 	d_src="$(_dashes "${w_src}")"
 	d_cmd="$(_dashes "${w_cmd}")"
-	d_arch="$(_dashes 38)"
+	d_arch="$(_dashes "${w_arch}")"
 	d_size="$(_dashes 10)"
 
-	printf '\n%bProfils configurés%b\n' "${C_BOLD}" "${C_RESET}"
-	printf '%-*s  %-*s  %-*s  %-38s  %s\n' \
-		"${w_prof}" "Profil" "${w_src}" "Dossier" "${w_cmd}" "Contrôle" "Dernière archive" "Taille"
+	# Cellule « dossier » des profils orphelins : texte + remplissage calculé
+	# à la main (les séquences de couleur fausseraient %-*s).
+	local hors_cfg="(hors configuration)"
+	local hors_pad=""
+	((w_src > ${#hors_cfg})) && hors_pad="$(printf '%*s' "$((w_src - ${#hors_cfg}))" '')"
+
+	printf '\n%bProfils%b\n' "${C_BOLD}" "${C_RESET}"
+	printf '%-*s  %-*s  %-*s  %-*s  %s\n' \
+		"${w_prof}" "Profil" "${w_src}" "Dossier" "${w_cmd}" "Contrôle" "${w_arch}" "Dernière archive" "Taille"
 	printf '%s  %s  %s  %s  %s\n' "${d_prof}" "${d_src}" "${d_cmd}" "${d_arch}" "${d_size}"
 
 	local when size_h
@@ -641,11 +673,11 @@ show() {
 		if _latest_archive "${profil}"; then
 			when="${LATEST_PATH##*/}"
 			size_h="$(_human_size "${LATEST_SIZE}")"
-			printf '%-*s  %-*s  %-*s  %-38s  %s\n' \
+			printf '%-*s  %-*s  %-*s  %-*s  %s\n' \
 				"${w_prof}" "${profil}" \
 				"${w_src}" "${SOURCES[${profil}]}" \
 				"${w_cmd}" "${COMMANDS[${profil}]:-}" \
-				"${when}" "${size_h}"
+				"${w_arch}" "${when}" "${size_h}"
 		else
 			printf '%-*s  %-*s  %-*s  %b(aucune)%b\n' \
 				"${w_prof}" "${profil}" \
@@ -655,11 +687,20 @@ show() {
 		fi
 	done
 
-	local i group total=0 orphan_total=0 snap_total=0 snap_count=0
-	local -A connus=() orphelins=()
-	for profil in "${profils[@]}"; do
-		connus[${profil}]=1
+	# Orphelins : mêmes colonnes, dossier = « (hors configuration) ».
+	for profil in "${orphelins[@]}"; do
+		if ! _latest_archive "${profil}"; then
+			continue
+		fi
+		when="${LATEST_PATH##*/}"
+		size_h="$(_human_size "${LATEST_SIZE}")"
+		printf '%-*s  %b%s%b%s  %-*s  %-*s  %s\n' \
+			"${w_prof}" "${profil}" \
+			"${C_YELLOW}" "${hors_cfg}" "${C_RESET}" "${hors_pad}" \
+			"${w_cmd}" "" \
+			"${w_arch}" "${when}" "${size_h}"
 	done
+
 	for i in "${!ARCH_GROUP[@]}"; do
 		group="${ARCH_GROUP[${i}]}"
 		total=$((total + ARCH_SIZE[i]))
@@ -671,21 +712,23 @@ show() {
 		profil="$(_group_profile "${group}")"
 		if [[ -z "${connus[${profil}]:-}" ]]; then
 			orphan_total=$((orphan_total + ARCH_SIZE[i]))
-			orphelins[${profil}]=1
 		fi
 	done
 
-	local total_h
+	local total_h orphan_h
 	total_h="$(_human_size "${total}")"
-	printf '\n%bContenu de %s%b : %d archive(s), %s\n' \
+	printf '\n%bContenu de %s%b : %d archive(s), %s' \
 		"${C_BOLD}" "${NAS_MOUNT}" "${C_RESET}" "${#ARCH_PATH[@]}" "${total_h}"
+	if ((${#orphelins[@]} > 0)); then
+		orphan_h="$(_human_size "${orphan_total}")"
+		printf ' dont %s de profils hors configuration' "${orphan_h}"
+	fi
+	printf '\n'
 
 	if ((${#orphelins[@]} > 0)); then
-		local orphan_list="" orphan_h=""
-		orphan_list="$(printf '%s ' "${!orphelins[@]}")"
-		orphan_h="$(_human_size "${orphan_total}")"
-		printf ' Profils absents de la configuration : %s(%s)\n' "${orphan_list}" "${orphan_h}"
-		printf ' %b→ « delete_old --orphans » les traite ; rien n'"'"'est supprimé sans confirmation.%b\n' \
+		printf ' %b(hors configuration) = archives d'"'"'un profil qui n'"'"'est plus déclaré dans la config%b\n' \
+			"${C_DIM}" "${C_RESET}"
+		printf ' %bdu script ; conservées en l'"'"'état (« delete_old --orphans » pour les purger).%b\n' \
 			"${C_DIM}" "${C_RESET}"
 	fi
 
