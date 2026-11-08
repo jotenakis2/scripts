@@ -11,15 +11,16 @@ fi
 
 # dossiers à sauvegarder
 declare -A SOURCES=(
-   ["HELIUM"]=".config/net.imput.helium"
-   ["LIBREWOLF"]=".config/librewolf"
+   #["HELIUM"]=".config/net.imput.helium"
+   ["BRAVE"]=".config/BraveSoftware"
+   #["LIBREWOLF"]=".config/librewolf"
    ["SSH"]=".ssh"
    ["IPTVNATOR"]=".iptvnator"
-   ["MSMTP"]=".config/msmtp"
-   ["IMAGES"]="Pictures"
+   #["MSMTP"]=".config/msmtp"
+   #["IMAGES"]="Pictures"
    ["DOCUMENTS"]="Documents"
-   ["MOK"]="mok-cachyos"
-   ["DISCORD"]=".config/vesktop"
+   #["MOK"]="mok-cachyos"
+   #["DISCORD"]=".config/vesktop"
    ["PROJECTS"]="Projects"
    ["ZSH_HISTORY"]=".local/share/zsh/zsh_history"
    # ajouter ici sur le modèle ["NOM-DU-PROFIL-DE-SAUVEGARDE"]="Dossier" où Dossier est un répertoire dans $HOME
@@ -28,10 +29,11 @@ declare -A SOURCES=(
 # binaire à surveiller avant la sauvegarde 
 # (par exemple pour les profils navigateurs il est recommandé de fermer le navigateur avant sauvegarde/restauration
 declare -A COMMANDS=(
-   ["HELIUM"]="helium"
-   ["LIBREWOLF"]="librewolf"
+   #["HELIUM"]="helium"
+   #["LIBREWOLF"]="librewolf"
    ["IPTVNATOR"]="iptvnator.bin"
-   ["DISCORD"]="vesktop"
+   #["DISCORD"]="vesktop"
+   ["BRAVE"]="brave"
    # ajouter ici sur le modèle ["NOM-DU-PROFIL-DE-SAUVEGARDE"]="nom-du-binaire"
 )
 
