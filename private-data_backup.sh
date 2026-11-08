@@ -99,6 +99,7 @@ VERIFY=1
 KEEP=1
 ORPHANS=0
 PURGE_ORPHANS=0
+PORCELAIN=0
 SNAPSHOT_MODE="auto"
 
 # Archives découvertes : triées par groupe puis date décroissante.
@@ -454,7 +455,11 @@ _on_exit() {
 	_cleanup_parts
 	_restart_services
 	if [[ -n "${LOG_FILE}" ]] && [[ -s "${LOG_FILE}" ]] && ((INTERRUPTED == 0)); then
-		printf '\n %bLog%b : %s\n' "${C_DIM}" "${C_RESET}" "${LOG_FILE}"
+		if ((PORCELAIN == 1)); then
+			printf '\n %bLog%b : %s\n' "${C_DIM}" "${C_RESET}" "${LOG_FILE}" >&2
+		else
+			printf '\n %bLog%b : %s\n' "${C_DIM}" "${C_RESET}" "${LOG_FILE}"
+		fi
 	fi
 	return 0
 }
@@ -781,9 +786,11 @@ ${C_BOLD}${SCRIPTNAME}${C_RESET} v${VER} — sauvegarde/restauration de données
 Usage :
   ${C_GREEN}${0} backup${C_RESET}  [PROFIL...] [--dry-run] [--no-verify]
   ${C_GREEN}${0} restore${C_RESET} [PROFIL]    [--yes] [--dry-run] [--snapshot|--no-snapshot]
+  ${C_GREEN}${0} rollback${C_RESET} [PROFIL]   [--yes] [--dry-run]   (instantané pré-restauration)
   ${C_GREEN}${0} delete_old${C_RESET} [--keep N] [--orphans|--purge-orphans] [--dry-run] [--yes]
   ${C_GREEN}${0} show
   ${C_GREEN}${0} list${C_RESET}    [PROFIL]
+  ${C_GREEN}${0} config-path | config-check
   ${C_GREEN}${0} help | --version
 
 Options :
@@ -795,6 +802,7 @@ Options :
   --purge-orphans supprimer toutes les archives des profils hors configuration
   --snapshot     forcer l'instantané avant restauration
   --no-snapshot  interdire l'instantané avant restauration
+  --porcelain    sortie tabulée (interfaces) pour show
   --config FILE  fichier de configuration (défaut : ./${CONFIG_BASENAME}
                  ou ${XDG_CONFIG_HOME:-${HOME}/.config}/${SCRIPTNAME}/config)
 
@@ -818,6 +826,26 @@ show() {
 	local profil cmd src i group total=0 orphan_total=0 snap_total=0 snap_count=0
 
 	mapfile -t profils < <(printf '%s\n' "${!SOURCES[@]}" | sort || true)
+
+	# Sortie tabulée stable, destinée aux interfaces (TUI, scripts) :
+	# profil, dossier, binaire de contrôle, dernière archive, date, taille.
+	if ((PORCELAIN == 1)); then
+		local base=""
+		for profil in "${profils[@]}"; do
+			src="${SOURCES[${profil}]}"
+			cmd="${COMMANDS[${profil}]:-}"
+			if _latest_archive "${profil}"; then
+				base="${LATEST_PATH##*/}"
+				printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+					"${profil}" "${src}" "${cmd:--}" "${base}" "${LATEST_DT}" "${LATEST_SIZE}"
+			else
+				printf '%s\t%s\t%s\t-\t-\t0\n' \
+					"${profil}" "${src}" "${cmd:--}"
+			fi
+		done
+		return 0
+	fi
+
 	for profil in "${profils[@]}"; do
 		connus[${profil}]=1
 	done
@@ -1241,7 +1269,10 @@ _dir_size_mb() {
 }
 
 _snapshot_path() {
-	printf '%s/%s/%s_%s.tar.gz' "${NAS_MOUNT}" "${SNAPSHOT_SUBDIR}" "${1}" "${RUN_DATE}"
+	local enc=""
+	enc="$(_enc_suffix)"
+	printf '%s/%s/%s_%s.tar.gz%s' \
+		"${NAS_MOUNT}" "${SNAPSHOT_SUBDIR}" "${1}" "${RUN_DATE}" "${enc}"
 }
 
 # Instantané de l'état courant avant écrasement. 0 = fait ou inutile.
@@ -1249,7 +1280,7 @@ _snapshot_before_restore() {
 	local profil="${1}"
 	local src="${SOURCES[${profil}]}"
 	local abs="${HOME}/${src}"
-	local dir size_mb target
+	local dir size_mb target rc=0
 
 	[[ -e ${abs} ]] || return 0
 
@@ -1276,8 +1307,11 @@ _snapshot_before_restore() {
 	[[ -O ${dir} ]] && chmod 700 -- "${dir}" 2>/dev/null
 	target="$(_snapshot_path "${profil}")"
 
+	# Même moteur que les archives : exclusions du profil et chiffrement
+	# éventuel sont appliqués, et l'écriture reste atomique (.part + mv).
 	PART_FILE="${target}.part"
-	if ! _RUN "Instantané de ~/${src}" tar -czf "${target}.part" -C "${HOME}" "${src}"; then
+	if ! _RUN "Instantané de ~/${src} (exclusions appliquées)" \
+		_backup_tar "${profil}" "${src}" "${target}.part"; then
 		_cleanup_parts
 		_ERR "instantané impossible — restauration annulée"
 		return 1
@@ -1289,6 +1323,21 @@ _snapshot_before_restore() {
 		_ERR "renommage de l'instantané impossible"
 		return 1
 	fi
+
+	if ((VERIFY == 1)); then
+		_verify_archive "${target}"
+		rc=$?
+		case "${rc}" in
+		0) ;;
+		2) _WARN "instantané chiffré non vérifiable (clé indisponible)" ;;
+		*)
+			rm -f -- "${target}" 2>/dev/null
+			_ERR "instantané corrompu — restauration annulée"
+			return 1
+			;;
+		esac
+	fi
+
 	_OK "instantané : ${SNAPSHOT_SUBDIR}/${target##*/}"
 	return 0
 }
@@ -1308,37 +1357,30 @@ _restore_extract() {
 	return "${rc}"
 }
 
-_restore_one() {
-	local profil="${1}" file="" cmd suffix when size_h rc=0
-	profil="${profil^^}"
+# _restore_from GROUPE PROFIL [instantané 0|1] [libellé]
+# Cœur commun à `restore` (archive la plus récente) et `rollback`
+# (instantané pré-restauration).
+_restore_from() {
+	local group="${1}" profil="${2}" with_snapshot="${3:-1}" label="${4:-Restauration}"
+	local file="" suffix when size_h rc=0
 
-	if ! _known_profile "${profil}"; then
-		_ERR "profil inconnu : ${profil} (voir « show »)"
-		return 2
-	fi
-	if ! _latest_archive "${profil}"; then
-		_ERR "${profil} : aucune sauvegarde dans ${NAS_MOUNT}"
+	if ! _latest_archive "${group}"; then
+		_ERR "${label} : aucune archive pour ${profil}"
 		return 1
 	fi
 	file="${LATEST_PATH}"
 
-	cmd="${COMMANDS[${profil}]:-}"
-	if [[ -n ${cmd} ]] && pgrep -x -- "${cmd}" >/dev/null 2>&1; then
-		_ERR "${profil} : ferme ${cmd} d'abord"
-		return 1
-	fi
-
 	when="$(_fmt_datekey "${LATEST_DT}")"
 	size_h="$(_human_size "${LATEST_SIZE}")"
-	printf '\n%bRestauration%b %s ← %s (%s, %s)\n' \
-		"${C_BOLD}" "${C_RESET}" "${profil}" "${file##*/}" "${when}" "${size_h}"
+	printf '\n%b%s%b %s ← %s (%s, %s)\n' \
+		"${C_BOLD}" "${label}" "${C_RESET}" "${profil}" "${file##*/}" "${when}" "${size_h}"
 
 	_verify_archive "${file}"
 	rc=$?
 	if ((rc == 1)); then
 		_WARN "${profil} : ${file##*/} est corrompue — recherche d'une archive antérieure valide"
-		if ! _find_valid_archive "${profil}"; then
-			_ERR "${profil} : aucune archive valide — restauration refusée"
+		if ! _find_valid_archive "${group}"; then
+			_ERR "${profil} : aucune archive valide — opération refusée"
 			return 1
 		fi
 		file="${LATEST_PATH}"
@@ -1354,23 +1396,53 @@ _restore_one() {
 		return 0
 	fi
 
-	if ! _confirm "Écraser ~/${SOURCES[${profil}]} avec cette archive ?"; then
+	if ! _confirm "${label} : écraser ~/${SOURCES[${profil}]} avec ${file##*/} ?"; then
 		_INFO "${profil} : annulé"
 		return 3
 	fi
 
-	if ! _snapshot_before_restore "${profil}"; then
-		return 1
+	if ((with_snapshot == 1)); then
+		if ! _snapshot_before_restore "${profil}"; then
+			return 1
+		fi
 	fi
 
 	suffix=".pre-restore-${RUN_DATE}"
-	if ! _RUN "Restauration de ${profil} (${file##*/})" _restore_extract "${file}" "${HOME}" "${suffix}"; then
+	if ! _RUN "${label} de ${profil} (${file##*/})" _restore_extract "${file}" "${HOME}" "${suffix}"; then
 		_show_log_tail
 		_ERR "${profil} : restauration en échec (les fichiers déjà extraits sont conservés)"
 		return 1
 	fi
 	_restart_services
 	return 0
+}
+
+_restore_one() {
+	local profil="${1^^}" cmd
+	if ! _known_profile "${profil}"; then
+		_ERR "profil inconnu : ${profil} (voir « show »)"
+		return 2
+	fi
+	cmd="${COMMANDS[${profil}]:-}"
+	if [[ -n ${cmd} ]] && pgrep -x -- "${cmd}" >/dev/null 2>&1; then
+		_ERR "${profil} : ferme ${cmd} d'abord"
+		return 1
+	fi
+	_restore_from "${profil}" "${profil}" 1 "Restauration"
+}
+
+_rollback_one() {
+	local profil="${1^^}" cmd
+	if ! _known_profile "${profil}"; then
+		_ERR "profil inconnu : ${profil} (voir « show »)"
+		return 2
+	fi
+	cmd="${COMMANDS[${profil}]:-}"
+	if [[ -n ${cmd} ]] && pgrep -x -- "${cmd}" >/dev/null 2>&1; then
+		_ERR "${profil} : ferme ${cmd} d'abord"
+		return 1
+	fi
+	_restore_from "${SNAPSHOT_SUBDIR}/${profil}" "${profil}" 0 "Retour arrière"
 }
 
 restore() {
@@ -1443,6 +1515,85 @@ restore() {
 	fi
 
 	_restore_one "${profils[$((choice - 1))]}"
+	return "${?}"
+}
+
+# =============================================================================
+# ROLLBACK : restaurer un instantané pré-restauration
+# =============================================================================
+
+rollback() {
+	local target="${1:-}"
+	_check_nas_rw || return 1
+	_check_nas_perms
+	_collect_archives
+
+	if [[ -n ${target} ]]; then
+		_rollback_one "${target}"
+		return "${?}"
+	fi
+
+	# Profils disposant d'au moins un instantané.
+	local -a profils=()
+	local -A vu=()
+	local i group p
+	for i in "${!ARCH_GROUP[@]}"; do
+		group="${ARCH_GROUP[${i}]}"
+		[[ ${group} == "${SNAPSHOT_SUBDIR}/"* ]] || continue
+		p="$(_group_profile "${group}")"
+		[[ -n "${vu[${p}]:-}" ]] && continue
+		vu[${p}]=1
+		profils+=("${p}")
+	done
+
+	if ((${#profils[@]} == 0)); then
+		_INFO "aucun instantané dans ${NAS_MOUNT}/${SNAPSHOT_SUBDIR}"
+		return 0
+	fi
+	mapfile -t profils < <(printf '%s\n' "${profils[@]}" | sort || true)
+
+	if ! _is_tty; then
+		_ERR "instantanés disponibles :"
+		local when size_h
+		for p in "${profils[@]}"; do
+			_latest_archive "${SNAPSHOT_SUBDIR}/${p}"
+			when="$(_fmt_datekey "${LATEST_DT}")"
+			size_h="$(_human_size "${LATEST_SIZE}")"
+			printf '   %-14s %s  %s\n' "${p}" "${when}" "${size_h}" >&2
+		done
+		_ERR "usage : rollback PROFIL"
+		return 2
+	fi
+
+	printf '\n%bInstantanés disponibles :%b\n\n' "${C_CYAN}" "${C_RESET}"
+	local -i k=1
+	local when size_h
+	for p in "${profils[@]}"; do
+		_latest_archive "${SNAPSHOT_SUBDIR}/${p}"
+		when="$(_fmt_datekey "${LATEST_DT}")"
+		size_h="$(_human_size "${LATEST_SIZE}")"
+		printf '  %b%2d)%b %-14s %s  %s\n' "${C_GREEN}" "${k}" "${C_RESET}" "${p}" "${when}" "${size_h}"
+		k=$((k + 1))
+	done
+	local cancel_idx=${k}
+	printf '  %b%2d)%b Annuler\n' "${C_GREEN}" "${k}" "${C_RESET}"
+
+	local choice=""
+	printf '\n%b#?%b ' "${C_CYAN}" "${C_RESET}"
+	if ! read -r choice; then
+		printf '\n'
+		_ERR "aucune saisie — abandon"
+		return 2
+	fi
+	if [[ ! ${choice} =~ ^[0-9]+$ ]] || ((choice < 1 || choice > cancel_idx)); then
+		_ERR "choix invalide"
+		return 2
+	fi
+	if ((choice == cancel_idx)); then
+		_INFO "annulé"
+		return 0
+	fi
+	_rollback_one "${profils[$((choice - 1))]}"
 	return "${?}"
 }
 
@@ -1613,6 +1764,7 @@ main() {
 		--no-verify)   VERIFY=0 ;;
 		--orphans)       ORPHANS=1 ;;
 		--purge-orphans) PURGE_ORPHANS=1 ;;
+		--porcelain)     PORCELAIN=1 ;;
 		--config)        shift ;;
 		--config=*)      ;;
 		--snapshot)    SNAPSHOT_MODE="yes" ;;
@@ -1649,7 +1801,7 @@ main() {
 	fi
 
 	case "${cmd}" in
-	backup|restore|delete_old|show|list|help|"") ;;
+	backup|restore|rollback|delete_old|show|list|config-path|config-check|help|"") ;;
 	*)
 		_ERR "commande inconnue : ${cmd}"
 		printf '\n' >&2
@@ -1720,8 +1872,13 @@ main() {
 		fi
 	fi
 
-	printf '\n%b%s%b %bv%s%b\n' \
-		"${C_CYAN}" "${SCRIPTNAME}" "${C_RESET}" "${C_YELLOW}" "${VER}" "${C_RESET}"
+	if ((PORCELAIN == 1)); then
+		printf '\n%b%s%b %bv%s%b\n' \
+			"${C_CYAN}" "${SCRIPTNAME}" "${C_RESET}" "${C_YELLOW}" "${VER}" "${C_RESET}" >&2
+	else
+		printf '\n%b%s%b %bv%s%b\n' \
+			"${C_CYAN}" "${SCRIPTNAME}" "${C_RESET}" "${C_YELLOW}" "${VER}" "${C_RESET}"
+	fi
 
 	local rc=0
 	case "${cmd}" in
@@ -1737,9 +1894,21 @@ main() {
 		restore "${positional[0]:-}"
 		rc=$?
 		;;
+	rollback)
+		rollback "${positional[0]:-}"
+		rc=$?
+		;;
 	delete_old)
 		delete_old
 		rc=$?
+		;;
+	config-path)
+		printf '%s\n' "${CFG_FILE}"
+		rc=0
+		;;
+	config-check)
+		_INFO "configuration valide : ${CFG_FILE}"
+		rc=0
 		;;
 	show)
 		show
