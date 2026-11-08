@@ -92,6 +92,7 @@ RUN_DATE=""
 NAS_MOUNT=""
 FAILURES=0
 INTERRUPTED=0
+LOG_RUN=0
 
 DRY_RUN=0
 ASSUME_YES=0
@@ -134,9 +135,18 @@ _enable_colors() {
 }
 
 # Écriture dans le log : ne doit jamais échouer, même sans log.
+# Chaque ligne est horodatée.
 _log_write() {
 	[[ -n "${LOG_FILE}" ]] || return 0
-	printf '%s\n' "${*}" >>"${LOG_FILE}" 2>/dev/null || return 0
+	local ts=""
+	ts="$(date '+%Y-%m-%d %H:%M:%S')" || ts="?"
+	printf '[%s] %s\n' "${ts}" "${*}" >>"${LOG_FILE}" 2>/dev/null || return 0
+	return 0
+}
+
+# Détail destiné au log uniquement (la console reste lisible).
+_log() {
+	_log_write "${*}"
 	return 0
 }
 
@@ -634,8 +644,11 @@ _RUN() {
 		return 2
 	fi
 
-	local rc=0 target="/dev/null"
+	local rc=0 target="/dev/null" t0="${SECONDS}"
 	[[ -n "${LOG_FILE}" ]] && target="${LOG_FILE}"
+
+	_log "RUN  ${msg}"
+	_log "CMD  ${*}"
 
 	"${@}" >>"${target}" 2>&1 9>&- &
 	CHILD_PID=$!
@@ -643,6 +656,7 @@ _RUN() {
 	wait "${CHILD_PID}"
 	rc=$?
 	CHILD_PID=0
+	_log "RC   ${rc} (durée $((SECONDS - t0)) s)"
 
 	if ((rc == 0)); then
 		_OK "${msg}"
@@ -1195,10 +1209,16 @@ _backup_tar() {
 		unset IFS
 	fi
 
+	local opts_str=""
+	if ((${#opts[@]} > 0)); then
+		opts_str="${opts[*]} "
+	fi
 	if [[ -n "${ENCRYPT}" ]]; then
+		_log "tar -czf - ${opts_str}-C ${HOME} ${src} | ${ENCRYPT} > ${out}"
 		tar -czf - "${opts[@]}" -C "${HOME}" "${src}" | _encrypt >"${out}"
 		rc=$?
 	else
+		_log "tar -czf ${out} ${opts_str}-C ${HOME} ${src}"
 		tar -czf "${out}" "${opts[@]}" -C "${HOME}" "${src}"
 		rc=$?
 	fi
@@ -1206,7 +1226,11 @@ _backup_tar() {
 	# tar : 0 = OK, 1 = « fichier modifié pendant la lecture » (archive
 	# utilisable), >= 2 = échec réel. Avec chiffrement, pipefail renvoie le code
 	# du dernier maillon en échec : un gpg en échec (2) l'emporte donc.
-	((rc == 0 || rc == 1)) && return 0
+	if ((rc == 1)); then
+		_log "avertissement tar : fichier(s) modifié(s) pendant la lecture (archive conservée)"
+		return 0
+	fi
+	((rc == 0)) && return 0
 	return "${rc}"
 }
 
@@ -1245,6 +1269,10 @@ _backup_one() {
 	target="${NAS_MOUNT}/${profil}_${RUN_DATE}.tar.gz${enc}"
 	part="${target}.part"
 
+	_log "profil ${profil} : source=${abs}"
+	_log "profil ${profil} : exclusions=${EXCLUDES[${profil}]:-aucune}"
+	_log "profil ${profil} : cible=${target}"
+
 	if ((DRY_RUN == 1)); then
 		bytes="$(du -sb -- "${abs}" 2>/dev/null | cut -f1)" || bytes=0
 		[[ ${bytes} =~ ^[0-9]+$ ]] || bytes=0
@@ -1267,7 +1295,7 @@ _backup_one() {
 		_verify_archive "${part}"
 		vrc=$?
 		case "${vrc}" in
-		0) ;;
+		0) _log "profil ${profil} : vérification OK" ;;
 		2) _WARN "${profil} : archive chiffrée non vérifiable (clé indisponible)" ;;
 		*)
 			_cleanup_parts
@@ -1287,6 +1315,7 @@ _backup_one() {
 
 	bytes="$(_file_size "${target}")"
 	size_h="$(_human_size "${bytes}")"
+	_log "profil ${profil} : terminé, ${bytes} octets (${size_h})"
 	_INFO "${profil} : ${target##*/} (${size_h})"
 	return 0
 }
@@ -1438,15 +1467,18 @@ _snapshot_before_restore() {
 
 	case "${SNAPSHOT_MODE}" in
 	no)
+		_log "instantané ${profil} : ignoré (--no-snapshot)"
 		_WARN "pas d'instantané (--no-snapshot) : l'état actuel de ~/${src} sera perdu"
 		return 0
 		;;
 	auto)
 		size_mb="$(_dir_size_mb "${abs}")"
 		if ((size_mb > SNAPSHOT_MAX_MB)); then
+			_log "instantané ${profil} : ignoré (${size_mb} Mo > ${SNAPSHOT_MAX_MB} Mo)"
 			_WARN "instantané ignoré : ~/${src} fait ${size_mb} Mo (> ${SNAPSHOT_MAX_MB} Mo) — utilise --snapshot pour forcer"
 			return 0
 		fi
+		_log "instantané ${profil} : mode auto, ${size_mb} Mo <= ${SNAPSHOT_MAX_MB} Mo"
 		;;
 	*) ;;
 	esac
@@ -1490,6 +1522,10 @@ _snapshot_before_restore() {
 		esac
 	fi
 
+	local snap_bytes=0 snap_size=""
+	snap_bytes="$(_file_size "${target}")"
+	snap_size="$(_human_size "${snap_bytes}")"
+	_log "instantané ${profil} : ${target} (${snap_size})"
 	_OK "instantané : ${SNAPSHOT_SUBDIR}/${target##*/}"
 	return 0
 }
@@ -1499,13 +1535,18 @@ _restore_extract() {
 	local -a opts=(--extract --gzip --directory "${dest}" --no-same-owner --backup --suffix="${suffix}")
 
 	if _archive_is_encrypted "${file}"; then
+		_log "decrypt ${file} | tar ${opts[*]} --file -"
 		_decrypt "${file}" | tar "${opts[@]}" --file -
 		rc=$?
 	else
+		_log "tar ${opts[*]} --file ${file}"
 		tar "${opts[@]}" --file "${file}"
 		rc=$?
 	fi
-	((rc == 1)) && return 0 # tar : avertissement (fichier modifié)
+	if ((rc == 1)); then
+		_log "avertissement tar : fichier(s) modifié(s) pendant l'extraction"
+		return 0
+	fi
 	return "${rc}"
 }
 
@@ -1555,12 +1596,14 @@ _restore_file() {
 	local bytes=0
 	bytes="$(_file_size "${file}")"
 	size_h="$(_human_size "${bytes}")"
+	_log "${label} ${profil} : archive=${file} (${when}, ${size_h})"
 	printf '\n%b%s%b %s ← %s (%s, %s)\n' \
 		"${C_BOLD}" "${label}" "${C_RESET}" "${profil}" "${file##*/}" "${when}" "${size_h}"
 
 	if ((verified == 0)); then
 		_verify_archive "${file}"
 		rc=$?
+		_log "${label} ${profil} : vérification rc=${rc}"
 		if ((rc == 1)); then
 			_ERR "${profil} : ${file##*/} est corrompue — opération refusée"
 			return 1
@@ -1586,6 +1629,7 @@ _restore_file() {
 	fi
 
 	suffix=".pre-restore-${RUN_DATE}"
+	_log "${label} ${profil} : extraction vers ${HOME} (sauvegardes *.pre-restore-${RUN_DATE})"
 	if ! _RUN "${label} de ${profil} (${file##*/})" _restore_extract "${file}" "${HOME}" "${suffix}"; then
 		_show_log_tail
 		_ERR "${profil} : restauration en échec (les fichiers déjà extraits sont conservés)"
@@ -2112,8 +2156,19 @@ delete_old() {
 			continue
 		fi
 
+		if ((${#g_keep[@]} > 0)); then
+			local k
+			for k in "${g_keep[@]}"; do
+				_log "rétention ${group} : conserve ${k##*/}"
+			done
+		fi
 		kept_total=$((kept_total + ${#g_keep[@]}))
 		if ((${#g_del[@]} > 0)); then
+			local j verb="supprime"
+			((DRY_RUN == 1)) && verb="supprimerait"
+			for j in "${!g_del[@]}"; do
+				_log "rétention ${group} : ${verb} ${g_del[${j}]##*/} (${g_reason[${j}]})"
+			done
 			del_paths+=("${g_del[@]}")
 			del_reasons+=("${g_reason[@]}")
 		fi
@@ -2170,6 +2225,7 @@ delete_old() {
 # =============================================================================
 
 main() {
+	local -a raw_args=("${@}")
 	# La commande est le premier argument qui n'est pas une option ; les
 	# options peuvent donc la précéder (ex. « --config F show »).
 	local cmd=""
@@ -2278,6 +2334,20 @@ main() {
 	_enable_colors
 	_init_log
 
+	# Les commandes de consultation (`show`, `list`, `config-path`…) sont
+	# appelées en boucle par la TUI : elles ne créent pas de journal.
+	case "${cmd}" in
+	backup|restore|rollback|delete_old|delete-archive|verify|profile-add|profile-remove|config-set) LOG_RUN=1 ;;
+	*) LOG_RUN=0 ;;
+	esac
+	if ((LOG_RUN == 1)); then
+		_log "=== ${SCRIPTNAME} ${VER} — ${cmd} ==="
+		_log "arguments : ${raw_args[*]}"
+		_log "config    : ${CFG_FILE:-aucun (valeurs par défaut)}"
+		_log "stockage  : ${NAS}/${BACKUP_SUBDIR}"
+		_log "options   : dry-run=${DRY_RUN} verify=${VERIFY} keep=${KEEP} snapshot=${SNAPSHOT_MODE} encrypt=${ENCRYPT:-aucun}"
+	fi
+
 	trap '_on_exit' EXIT
 	trap '_on_signal INT' INT
 	trap '_on_signal TERM' TERM
@@ -2367,6 +2437,9 @@ main() {
 		;;
 	*) ;;
 	esac
+	if ((LOG_RUN == 1)); then
+		_log "fin : rc=${rc}"
+	fi
 	return "${rc}"
 }
 
