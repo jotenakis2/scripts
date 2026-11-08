@@ -19,6 +19,16 @@ _self="$(readlink -f -- "${_self}")" || _self="${BASH_SOURCE[0]:-$0}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${_self}")" && pwd)" || exit 1
 readonly CLI="${SCRIPT_DIR}/private-data_backup.sh"
 
+# Glyphes Nerd Font (police Nerd Font requise dans le terminal).
+readonly ICON_DB=$'\uf1c0'
+readonly ICON_SAVE=$'\uf0c7'
+readonly ICON_RESTORE=$'\uf0e2'
+readonly ICON_ARCHIVE=$'\uf187'
+readonly ICON_QUIT=$'\uf011'
+readonly ICON_SNAP=$'\uf0c5'
+readonly ICON_EMPTY=$'\uf114'
+readonly ICON_WARN=$'\uf071'
+
 # Profils chargés depuis `show --porcelain`.
 declare -a P_NAME=() P_SRC=() P_CMD=() P_ARCH=() P_DATE=() P_SIZE=()
 
@@ -122,11 +132,11 @@ _screen_backup() {
 		labels+=("$(_label "${i}")")
 	done
 	if ((${#labels[@]} == 0)); then
-		gum style --border rounded --padding "0 2" --foreground 3 "📭  Aucun profil configuré."
+		gum style --border rounded --padding "0 2" --foreground 3 "${ICON_EMPTY}  Aucun profil configuré."
 		return 0
 	fi
 
-	pick="$(gum choose --no-limit --header "💾  Sauvegarder — espace pour cocher, entrée pour valider" \
+	pick="$(gum choose --no-limit --header "${ICON_SAVE}  Sauvegarder — espace pour cocher, entrée pour valider" \
 		--cursor "❯ " "${labels[@]}")" || return 0
 	[[ -z ${pick} ]] && return 0
 
@@ -157,11 +167,11 @@ _screen_restore() {
 	done
 	if ((${#labels[@]} == 0)); then
 		gum style --border rounded --padding "0 2" --foreground 3 \
-			"📭  Aucune archive disponible : lance d'abord une sauvegarde."
+			"${ICON_EMPTY}  Aucune archive disponible : lance d'abord une sauvegarde."
 		return 0
 	fi
 
-	pick="$(gum choose --header "♻️  Restaurer — choisir un profil" --cursor "❯ " "${labels[@]}")" || return 0
+	pick="$(gum choose --header "${ICON_RESTORE}  Restaurer — choisir un profil" --cursor "❯ " "${labels[@]}")" || return 0
 	for j in "${!labels[@]}"; do
 		if [[ ${labels[${j}]} == "${pick}" ]]; then
 			pos="${j}"
@@ -184,7 +194,7 @@ _screen_restore() {
 		"L'archive sera vérifiée avant extraction ; les fichiers écrasés" \
 		"sont conservés en *.pre-restore-<date>."
 
-	mode="$(gum choose --header "📸  Instantané de l'état actuel avant écrasement" \
+	mode="$(gum choose --header "${ICON_SNAP}  Instantané de l'état actuel avant écrasement" \
 		"auto (si ≤ 512 Mo)" "oui (forcer)" "non (aucun)")" || return 0
 
 	opts=(restore "${profile}" --yes)
@@ -203,33 +213,26 @@ _screen_restore() {
 	return 0
 }
 
-_screen_list() {
+# « Archives / État » : une seule vue, `list`.
+_screen_archives() {
 	printf '\n'
 	"${CLI}" list 2>&1 | gum pager
 	return 0
 }
 
-_screen_state() {
-	printf '\n'
-	"${CLI}" show 2>&1 | gum pager
-	return 0
-}
-
 _menu() {
 	local choice
-	choice="$(gum choose --header "🗄  private-data_backup ${TUI_VER} — $(basename -- "${CLI}")" \
+	choice="$(gum choose --header "${ICON_DB}  private-data_backup ${TUI_VER} — $(basename -- "${CLI}")" \
 		--cursor "❯ " \
-		"💾  Sauvegarder" \
-		"♻️  Restaurer" \
-		"📋  Archives" \
-		"📊  État" \
-		"🚪  Quitter")" || return 1
+		"${ICON_SAVE}  Sauvegarder" \
+		"${ICON_RESTORE}  Restaurer" \
+		"${ICON_ARCHIVE}  Archives / État" \
+		"${ICON_QUIT}  Quitter")" || return 1
 	# Correspondance par mot-clé : les icônes peuvent changer sans casser le menu.
 	case "${choice}" in
 	*Sauvegarder*) _screen_backup ;;
 	*Restaurer*) _screen_restore ;;
-	*Archives*) _screen_list ;;
-	*État*) _screen_state ;;
+	*Archives*) _screen_archives ;;
 	*) return 1 ;;
 	esac
 	return 0
@@ -267,7 +270,7 @@ EOF
 	while true; do
 		if ! _load; then
 			err="$(_error_text)"
-			gum style --border rounded --padding "1 2" --foreground 1 --title "⚠️  Erreur" \
+			gum style --border rounded --padding "1 2" --foreground 1 --title "${ICON_WARN}  Erreur" \
 				"Impossible de lire la configuration ou le NAS." "${err}"
 			return 1
 		fi
