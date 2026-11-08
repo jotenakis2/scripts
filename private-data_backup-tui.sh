@@ -747,10 +747,13 @@ _config_snapshot() {
 	toujours*) val="yes" ;;
 	*) val="no" ;;
 	esac
-	max="$(gum input --header "Taille max en mode auto (Mo)" --value "${CFG_SNAP_MAX}")" || return 0
-	if [[ ! ${max} =~ ^[0-9]+$ ]] || ((max < 1)); then
-		gum style --border rounded --padding "0 2" --foreground 1 "Taille invalide : ${max}"
-		return 0
+	max="${CFG_SNAP_MAX}"
+	if [[ ${val} == "auto" ]]; then
+		max="$(gum input --header "Taille max en mode auto (Mo)" --value "${CFG_SNAP_MAX}")" || return 0
+		if [[ ! ${max} =~ ^[0-9]+$ ]] || ((max < 1)); then
+			gum style --border rounded --padding "0 2" --foreground 1 "Taille invalide : ${max}"
+			return 0
+		fi
 	fi
 	_config_apply "SNAPSHOT_DEFAULT=${val}" "SNAPSHOT_MAX_MB=${max}"
 	return 0
@@ -798,13 +801,17 @@ _screen_config() {
 		0) snap="non" ;;
 		*) snap="oui" ;;
 		esac
+		local snap_line="instantané   : ${CFG_SNAP}"
+		if [[ ${CFG_SNAP} == "auto" ]]; then
+			snap_line="instantané   : auto (max ${CFG_SNAP_MAX} Mo)"
+		fi
 		gum style --border rounded --padding "0 2" \
 			"Configuration" \
 			"" \
 			"destination  : ${CFG_NAS}/${CFG_SUB}" \
 			"rétention    : ${CFG_KEEP} archive(s) par profil" \
 			"vérification : ${snap} après écriture" \
-			"instantané   : ${CFG_SNAP} (max ${CFG_SNAP_MAX} Mo en auto)" \
+			"${snap_line}" \
 			"chiffrement  : ${CFG_ENCRYPT:-aucun}" \
 			"délai NFS    : ${CFG_TIMEOUT} s"
 
