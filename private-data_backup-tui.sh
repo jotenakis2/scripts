@@ -88,6 +88,12 @@ _pause() {
 	printf '\n'
 }
 
+# Efface l'écran (les écrans ne doivent pas s'empiler).
+_clear() {
+	[[ -t 1 ]] && printf '\033[H\033[2J'
+	return 0
+}
+
 _group_display() {
 	if [[ ${1} == "pre-restore/"* ]]; then
 		printf '%s (instantané)' "${1#pre-restore/}"
@@ -230,6 +236,7 @@ _pick_archive() {
 # =============================================================================
 
 _screen_backup() {
+	_clear
 	local -a labels=() args=()
 	local i pick line
 
@@ -262,6 +269,7 @@ _screen_backup() {
 }
 
 _screen_restore() {
+	_clear
 	local -a idx=() labels=() opts=()
 	local i j pos=-1 pick profile mode when size
 
@@ -399,6 +407,7 @@ _archives_purge() {
 _screen_archives() {
 	local action="" count=0 total=0 i header=""
 	while true; do
+		_clear
 		# Compteur rafraîchi à chaque passage (suppressions, purge…).
 		count=0
 		total=0
@@ -556,6 +565,7 @@ _profile_remove() {
 }
 
 _screen_profiles() {
+	_clear
 	local -a labels=()
 	local i action
 
@@ -588,6 +598,7 @@ _screen_profiles() {
 
 _menu() {
 	local choice
+	_clear
 	choice="$(gum choose --header "${ICON_DB}  private-data_backup ${TUI_VER} — $(basename -- "${CLI}")" \
 		--cursor "❯ " \
 		"${ICON_SAVE}  Sauvegarder" \
