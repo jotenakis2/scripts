@@ -290,7 +290,9 @@ _screen_restore() {
 	when="$(_fmt_dt "${P_DATE[${i}]}")"
 	size="$(_human "${P_SIZE[${i}]}")"
 
-	gum style --border rounded --padding "0 2" --title "Restauration ${profile}" \
+	gum style --border rounded --padding "0 2" \
+		"Restauration ${profile}" \
+		"" \
 		"archive : ${P_ARCH[${i}]}" \
 		"date    : ${when}" \
 		"taille  : ${size}" \
@@ -332,7 +334,9 @@ _archives_restore() {
 	else
 		src="(profil inconnu)"
 	fi
-	gum style --border rounded --padding "0 2" --title "Restaurer une version" \
+	gum style --border rounded --padding "0 2" \
+		"Restaurer une version" \
+		"" \
 		"archive : ${PICK_FILE##*/}" \
 		"profil  : ${profile}" \
 		"cible   : ~/${src}"
@@ -500,7 +504,9 @@ _profile_inputs() {
 
 _profile_save() {
 	local action="${1}" rc=0
-	gum style --border rounded --padding "0 2" --title "${action} un profil" \
+	gum style --border rounded --padding "0 2" \
+		"${action} un profil" \
+		"" \
 		"nom     : ${PF_NAME}" \
 		"dossier : ~/${PF_SRC}" \
 		"binaire : ${PF_CMD:-(aucun)}" \
@@ -560,7 +566,7 @@ _screen_profiles() {
 		gum style --border rounded --padding "0 2" --foreground 3 "${ICON_EMPTY}  Aucun profil."
 		return 0
 	fi
-	gum style --border rounded --padding "0 2" --title "Profils configurés" "${labels[@]}"
+	gum style --border rounded --padding "0 2" "Profils configurés" "" "${labels[@]}"
 
 	action="$(gum choose --header "${ICON_USERS}  Profils — que faire ?" --cursor "❯ " \
 		"${ICON_PLUS}  Ajouter un profil" \
@@ -636,8 +642,11 @@ EOF
 	while true; do
 		if ! _load; then
 			err="$(_error_text)"
-			gum style --border rounded --padding "1 2" --foreground 1 --title "${ICON_WARN}  Erreur" \
-				"Impossible de lire la configuration ou le NAS." "${err}"
+			gum style --border rounded --padding "1 2" --foreground 1 \
+				"${ICON_WARN}  Erreur" \
+				"" \
+				"Impossible de lire la configuration ou le NAS." \
+				"${err}"
 			return 1
 		fi
 		_menu || break
