@@ -17,7 +17,7 @@
 set -uo pipefail
 umask 077
 
-readonly TUI_VER="1.1"
+APP_VER=""
 _self="${BASH_SOURCE[0]:-$0}"
 _self="$(readlink -f -- "${_self}")" || _self="${BASH_SOURCE[0]:-$0}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${_self}")" && pwd)" || exit 1
@@ -599,7 +599,7 @@ _screen_profiles() {
 _menu() {
 	local choice
 	_clear
-	choice="$(gum choose --header "${ICON_DB}  private-data_backup ${TUI_VER} — $(basename -- "${CLI}")" \
+	choice="$(gum choose --header "${ICON_DB}  private-data_backup ${APP_VER}" \
 		--cursor "❯ " \
 		"${ICON_SAVE}  Sauvegarder" \
 		"${ICON_RESTORE}  Restaurer" \
@@ -622,6 +622,10 @@ _menu() {
 # =============================================================================
 
 main() {
+	# Version unique : celle du script principal (pas de version TUI séparée).
+	APP_VER="$("${CLI}" --version 2>/dev/null | awk '{print $NF}')" || true
+	[[ -n ${APP_VER} ]] || APP_VER="?"
+
 	case "${1:-}" in
 	-h|--help)
 		cat <<EOF
@@ -639,7 +643,7 @@ EOF
 		return 0
 		;;
 	--version)
-		printf 'private-data_backup-tui %s\n' "${TUI_VER}"
+		printf 'private-data_backup %s\n' "${APP_VER}"
 		return 0
 		;;
 	*) ;;
