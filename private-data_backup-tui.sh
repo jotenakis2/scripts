@@ -122,11 +122,11 @@ _screen_backup() {
 		labels+=("$(_label "${i}")")
 	done
 	if ((${#labels[@]} == 0)); then
-		gum style --border rounded --padding "0 2" --foreground 3 "Aucun profil configuré."
+		gum style --border rounded --padding "0 2" --foreground 3 "📭  Aucun profil configuré."
 		return 0
 	fi
 
-	pick="$(gum choose --no-limit --header "Sauvegarder — espace pour cocher, entrée pour valider" \
+	pick="$(gum choose --no-limit --header "💾  Sauvegarder — espace pour cocher, entrée pour valider" \
 		--cursor "❯ " "${labels[@]}")" || return 0
 	[[ -z ${pick} ]] && return 0
 
@@ -157,11 +157,11 @@ _screen_restore() {
 	done
 	if ((${#labels[@]} == 0)); then
 		gum style --border rounded --padding "0 2" --foreground 3 \
-			"Aucune archive disponible : lance d'abord une sauvegarde."
+			"📭  Aucune archive disponible : lance d'abord une sauvegarde."
 		return 0
 	fi
 
-	pick="$(gum choose --header "Restaurer — choisir un profil" --cursor "❯ " "${labels[@]}")" || return 0
+	pick="$(gum choose --header "♻️  Restaurer — choisir un profil" --cursor "❯ " "${labels[@]}")" || return 0
 	for j in "${!labels[@]}"; do
 		if [[ ${labels[${j}]} == "${pick}" ]]; then
 			pos="${j}"
@@ -184,7 +184,7 @@ _screen_restore() {
 		"L'archive sera vérifiée avant extraction ; les fichiers écrasés" \
 		"sont conservés en *.pre-restore-<date>."
 
-	mode="$(gum choose --header "Instantané de l'état actuel avant écrasement" \
+	mode="$(gum choose --header "📸  Instantané de l'état actuel avant écrasement" \
 		"auto (si ≤ 512 Mo)" "oui (forcer)" "non (aucun)")" || return 0
 
 	opts=(restore "${profile}" --yes)
@@ -203,6 +203,12 @@ _screen_restore() {
 	return 0
 }
 
+_screen_list() {
+	printf '\n'
+	"${CLI}" list 2>&1 | gum pager
+	return 0
+}
+
 _screen_state() {
 	printf '\n'
 	"${CLI}" show 2>&1 | gum pager
@@ -211,13 +217,19 @@ _screen_state() {
 
 _menu() {
 	local choice
-	choice="$(gum choose --header "private-data_backup ${TUI_VER} — $(basename -- "${CLI}")" \
+	choice="$(gum choose --header "🗄  private-data_backup ${TUI_VER} — $(basename -- "${CLI}")" \
 		--cursor "❯ " \
-		"Sauvegarder" "Restaurer" "État / archives" "Quitter")" || return 1
+		"💾  Sauvegarder" \
+		"♻️  Restaurer" \
+		"📋  Archives" \
+		"📊  État" \
+		"🚪  Quitter")" || return 1
+	# Correspondance par mot-clé : les icônes peuvent changer sans casser le menu.
 	case "${choice}" in
-	"Sauvegarder") _screen_backup ;;
-	"Restaurer") _screen_restore ;;
-	"État / archives") _screen_state ;;
+	*Sauvegarder*) _screen_backup ;;
+	*Restaurer*) _screen_restore ;;
+	*Archives*) _screen_list ;;
+	*État*) _screen_state ;;
 	*) return 1 ;;
 	esac
 	return 0
@@ -255,7 +267,7 @@ EOF
 	while true; do
 		if ! _load; then
 			err="$(_error_text)"
-			gum style --border rounded --padding "1 2" --foreground 1 --title "Erreur" \
+			gum style --border rounded --padding "1 2" --foreground 1 --title "⚠️  Erreur" \
 				"Impossible de lire la configuration ou le NAS." "${err}"
 			return 1
 		fi
