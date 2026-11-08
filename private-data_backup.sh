@@ -100,6 +100,7 @@ KEEP=1
 ORPHANS=0
 PURGE_ORPHANS=0
 PORCELAIN=0
+ARCHIVE_FILE=""
 SNAPSHOT_MODE="auto"
 
 # Archives découvertes : triées par groupe puis date décroissante.
@@ -423,6 +424,127 @@ _config_validate() {
 		errs=1
 	fi
 	return "${errs}"
+}
+
+# -----------------------------------------------------------------------------
+# Réécriture des blocs de profils dans le fichier de configuration
+# -----------------------------------------------------------------------------
+
+# Échappe une valeur pour une affectation entre guillemets doubles.
+_dq() {
+	local v="${1}"
+	v="${v//\\/\\\\}"
+	v="${v//\"/\\\"}"
+	v="${v//\$/\\\$}"
+	v="${v//\`/\\\`}"
+	printf '%s' "${v}"
+}
+
+# Contenu du bloc NAME (SOURCES, COMMANDS, SERVICES, EXCLUDES) trié par clé.
+_config_block() {
+	local name="${1}"
+	local -n arr="${name}"
+	local -a keys=()
+	local k out=""
+	if ((${#arr[@]} > 0)); then
+		mapfile -t keys < <(printf '%s\n' "${!arr[@]}" | sort || true)
+	fi
+	out="${name}=("
+	for k in "${keys[@]}"; do
+		out+=$'\n\t'"[\"${k}\"]=\"$(_dq "${arr[${k}]}")\""
+	done
+	if ((${#keys[@]} > 0)); then
+		out+=$'\n'
+	fi
+	out+=")"
+	printf '%s\n' "${out}"
+}
+
+# Remplace, dans FILE, le contenu entre « # >>> NAME » et « # <<< NAME ».
+_config_write_block() {
+	local file="${1}" name="${2}" content="" tmp="" rc=0
+	content="$(_config_block "${name}")" || return 1
+	tmp="${file}.blk.$$"
+	BLOCK_NAME="${name}" BLOCK_CONTENT="${content}" awk '
+		BEGIN {
+			name = ENVIRON["BLOCK_NAME"]
+			content = ENVIRON["BLOCK_CONTENT"]
+			inb = 0
+			seen = 0
+		}
+		$0 == "# >>> " name { print; print content; inb = 1; seen = 1; next }
+		$0 == "# <<< " name { inb = 0 }
+		inb == 0 { print }
+		END { if (seen == 0) exit 3 }
+	' "${file}" >"${tmp}"
+	rc=$?
+	if ((rc != 0)); then
+		rm -f -- "${tmp}"
+		_ERR "bloc « ${name} » introuvable dans ${file}"
+		return 1
+	fi
+	if ! mv -f -- "${tmp}" "${file}"; then
+		rm -f -- "${tmp}"
+		return 1
+	fi
+	return 0
+}
+
+# Valide un fichier de configuration candidat dans un bash enfant : ses
+# tableaux ne polluent pas ceux du script courant.
+_config_validate_file() {
+	local f="${1}" count=""
+	# shellcheck disable=SC2016 # code exécuté par le bash enfant : l'expansion doit y avoir lieu
+	count="$(bash -c '
+		declare -A SOURCES=() COMMANDS=() SERVICES=() EXCLUDES=()
+		set +u
+		source "$1" >/dev/null 2>&1 || exit 1
+		printf "%s" "${#SOURCES[@]}"
+	' _ "${f}" 2>&1)" || return 1
+	# Toute sortie d'erreur du fichier candidat casse la correspondance.
+	[[ ${count} =~ ^[0-9]+$ ]] || return 1
+	((count > 0)) || return 1
+	return 0
+}
+
+# Écrit les tableaux en mémoire dans CFG_FILE, avec sauvegarde et contrôles.
+_config_save() {
+	local file="${CFG_FILE}" tmp="" bak="" block
+	if [[ -z ${file} ]]; then
+		_ERR "aucun fichier de configuration chargé"
+		return 1
+	fi
+	tmp="${file}.tmp.$$"
+	if ! cp -p -- "${file}" "${tmp}" 2>/dev/null; then
+		_ERR "copie impossible vers ${tmp}"
+		return 1
+	fi
+	for block in SOURCES COMMANDS SERVICES EXCLUDES; do
+		if ! _config_write_block "${tmp}" "${block}"; then
+			rm -f -- "${tmp}"
+			return 1
+		fi
+	done
+	if ! bash -n "${tmp}" 2>/dev/null; then
+		rm -f -- "${tmp}"
+		_ERR "fichier de configuration généré invalide (syntaxe) — rien n'a été écrit"
+		return 1
+	fi
+	if ! _config_validate_file "${tmp}"; then
+		rm -f -- "${tmp}"
+		_ERR "fichier de configuration généré invalide (contenu) — rien n'a été écrit"
+		return 1
+	fi
+	bak="${file}.bak"
+	cp -p -- "${file}" "${bak}" 2>/dev/null || _WARN "sauvegarde ${bak} impossible"
+	if ! mv -f -- "${tmp}" "${file}"; then
+		rm -f -- "${tmp}"
+		_ERR "écriture impossible : ${file}"
+		return 1
+	fi
+	_OK "configuration mise à jour : ${file}"
+	_INFO "sauvegarde précédente : ${bak}"
+	return 0
 }
 
 # =============================================================================
@@ -754,6 +876,18 @@ _known_profile() {
 	[[ -n "${SOURCES[${1}]:-}" ]]
 }
 
+# Refuse tout chemin hors du stockage (sécurité avant suppression/vérification).
+_ensure_in_nas() {
+	local f="${1}" real="" base=""
+	real="$(readlink -f -- "${f}" 2>/dev/null)" || real="${f}"
+	base="$(readlink -f -- "${NAS_MOUNT}" 2>/dev/null)" || base="${NAS_MOUNT}"
+	if [[ ${real} != "${base}/"* ]]; then
+		_ERR "chemin hors du stockage (${base}) : ${f}"
+		return 1
+	fi
+	return 0
+}
+
 _fmt_datekey() {
 	local dk="${1}"
 	if [[ ${#dk} -ne 14 ]]; then
@@ -787,9 +921,13 @@ Usage :
   ${C_GREEN}${0} backup${C_RESET}  [PROFIL...] [--dry-run] [--no-verify]
   ${C_GREEN}${0} restore${C_RESET} [PROFIL]    [--yes] [--dry-run] [--snapshot|--no-snapshot]
   ${C_GREEN}${0} rollback${C_RESET} [PROFIL]   [--yes] [--dry-run]   (instantané pré-restauration)
+  ${C_GREEN}${0} verify${C_RESET} FICHIER
+  ${C_GREEN}${0} delete-archive${C_RESET} FICHIER [--yes] [--dry-run]
   ${C_GREEN}${0} delete_old${C_RESET} [--keep N] [--orphans|--purge-orphans] [--dry-run] [--yes]
   ${C_GREEN}${0} show
   ${C_GREEN}${0} list${C_RESET}    [PROFIL]
+  ${C_GREEN}${0} profile-add${C_RESET} NOM DOSSIER [BINAIRE] [EXCLUSIONS]
+  ${C_GREEN}${0} profile-remove${C_RESET} NOM
   ${C_GREEN}${0} config-path | config-check
   ${C_GREEN}${0} help | --version
 
@@ -802,7 +940,8 @@ Options :
   --purge-orphans supprimer toutes les archives des profils hors configuration
   --snapshot     forcer l'instantané avant restauration
   --no-snapshot  interdire l'instantané avant restauration
-  --porcelain    sortie tabulée (interfaces) pour show
+  --porcelain    sortie tabulée (interfaces) pour show et list
+  --archive FILE restaurer cette archive précise (avec restore)
   --config FILE  fichier de configuration (défaut : ./${CONFIG_BASENAME}
                  ou ${XDG_CONFIG_HOME:-${HOME}/.config}/${SCRIPTNAME}/config)
 
@@ -836,11 +975,12 @@ show() {
 			cmd="${COMMANDS[${profil}]:-}"
 			if _latest_archive "${profil}"; then
 				base="${LATEST_PATH##*/}"
-				printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-					"${profil}" "${src}" "${cmd:--}" "${base}" "${LATEST_DT}" "${LATEST_SIZE}"
+				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+					"${profil}" "${src}" "${cmd:--}" "${base}" \
+					"${LATEST_DT}" "${LATEST_SIZE}" "${EXCLUDES[${profil}]:--}"
 			else
-				printf '%s\t%s\t%s\t-\t-\t0\n' \
-					"${profil}" "${src}" "${cmd:--}"
+				printf '%s\t%s\t%s\t-\t-\t0\t%s\n' \
+					"${profil}" "${src}" "${cmd:--}" "${EXCLUDES[${profil}]:--}"
 			fi
 		done
 		return 0
@@ -976,6 +1116,16 @@ list() {
 		return 0
 	fi
 	_collect_archives
+
+	# Sortie tabulée stable : groupe, date, taille, chemin.
+	if ((PORCELAIN == 1)); then
+		local i
+		for i in "${!ARCH_PATH[@]}"; do
+			printf '%s\t%s\t%s\t%s\n' \
+				"${ARCH_GROUP[${i}]}" "${ARCH_DT[${i}]}" "${ARCH_SIZE[${i}]}" "${ARCH_PATH[${i}]}"
+		done
+		return 0
+	fi
 
 	if ((${#ARCH_PATH[@]} == 0)); then
 		_INFO "aucune archive dans ${NAS_MOUNT}"
@@ -1357,38 +1507,64 @@ _restore_extract() {
 	return "${rc}"
 }
 
-# _restore_from GROUPE PROFIL [instantané 0|1] [libellé]
-# Cœur commun à `restore` (archive la plus récente) et `rollback`
-# (instantané pré-restauration).
-_restore_from() {
-	local group="${1}" profil="${2}" with_snapshot="${3:-1}" label="${4:-Restauration}"
-	local file="" suffix when size_h rc=0
+# _pick_archive GROUPE PROFIL [libellé] : archive la plus récente du groupe,
+# vérifiée, avec repli sur la précédente valide. Renseigne RESTORE_FILE.
+RESTORE_FILE=""
+_pick_archive() {
+	local group="${1}" profil="${2}" label="${3:-Restauration}" rc=0
 
+	RESTORE_FILE=""
 	if ! _latest_archive "${group}"; then
 		_ERR "${label} : aucune archive pour ${profil}"
 		return 1
 	fi
-	file="${LATEST_PATH}"
+	RESTORE_FILE="${LATEST_PATH}"
 
-	when="$(_fmt_datekey "${LATEST_DT}")"
-	size_h="$(_human_size "${LATEST_SIZE}")"
-	printf '\n%b%s%b %s ← %s (%s, %s)\n' \
-		"${C_BOLD}" "${label}" "${C_RESET}" "${profil}" "${file##*/}" "${when}" "${size_h}"
-
-	_verify_archive "${file}"
+	_verify_archive "${RESTORE_FILE}"
 	rc=$?
 	if ((rc == 1)); then
-		_WARN "${profil} : ${file##*/} est corrompue — recherche d'une archive antérieure valide"
+		_WARN "${profil} : ${RESTORE_FILE##*/} est corrompue — recherche d'une archive antérieure valide"
 		if ! _find_valid_archive "${group}"; then
 			_ERR "${profil} : aucune archive valide — opération refusée"
 			return 1
 		fi
-		file="${LATEST_PATH}"
-		when="$(_fmt_datekey "${LATEST_DT}")"
-		size_h="$(_human_size "${LATEST_SIZE}")"
-		_INFO "reprise sur ${file##*/} (${when}, ${size_h})"
+		RESTORE_FILE="${LATEST_PATH}"
+		_INFO "reprise sur ${RESTORE_FILE##*/}"
 	elif ((rc == 2)); then
 		_WARN "${profil} : archive non vérifiable (clé indisponible) — poursuite"
+	fi
+	return 0
+}
+
+# _restore_file FICHIER PROFIL [instantané 0|1] [libellé] [déjà vérifiée 0|1]
+_restore_file() {
+	local file="${1}" profil="${2}" with_snapshot="${3:-1}" label="${4:-Restauration}" verified="${5:-0}"
+	local suffix="" when="" size_h="" rc=0
+
+	[[ -f ${file} ]] || {
+		_ERR "archive absente : ${file}"
+		return 1
+	}
+	if ! _parse_archive "${file}"; then
+		_ERR "nom d'archive non reconnu : ${file##*/}"
+		return 1
+	fi
+	when="$(_fmt_datekey "${ARCH_DATEKEY}")"
+	local bytes=0
+	bytes="$(_file_size "${file}")"
+	size_h="$(_human_size "${bytes}")"
+	printf '\n%b%s%b %s ← %s (%s, %s)\n' \
+		"${C_BOLD}" "${label}" "${C_RESET}" "${profil}" "${file##*/}" "${when}" "${size_h}"
+
+	if ((verified == 0)); then
+		_verify_archive "${file}"
+		rc=$?
+		if ((rc == 1)); then
+			_ERR "${profil} : ${file##*/} est corrompue — opération refusée"
+			return 1
+		elif ((rc == 2)); then
+			_WARN "${profil} : archive non vérifiable (clé indisponible) — poursuite"
+		fi
 	fi
 
 	if ((DRY_RUN == 1)); then
@@ -1415,6 +1591,15 @@ _restore_from() {
 	fi
 	_restart_services
 	return 0
+}
+
+# Cœur de `restore` / `rollback` : groupe « PROFIL » ou « pre-restore/PROFIL ».
+_restore_from() {
+	local group="${1}" profil="${2}" with_snapshot="${3:-1}" label="${4:-Restauration}"
+	if ! _pick_archive "${group}" "${profil}" "${label}"; then
+		return 1
+	fi
+	_restore_file "${RESTORE_FILE}" "${profil}" "${with_snapshot}" "${label}" 1
 }
 
 _restore_one() {
@@ -1450,6 +1635,27 @@ restore() {
 	_check_nas_rw || return 1
 	_check_nas_perms
 	_collect_archives
+
+	# Restauration d'une archive précise (choisie dans `list`).
+	if [[ -n ${ARCHIVE_FILE} ]]; then
+		_ensure_in_nas "${ARCHIVE_FILE}" || return 1
+		if ! _parse_archive "${ARCHIVE_FILE}"; then
+			_ERR "nom d'archive non reconnu : ${ARCHIVE_FILE##*/}"
+			return 2
+		fi
+		local profil_archive="${ARCH_PROFILE^^}"
+		if ! _known_profile "${profil_archive}"; then
+			_ERR "archive d'un profil inconnu : ${profil_archive} (voir « show »)"
+			return 2
+		fi
+		local cmd_archive="${COMMANDS[${profil_archive}]:-}"
+		if [[ -n ${cmd_archive} ]] && pgrep -x -- "${cmd_archive}" >/dev/null 2>&1; then
+			_ERR "${profil_archive} : ferme ${cmd_archive} d'abord"
+			return 1
+		fi
+		_restore_file "${ARCHIVE_FILE}" "${profil_archive}" 1 "Restauration"
+		return "${?}"
+	fi
 
 	if [[ -n ${target} ]]; then
 		_restore_one "${target}"
@@ -1595,6 +1801,130 @@ rollback() {
 	fi
 	_rollback_one "${profils[$((choice - 1))]}"
 	return "${?}"
+}
+
+# =============================================================================
+# VÉRIFICATION ET SUPPRESSION D'UNE ARCHIVE
+# =============================================================================
+
+verify() {
+	local f="${1:-}" rc=0
+	if [[ -z ${f} ]]; then
+		_ERR "usage : verify FICHIER"
+		return 2
+	fi
+	if [[ ! -f ${f} ]]; then
+		_ERR "fichier absent : ${f}"
+		return 1
+	fi
+	_verify_archive "${f}"
+	rc=$?
+	case "${rc}" in
+	0)
+		local bytes=0 size_h=""
+		bytes="$(_file_size "${f}")"
+		size_h="$(_human_size "${bytes}")"
+		_OK "archive valide : ${f##*/} (${size_h})"
+		return 0
+		;;
+	2)
+		_WARN "non vérifiable (clé indisponible) : ${f##*/}"
+		return 2
+		;;
+	*)
+		_ERR "archive corrompue ou vide : ${f##*/}"
+		return 1
+		;;
+	esac
+}
+
+delete_archive() {
+	local f="${1:-}" rc=0
+	if [[ -z ${f} ]]; then
+		_ERR "usage : delete-archive FICHIER"
+		return 2
+	fi
+	_check_nas_rw || return 1
+	_ensure_in_nas "${f}" || return 1
+	if [[ ! -f ${f} ]]; then
+		_ERR "fichier absent : ${f}"
+		return 1
+	fi
+	if ((DRY_RUN == 1)); then
+		_INFO "serait supprimé : ${f##*/}"
+		return 0
+	fi
+	if ! _confirm "Supprimer définitivement ${f##*/} ?"; then
+		_INFO "annulé — rien n'a été supprimé"
+		return 0
+	fi
+	if ! _RUN "Suppression de ${f##*/}" rm -f -- "${f}"; then
+		rc=1
+	fi
+	return "${rc}"
+}
+
+# =============================================================================
+# PROFILS (écriture dans le fichier de configuration)
+# =============================================================================
+
+profile_add() {
+	local name="${1:-}" src="${2:-}" cmd="${3:-}" excl="${4:-}" exists=0
+
+	name="${name^^}"
+	if [[ ! ${name} =~ ^[A-Z][A-Z0-9_]*$ ]]; then
+		_ERR "nom de profil invalide : ${name} (lettres A-Z, chiffres, _, commence par une lettre)"
+		return 2
+	fi
+	if [[ -z ${src} ]]; then
+		_ERR "dossier source manquant (relatif à \$HOME)"
+		return 2
+	fi
+	if [[ ${src} == /* ]]; then
+		_ERR "le dossier doit être relatif à \$HOME (reçu : ${src})"
+		return 2
+	fi
+	[[ -e "${HOME}/${src}" ]] || _WARN "${HOME}/${src} n'existe pas encore"
+	_known_profile "${name}" && exists=1
+
+	SOURCES[${name}]="${src}"
+	if [[ -n ${cmd} ]]; then
+		COMMANDS[${name}]="${cmd}"
+	else
+		unset "COMMANDS[${name}]"
+	fi
+	if [[ -n ${excl} ]]; then
+		EXCLUDES[${name}]="${excl}"
+	else
+		unset "EXCLUDES[${name}]"
+	fi
+
+	if ! _config_save; then
+		_ERR "${name} : modification NON enregistrée"
+		return 1
+	fi
+	if ((exists == 1)); then
+		_INFO "${name} : profil mis à jour (~/${src})"
+	else
+		_INFO "${name} : profil ajouté (~/${src})"
+	fi
+	return 0
+}
+
+profile_remove() {
+	local name="${1:-}"
+	name="${name^^}"
+	if ! _known_profile "${name}"; then
+		_ERR "profil inconnu : ${name}"
+		return 2
+	fi
+	unset "SOURCES[${name}]" "COMMANDS[${name}]" "SERVICES[${name}]" "EXCLUDES[${name}]"
+	if ! _config_save; then
+		_ERR "${name} : modification NON enregistrée"
+		return 1
+	fi
+	_WARN "${name} retiré ; ses archives restent sur le NAS (orphelines : delete_old --purge-orphans)"
+	return 0
 }
 
 # =============================================================================
@@ -1765,6 +2095,8 @@ main() {
 		--orphans)       ORPHANS=1 ;;
 		--purge-orphans) PURGE_ORPHANS=1 ;;
 		--porcelain)     PORCELAIN=1 ;;
+		--archive)       shift; ARCHIVE_FILE="${1:-}" ;;
+		--archive=*)     ARCHIVE_FILE="${1#*=}" ;;
 		--config)        shift ;;
 		--config=*)      ;;
 		--snapshot)    SNAPSHOT_MODE="yes" ;;
@@ -1801,7 +2133,7 @@ main() {
 	fi
 
 	case "${cmd}" in
-	backup|restore|rollback|delete_old|show|list|config-path|config-check|help|"") ;;
+	backup|restore|rollback|delete_old|show|list|verify|delete-archive|profile-add|profile-remove|config-path|config-check|help|"") ;;
 	*)
 		_ERR "commande inconnue : ${cmd}"
 		printf '\n' >&2
@@ -1900,6 +2232,22 @@ main() {
 		;;
 	delete_old)
 		delete_old
+		rc=$?
+		;;
+	verify)
+		verify "${positional[0]:-}"
+		rc=$?
+		;;
+	delete-archive)
+		delete_archive "${positional[0]:-}"
+		rc=$?
+		;;
+	profile-add)
+		profile_add "${positional[0]:-}" "${positional[1]:-}" "${positional[2]:-}" "${positional[3]:-}"
+		rc=$?
+		;;
+	profile-remove)
+		profile_remove "${positional[0]:-}"
 		rc=$?
 		;;
 	config-path)
