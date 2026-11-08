@@ -278,7 +278,7 @@ _screen_backup() {
 	fi
 
 	pick="$(gum choose --no-limit --height 15 \
-		--header "${ICON_SAVE}  Sauvegarder — espace pour cocher, entrée pour valider" \
+		--header "${ICON_SAVE}  Sauvegarder — x pour cocher, entrée pour valider" \
 		--cursor "❯ " "${labels[@]}")" || return 0
 	[[ -z ${pick} ]] && return 0
 
