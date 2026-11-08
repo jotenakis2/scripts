@@ -37,6 +37,7 @@ readonly ICON_EDIT=$'\uf044'
 readonly ICON_TRASH=$'\uf1f8'
 readonly ICON_EYE=$'\uf06e'
 readonly ICON_INFO=$'\uf129'
+readonly ICON_CONFIG=$'\uf013'
 
 # Profils (`show --porcelain`).
 declare -a P_NAME=() P_SRC=() P_CMD=() P_ARCH=() P_DATE=() P_SIZE=() P_EXCL=()
@@ -47,6 +48,18 @@ declare -a A_GROUP=() A_DATE=() A_SIZE=() A_PATH=()
 # Sélections courantes.
 PICK_FILE=""
 PICK_GROUP=""
+
+# Valeurs de configuration (écran Configuration).
+CFG_NAS=""
+CFG_SUB=""
+CFG_KEEP=""
+CFG_VERIFY=""
+CFG_SNAP=""
+CFG_SNAP_MAX=""
+CFG_TIMEOUT=""
+CFG_ENCRYPT=""
+CFG_GPG=""
+CFG_AGE=""
 PF_NAME=""
 PF_SRC=""
 PF_CMD=""
@@ -440,7 +453,7 @@ _screen_archives() {
 			"Restaurer une version…" \
 			"Vérifier une archive…" \
 			"Supprimer une archive…" \
-			"Rétention (delete_old)…" \
+			"Appliquer la politique de rétention" \
 			"Purger les profils orphelins…" \
 			"Retour")" || return 0
 		case "${action}" in
@@ -453,7 +466,7 @@ _screen_archives() {
 		Restaurer*) _archives_restore ;;
 		Vérifier*) _archives_verify ;;
 		Supprimer*) _archives_delete ;;
-		Rétention*) _archives_retention ;;
+		Appliquer*) _archives_retention ;;
 		Purger*) _archives_purge ;;
 		*) return 0 ;;
 		esac
@@ -647,11 +660,15 @@ Restaurer     Restaure l'archive la plus récente d'un profil après
               remplacés sont conservés en *.pre-restore-<date>.
 
 Archives      Voir toutes les archives, restaurer une version précise,
-              vérifier, supprimer, appliquer la rétention (delete_old)
-              ou purger les profils absents de la configuration.
+              vérifier, supprimer, appliquer la politique de rétention
+              (delete_old) ou purger les profils absents de la config.
 
 Profils       Ajouter, modifier ou retirer un profil dans le fichier de
               configuration (sauvegarde .bak, écriture validée).
+
+Configuration Modifier la destination (montage et sous-dossier), la
+              rétention, la vérification, les instantanés, le chiffrement
+              et le délai NFS — mêmes garde-fous que pour les profils.
 
 OÙ SONT LES CHOSES
 ------------------
@@ -671,6 +688,145 @@ EOF
 }
 
 # =============================================================================
+# ÉCRAN : CONFIGURATION
+# =============================================================================
+
+_config_values_load() {
+	CFG_NAS="$(_config_get NAS)"
+	CFG_SUB="$(_config_get BACKUP_SUBDIR)"
+	CFG_KEEP="$(_config_get KEEP_DEFAULT)"
+	CFG_VERIFY="$(_config_get VERIFY_DEFAULT)"
+	CFG_SNAP="$(_config_get SNAPSHOT_DEFAULT)"
+	CFG_SNAP_MAX="$(_config_get SNAPSHOT_MAX_MB)"
+	CFG_TIMEOUT="$(_config_get NAS_TIMEOUT)"
+	CFG_ENCRYPT="$(_config_get ENCRYPT)"
+	CFG_GPG="$(_config_get GPG_RECIPIENT)"
+	CFG_AGE="$(_config_get AGE_RECIPIENT)"
+	return 0
+}
+
+_config_apply() {
+	local -a pairs=("${@}")
+	gum style --border rounded --padding "0 2" "Nouvelle configuration" "" "${pairs[@]}"
+	gum confirm --default=false --affirmative "Enregistrer" --negative "Annuler" \
+		"Écrire ces paramètres dans la configuration ?" || return 0
+	printf '\n'
+	"${CLI}" config-set "${pairs[@]}"
+	_pause
+	return 0
+}
+
+_config_destination() {
+	local nas="" sub=""
+	nas="$(gum input --header "Point de montage (NAS)" --value "${CFG_NAS}")" || return 0
+	[[ -n ${nas} ]] || return 0
+	sub="$(gum input --header "Sous-dossier des archives" --value "${CFG_SUB}")" || return 0
+	[[ -n ${sub} ]] || return 0
+	_config_apply "NAS=${nas}" "BACKUP_SUBDIR=${sub}"
+	return 0
+}
+
+_config_retention() {
+	local keep="" verify="" v=1
+	keep="$(gum input --header "Archives conservées par profil" --value "${CFG_KEEP}")" || return 0
+	if [[ ! ${keep} =~ ^[0-9]+$ ]] || ((keep < 1)); then
+		gum style --border rounded --padding "0 2" --foreground 1 "Nombre invalide : ${keep}"
+		return 0
+	fi
+	verify="$(gum choose --header "Vérifier l'intégrité après écriture" "oui" "non")" || return 0
+	[[ ${verify} == "non" ]] && v=0
+	_config_apply "KEEP_DEFAULT=${keep}" "VERIFY_DEFAULT=${v}"
+	return 0
+}
+
+_config_snapshot() {
+	local mode="" max="" val=""
+	mode="$(gum choose --header "Instantané avant restauration" "auto (si ≤ 512 Mo)" "toujours" "jamais")" || return 0
+	case "${mode}" in
+	auto*) val="auto" ;;
+	toujours*) val="yes" ;;
+	*) val="no" ;;
+	esac
+	max="$(gum input --header "Taille max en mode auto (Mo)" --value "${CFG_SNAP_MAX}")" || return 0
+	if [[ ! ${max} =~ ^[0-9]+$ ]] || ((max < 1)); then
+		gum style --border rounded --padding "0 2" --foreground 1 "Taille invalide : ${max}"
+		return 0
+	fi
+	_config_apply "SNAPSHOT_DEFAULT=${val}" "SNAPSHOT_MAX_MB=${max}"
+	return 0
+}
+
+_config_encrypt() {
+	local enc="" rec=""
+	enc="$(gum choose --header "Chiffrement des archives" "aucun" "gpg" "age")" || return 0
+	case "${enc}" in
+	aucun)
+		_config_apply "ENCRYPT=" "GPG_RECIPIENT=" "AGE_RECIPIENT="
+		;;
+	gpg)
+		rec="$(gum input --header "Destinataire GPG (identifiant ou empreinte)" --value "${CFG_GPG}")" || return 0
+		[[ -n ${rec} ]] || return 0
+		_config_apply "ENCRYPT=gpg" "GPG_RECIPIENT=${rec}" "AGE_RECIPIENT="
+		;;
+	age)
+		rec="$(gum input --header "Destinataire age (age1…)" --value "${CFG_AGE}")" || return 0
+		[[ -n ${rec} ]] || return 0
+		_config_apply "ENCRYPT=age" "AGE_RECIPIENT=${rec}" "GPG_RECIPIENT="
+		;;
+	*) ;;
+	esac
+	return 0
+}
+
+_config_timeout() {
+	local t=""
+	t="$(gum input --header "Délai des vérifications NFS (secondes)" --value "${CFG_TIMEOUT}")" || return 0
+	if [[ ! ${t} =~ ^[0-9]+$ ]] || ((t < 1)); then
+		gum style --border rounded --padding "0 2" --foreground 1 "Délai invalide : ${t}"
+		return 0
+	fi
+	_config_apply "NAS_TIMEOUT=${t}"
+	return 0
+}
+
+_screen_config() {
+	local action="" snap=""
+	while true; do
+		_clear
+		_config_values_load
+		case "${CFG_VERIFY}" in
+		0) snap="non" ;;
+		*) snap="oui" ;;
+		esac
+		gum style --border rounded --padding "0 2" \
+			"Configuration" \
+			"" \
+			"destination  : ${CFG_NAS}/${CFG_SUB}" \
+			"rétention    : ${CFG_KEEP} archive(s) par profil" \
+			"vérification : ${snap} après écriture" \
+			"instantané   : ${CFG_SNAP} (max ${CFG_SNAP_MAX} Mo en auto)" \
+			"chiffrement  : ${CFG_ENCRYPT:-aucun}" \
+			"délai NFS    : ${CFG_TIMEOUT} s"
+
+		action="$(gum choose --header "${ICON_CONFIG}  Configuration — que modifier ?" --cursor "❯ " \
+			"Destination (montage, sous-dossier)…" \
+			"Rétention et vérification…" \
+			"Instantanés avant restauration…" \
+			"Chiffrement…" \
+			"Délai NFS…" \
+			"Retour")" || return 0
+		case "${action}" in
+		Destination*) _config_destination ;;
+		Rétention*) _config_retention ;;
+		Instantanés*) _config_snapshot ;;
+		Chiffrement*) _config_encrypt ;;
+		Délai*) _config_timeout ;;
+		*) return 0 ;;
+		esac
+	done
+}
+
+# =============================================================================
 # MENU
 # =============================================================================
 
@@ -679,19 +835,21 @@ _menu() {
 	_clear
 	choice="$(gum choose --header "Private data backup v${APP_VER}" \
 		--cursor "❯ " \
+		"${ICON_INFO}  Description" \
 		"${ICON_SAVE}  Sauvegarder" \
 		"${ICON_RESTORE}  Restaurer" \
-		"${ICON_ARCHIVE}  Archives / État" \
+		"${ICON_ARCHIVE}  Archives" \
 		"${ICON_USERS}  Profils" \
-		"${ICON_INFO}  Description" \
+		"${ICON_CONFIG}  Configuration" \
 		"${ICON_QUIT}  Quitter")" || return 1
 	# Correspondance par mot-clé : les icônes peuvent changer sans casser le menu.
 	case "${choice}" in
+	*Description*) _screen_about ;;
 	*Sauvegarder*) _screen_backup ;;
 	*Restaurer*) _screen_restore ;;
 	*Archives*) _screen_archives ;;
 	*Profils*) _screen_profiles ;;
-	*Description*) _screen_about ;;
+	*Configuration*) _screen_config ;;
 	*) return 1 ;;
 	esac
 	return 0

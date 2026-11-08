@@ -490,20 +490,21 @@ _config_write_block() {
 	return 0
 }
 
-# Valide un fichier de configuration candidat dans un bash enfant : ses
-# tableaux ne polluent pas ceux du script courant.
+# Valide un fichier de configuration candidat en le faisant valider par le
+# script lui-même (`config-check`), dans un processus séparé : aucun risque de
+# pollution des tableaux courants, et exactement les mêmes règles.
 _config_validate_file() {
-	local f="${1}" count=""
-	# shellcheck disable=SC2016 # code exécuté par le bash enfant : l'expansion doit y avoir lieu
-	count="$(bash -c '
-		declare -A SOURCES=() COMMANDS=() SERVICES=() EXCLUDES=()
-		set +u
-		source "$1" >/dev/null 2>&1 || exit 1
-		printf "%s" "${#SOURCES[@]}"
-	' _ "${f}" 2>&1)" || return 1
-	# Toute sortie d'erreur du fichier candidat casse la correspondance.
-	[[ ${count} =~ ^[0-9]+$ ]] || return 1
-	((count > 0)) || return 1
+	local f="${1}" self="${BASH_SOURCE[0]:-$0}" out=""
+	[[ -f ${f} ]] || return 1
+	if ! bash -n "${f}" 2>/dev/null; then
+		_ERR "syntaxe invalide dans le fichier généré"
+		return 1
+	fi
+	if ! out="$(bash "${self}" --config "${f}" config-check 2>&1)"; then
+		_ERR "configuration refusée :"
+		printf '%s\n' "${out}" >&2
+		return 1
+	fi
 	return 0
 }
 
@@ -928,6 +929,7 @@ Usage :
   ${C_GREEN}${0} list${C_RESET}    [PROFIL]
   ${C_GREEN}${0} profile-add${C_RESET} NOM DOSSIER [BINAIRE] [EXCLUSIONS]
   ${C_GREEN}${0} profile-remove${C_RESET} NOM
+  ${C_GREEN}${0} config-set${C_RESET} CLE=VALEUR [CLE=VALEUR...]   (NAS, rétention, chiffrement…)
   ${C_GREEN}${0} config-path | config-check
   ${C_GREEN}${0} help | --version
 
@@ -1865,6 +1867,96 @@ delete_archive() {
 }
 
 # =============================================================================
+# PARAMÈTRES (écriture des valeurs simples du fichier de configuration)
+# =============================================================================
+
+# Clés modifiables par `config-set` (liste blanche).
+_config_key_ok() {
+	case "${1}" in
+	NAS|BACKUP_SUBDIR|KEEP_DEFAULT|VERIFY_DEFAULT|SNAPSHOT_DEFAULT|SNAPSHOT_MAX_MB|NAS_TIMEOUT|ENCRYPT|GPG_RECIPIENT|AGE_RECIPIENT) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# Remplace (ou ajoute) une affectation simple KEY="..." dans FILE.
+_config_write_scalar() {
+	local file="${1}" key="${2}" val="${3}" tmp="${1}.sc.$$"
+	local esc=""
+	esc="$(_dq "${val}")"
+	SCALAR_KEY="${key}" SCALAR_VAL="${esc}" awk '
+		BEGIN { k = ENVIRON["SCALAR_KEY"]; v = ENVIRON["SCALAR_VAL"]; done = 0 }
+		!done && $0 ~ ("^" k "[ \t]*=") { print k "=\"" v "\""; done = 1; next }
+		{ print }
+		END { if (!done) print k "=\"" v "\"" }
+	' "${file}" >"${tmp}" || {
+		rm -f -- "${tmp}"
+		return 1
+	}
+	if ! mv -f -- "${tmp}" "${file}"; then
+		rm -f -- "${tmp}"
+		return 1
+	fi
+	return 0
+}
+
+config_set() {
+	local -a pairs=("${@}")
+	local pair key val file="${CFG_FILE}" tmp="" bak=""
+
+	if ((${#pairs[@]} == 0)); then
+		_ERR "usage : config-set CLE=VALEUR [CLE=VALEUR...]"
+		return 2
+	fi
+	if [[ -z ${file} ]]; then
+		_ERR "aucun fichier de configuration chargé"
+		return 1
+	fi
+	for pair in "${pairs[@]}"; do
+		if [[ ${pair} != *=* ]]; then
+			_ERR "argument invalide : ${pair} (attendu CLE=VALEUR)"
+			return 2
+		fi
+		key="${pair%%=*}"
+		if [[ -z ${key} ]] || ! _config_key_ok "${key}"; then
+			_ERR "clé non modifiable : ${key:-?} (voir la liste dans le script)"
+			return 2
+		fi
+	done
+
+	tmp="${file}.tmp.$$"
+	if ! cp -p -- "${file}" "${tmp}" 2>/dev/null; then
+		_ERR "copie impossible vers ${tmp}"
+		return 1
+	fi
+	for pair in "${pairs[@]}"; do
+		key="${pair%%=*}"
+		val="${pair#*=}"
+		if ! _config_write_scalar "${tmp}" "${key}" "${val}"; then
+			rm -f -- "${tmp}"
+			_ERR "écriture de ${key} impossible"
+			return 1
+		fi
+	done
+	if ! _config_validate_file "${tmp}"; then
+		rm -f -- "${tmp}"
+		_ERR "rien n'a été écrit"
+		return 1
+	fi
+	bak="${file}.bak"
+	cp -p -- "${file}" "${bak}" 2>/dev/null || _WARN "sauvegarde ${bak} impossible"
+	if ! mv -f -- "${tmp}" "${file}"; then
+		rm -f -- "${tmp}"
+		_ERR "écriture impossible : ${file}"
+		return 1
+	fi
+	_OK "configuration mise à jour : ${file}"
+	for pair in "${pairs[@]}"; do
+		_INFO "${pair%%=*} = ${pair#*=}"
+	done
+	return 0
+}
+
+# =============================================================================
 # PROFILS (écriture dans le fichier de configuration)
 # =============================================================================
 
@@ -2133,7 +2225,7 @@ main() {
 	fi
 
 	case "${cmd}" in
-	backup|restore|rollback|delete_old|show|list|verify|delete-archive|profile-add|profile-remove|config-path|config-check|help|"") ;;
+	backup|restore|rollback|delete_old|show|list|verify|delete-archive|profile-add|profile-remove|config-set|config-path|config-check|help|"") ;;
 	*)
 		_ERR "commande inconnue : ${cmd}"
 		printf '\n' >&2
@@ -2251,6 +2343,10 @@ main() {
 		;;
 	profile-remove)
 		profile_remove "${positional[0]:-}"
+		rc=$?
+		;;
+	config-set)
+		config_set "${positional[@]}"
 		rc=$?
 		;;
 	config-path)
