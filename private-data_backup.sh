@@ -961,10 +961,11 @@ list() {
 	d_size="$(_dashes 10)"
 	d_file="$(_dashes 10)"
 
-	printf '\n%-26s  %-19s  %10s  %s\n' "Profil" "Date" "Taille" "Fichier"
-	printf '%s  %s  %s  %s\n' "${d_prof}" "${d_when}" "${d_size}" "${d_file}"
+	# La première colonne marque les profils hors configuration d'une « * ».
+	printf '\n  %-26s  %-19s  %10s  %s\n' "Profil" "Date" "Taille" "Fichier"
+	printf '  %s  %s  %s  %s\n' "${d_prof}" "${d_when}" "${d_size}" "${d_file}"
 
-	local i group label when size_h profil_group skipped=0
+	local i group label when size_h profil_group skipped=0 orphans=0 mark=""
 	for i in "${!ARCH_PATH[@]}"; do
 		group="${ARCH_GROUP[${i}]}"
 		profil_group="$(_group_profile "${group}")"
@@ -975,10 +976,22 @@ list() {
 		label="$(_group_label "${group}")"
 		when="$(_fmt_datekey "${ARCH_DT[${i}]}")"
 		size_h="$(_human_size "${ARCH_SIZE[${i}]}")"
-		printf '%-26s  %-19s  %10s  %s\n' \
-			"${label}" "${when}" "${size_h}" "${ARCH_PATH[${i}]##*/}"
+		if _known_profile "${profil_group}"; then
+			mark=" "
+		else
+			mark="*"
+			orphans=$((orphans + 1))
+		fi
+		printf '%s %-26s  %-19s  %10s  %s\n' \
+			"${mark}" "${label}" "${when}" "${size_h}" "${ARCH_PATH[${i}]##*/}"
 	done
 	printf '\n'
+	if ((orphans > 0)); then
+		printf ' %b* = profil hors configuration (absent de SOURCES) ; conservé, à purger avec%b\n' \
+			"${C_DIM}" "${C_RESET}"
+		printf ' %b    « delete_old --purge-orphans » (avec confirmation).%b\n' \
+			"${C_DIM}" "${C_RESET}"
+	fi
 	if ((skipped > 0)); then
 		_INFO "${skipped} archive(s) masquée(s) par le filtre"
 	fi
