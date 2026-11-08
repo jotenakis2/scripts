@@ -36,6 +36,7 @@ readonly ICON_WARN=$'\uf071'
 readonly ICON_PLUS=$'\uf067'
 readonly ICON_EDIT=$'\uf044'
 readonly ICON_TRASH=$'\uf1f8'
+readonly ICON_EYE=$'\uf06e'
 
 # Profils (`show --porcelain`).
 declare -a P_NAME=() P_SRC=() P_CMD=() P_ARCH=() P_DATE=() P_SIZE=() P_EXCL=()
@@ -392,26 +393,42 @@ _archives_purge() {
 }
 
 _screen_archives() {
-	printf '\n'
-	"${CLI}" list 2>&1 | gum pager
+	local action="" count=0 total=0 i header=""
+	while true; do
+		# Compteur rafraîchi à chaque passage (suppressions, purge…).
+		count=0
+		total=0
+		if _load_archives; then
+			count=${#A_PATH[@]}
+			for i in "${!A_SIZE[@]}"; do
+				total=$((total + A_SIZE[i]))
+			done
+		fi
+		header="${ICON_ARCHIVE}  Archives — ${count} fichier(s), $(_human "${total}") — que faire ?"
 
-	local action
-	action="$(gum choose --header "${ICON_ARCHIVE}  Archives — que faire ?" --cursor "❯ " \
-		"Restaurer une version…" \
-		"Vérifier une archive…" \
-		"Supprimer une archive…" \
-		"Rétention (delete_old)…" \
-		"Purger les profils orphelins…" \
-		"Retour")" || return 0
-	case "${action}" in
-	Restaurer*) _archives_restore ;;
-	Vérifier*) _archives_verify ;;
-	Supprimer*) _archives_delete ;;
-	Rétention*) _archives_retention ;;
-	Purger*) _archives_purge ;;
-	*) ;;
-	esac
-	return 0
+		action="$(gum choose --header "${header}" --cursor "❯ " \
+			"${ICON_EYE}  Voir les archives" \
+			"Restaurer une version…" \
+			"Vérifier une archive…" \
+			"Supprimer une archive…" \
+			"Rétention (delete_old)…" \
+			"Purger les profils orphelins…" \
+			"Retour")" || return 0
+		case "${action}" in
+		*Voir*)
+			printf '\n'
+			"${CLI}" list 2>&1 | gum pager
+			# En quittant le pager, on revient au menu : ses possibilités
+			# sont réaffichées.
+			;;
+		Restaurer*) _archives_restore ;;
+		Vérifier*) _archives_verify ;;
+		Supprimer*) _archives_delete ;;
+		Rétention*) _archives_retention ;;
+		Purger*) _archives_purge ;;
+		*) return 0 ;;
+		esac
+	done
 }
 
 # =============================================================================
