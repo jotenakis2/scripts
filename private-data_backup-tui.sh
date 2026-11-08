@@ -24,7 +24,6 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${_self}")" && pwd)" || exit 1
 readonly CLI="${SCRIPT_DIR}/private-data_backup.sh"
 
 # Glyphes Nerd Font (police Nerd Font requise dans le terminal).
-readonly ICON_DB=$'\uf1c0'
 readonly ICON_SAVE=$'\uf0c7'
 readonly ICON_RESTORE=$'\uf0e2'
 readonly ICON_ARCHIVE=$'\uf187'
@@ -37,6 +36,7 @@ readonly ICON_PLUS=$'\uf067'
 readonly ICON_EDIT=$'\uf044'
 readonly ICON_TRASH=$'\uf1f8'
 readonly ICON_EYE=$'\uf06e'
+readonly ICON_INFO=$'\uf129'
 
 # Profils (`show --porcelain`).
 declare -a P_NAME=() P_SRC=() P_CMD=() P_ARCH=() P_DATE=() P_SIZE=() P_EXCL=()
@@ -165,6 +165,22 @@ _load_archives() {
 		A_SIZE+=("${s}")
 		A_PATH+=("${p}")
 	done
+	return 0
+}
+
+# Lit une variable simple (NAS, BACKUP_SUBDIR…) dans le fichier de config.
+_config_get() {
+	local key="${1:-}" file="" val=""
+	[[ -n ${key} ]] || return 1
+	file="$("${CLI}" config-path 2>/dev/null)" || return 1
+	[[ -n ${file} ]] || return 1
+	val="$(
+		set +u
+		# shellcheck source=/dev/null # fichier de configuration de l'utilisateur
+		source "${file}" >/dev/null 2>&1 || exit 1
+		printf '%s' "${!key}"
+	)" || return 1
+	printf '%s' "${val}"
 	return 0
 }
 
@@ -593,18 +609,81 @@ _screen_profiles() {
 }
 
 # =============================================================================
+# ÉCRAN : DESCRIPTION
+# =============================================================================
+
+_screen_about() {
+	_clear
+	local cfg="" nas="" sub="" storage=""
+
+	cfg="$("${CLI}" config-path 2>/dev/null)" || cfg="(inconnue)"
+	nas="$(_config_get NAS)" || nas=""
+	sub="$(_config_get BACKUP_SUBDIR)" || sub=""
+	if [[ -n ${nas} ]] && [[ -n ${sub} ]]; then
+		storage="${nas%/}/${sub#/}"
+	else
+		storage="(non défini)"
+	fi
+
+	gum pager <<EOF
+Private data backup v${APP_VER}
+==============================
+
+Sauvegarde et restauration de données privées vers un stockage dédié
+(NAS ou disque externe), par profils déclarés dans un fichier de
+configuration.
+
+CE QUE FAIT CHAQUE ACTION
+-------------------------
+Sauvegarder   Archive un ou plusieurs profils (tar.gz). Refuse un profil
+              dont l'application tourne, applique les exclusions, vérifie
+              l'archive et ne la renomme que si elle est saine
+              (écriture atomique : .part -> contrôle -> mv).
+
+Restaurer     Restaure l'archive la plus récente d'un profil après
+              vérification d'intégrité (repli sur la version précédente
+              si elle est corrompue) et confirmation. Un instantané de
+              l'état actuel est créé avant l'écrasement ; les fichiers
+              remplacés sont conservés en *.pre-restore-<date>.
+
+Archives      Voir toutes les archives, restaurer une version précise,
+              vérifier, supprimer, appliquer la rétention (delete_old)
+              ou purger les profils absents de la configuration.
+
+Profils       Ajouter, modifier ou retirer un profil dans le fichier de
+              configuration (sauvegarde .bak, écriture validée).
+
+OÙ SONT LES CHOSES
+------------------
+Configuration : ${cfg}
+Stockage      : ${storage}
+Journaux      : ~/.local/share/private-data_backup/
+
+SÉCURITÉ
+--------
+Archives et journaux en 0600, dossiers en 0700, chiffrement gpg/age
+optionnel (ENCRYPT dans la configuration), verrou pour empêcher deux
+exécutions simultanées.
+
+Toutes les opérations destructrices demandent une confirmation.
+EOF
+	return 0
+}
+
+# =============================================================================
 # MENU
 # =============================================================================
 
 _menu() {
 	local choice
 	_clear
-	choice="$(gum choose --header "${ICON_DB}  private-data_backup ${APP_VER}" \
+	choice="$(gum choose --header "Private data backup v${APP_VER}" \
 		--cursor "❯ " \
 		"${ICON_SAVE}  Sauvegarder" \
 		"${ICON_RESTORE}  Restaurer" \
 		"${ICON_ARCHIVE}  Archives / État" \
 		"${ICON_USERS}  Profils" \
+		"${ICON_INFO}  Description" \
 		"${ICON_QUIT}  Quitter")" || return 1
 	# Correspondance par mot-clé : les icônes peuvent changer sans casser le menu.
 	case "${choice}" in
@@ -612,6 +691,7 @@ _menu() {
 	*Restaurer*) _screen_restore ;;
 	*Archives*) _screen_archives ;;
 	*Profils*) _screen_profiles ;;
+	*Description*) _screen_about ;;
 	*) return 1 ;;
 	esac
 	return 0
@@ -632,8 +712,9 @@ main() {
 ${0} — interface texte de private-data_backup.sh
 
 Sauvegarder, restaurer (archive ou instantané), agir sur les archives
-(vérifier, supprimer, rétention, purge des orphelins) et gérer les profils
-(ajout, modification, retrait dans le fichier de configuration).
+(vérifier, supprimer, rétention, purge des orphelins), gérer les profils
+(ajout, modification, retrait dans le fichier de configuration) et lire une
+description de l'outil.
 
 Toute la logique et les sécurités (vérification, instantané, confirmation,
 verrou) restent dans le script CLI.

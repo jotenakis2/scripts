@@ -2151,6 +2151,9 @@ main() {
 		return 0
 	fi
 
+	# `config-path` sert aux scripts : sortie pure (bannière/log sur stderr).
+	[[ ${cmd} == "config-path" ]] && PORCELAIN=1
+
 	_need tar find sort awk stat findmnt date timeout du || return 1
 	case "${ENCRYPT}" in
 	"") ;;
