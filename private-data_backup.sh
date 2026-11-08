@@ -123,6 +123,7 @@ ASSUME_YES=0
 VERIFY="${VERIFY_DEFAULT}"
 KEEP="${KEEP_DEFAULT}"
 ORPHANS=0
+PURGE_ORPHANS=0
 SNAPSHOT_MODE="${SNAPSHOT_DEFAULT}"
 
 # Archives découvertes : triées par groupe puis date décroissante.
@@ -584,7 +585,7 @@ ${C_BOLD}${SCRIPTNAME}${C_RESET} v${VER} — sauvegarde/restauration de données
 Usage :
   ${C_GREEN}${0} backup${C_RESET}  [PROFIL...] [--dry-run] [--no-verify]
   ${C_GREEN}${0} restore${C_RESET} [PROFIL]    [--yes] [--dry-run] [--snapshot|--no-snapshot]
-  ${C_GREEN}${0} delete_old${C_RESET} [--keep N] [--orphans] [--dry-run] [--yes]
+  ${C_GREEN}${0} delete_old${C_RESET} [--keep N] [--orphans|--purge-orphans] [--dry-run] [--yes]
   ${C_GREEN}${0} show
   ${C_GREEN}${0} list${C_RESET}    [PROFIL]
   ${C_GREEN}${0} help | --version
@@ -592,9 +593,10 @@ Usage :
 Options :
   --dry-run      n'écrit et n'efface rien : affiche ce qui serait fait
   --yes, -y      ne pas demander de confirmation
-  --no-verify    ne pas relire l'archive après écriture (plus rapide)
+  --no-verify    ne pas vérifier l'intégrité des archives (backup, delete_old)
   --keep N       archives conservées par profil (delete_old, défaut ${KEEP_DEFAULT})
-  --orphans      inclure les profils absents de la configuration (delete_old)
+  --orphans      inclure les profils hors configuration dans la rétention (delete_old)
+  --purge-orphans supprimer toutes les archives des profils hors configuration
   --snapshot     forcer l'instantané avant restauration
   --no-snapshot  interdire l'instantané avant restauration
 
@@ -728,7 +730,7 @@ show() {
 	if ((${#orphelins[@]} > 0)); then
 		printf ' %b(hors configuration) = archives d'"'"'un profil qui n'"'"'est plus déclaré dans la config%b\n' \
 			"${C_DIM}" "${C_RESET}"
-		printf ' %bdu script ; conservées en l'"'"'état (« delete_old --orphans » pour les purger).%b\n' \
+		printf ' %bdu script ; conservées en l'"'"'état (« delete_old --purge-orphans » pour les supprimer).%b\n' \
 			"${C_DIM}" "${C_RESET}"
 	fi
 
@@ -1260,21 +1262,34 @@ delete_old() {
 	local rc=0 kept_total=0
 	local profil is_snapshot label
 
+	if ((VERIFY == 1)); then
+		_INFO "vérification des archives à conserver (relecture complète ; « --no-verify » pour l'éviter)"
+	fi
+
 	for group in "${groupes[@]}"; do
 		profil="$(_group_profile "${group}")"
 		is_snapshot=0
 		[[ ${group} == "${SNAPSHOT_SUBDIR}/"* ]] && is_snapshot=1
 
-		# Les instantanés sont traités par défaut ; les profils disparus de la
-		# configuration exigent --orphans.
-		if ((is_snapshot == 0)) && ! _known_profile "${profil}" && ((ORPHANS == 0)); then
-			continue
-		fi
-
 		local -a paths=()
 		for i in "${!ARCH_GROUP[@]}"; do
 			[[ ${ARCH_GROUP[${i}]} == "${group}" ]] && paths+=("${ARCH_PATH[${i}]}")
 		done
+
+		# Profil absent de la configuration : ignoré par défaut, inclus dans la
+		# rétention avec --orphans, supprimé en totalité avec --purge-orphans.
+		if ((is_snapshot == 0)) && ! _known_profile "${profil}"; then
+			if ((PURGE_ORPHANS == 1)); then
+				for i in "${!paths[@]}"; do
+					del_paths+=("${paths[${i}]}")
+					del_reasons+=("orphelin")
+				done
+				continue
+			fi
+			if ((ORPHANS == 0)); then
+				continue
+			fi
+		fi
 
 		local -a g_keep=() g_del=() g_reason=()
 		local n_keep=0 ok=0 p vrc
@@ -1284,8 +1299,15 @@ delete_old() {
 				g_reason+=("ancienne")
 				continue
 			fi
-			_verify_archive "${p}"
-			vrc=$?
+			if ((VERIFY == 1)); then
+				# La vérification relit toute l'archive (long sur un gros
+				# profil) : on l'affiche pour ne pas donner l'impression
+				# d'un blocage. --no-verify court-circuite cette étape.
+				_RUN "Vérification de ${p##*/}" _verify_archive "${p}"
+				vrc=$?
+			else
+				[[ -s ${p} ]] && vrc=0 || vrc=1
+			fi
 			case "${vrc}" in
 			0) g_keep+=("${p}"); n_keep=$((n_keep + 1)); ok=1 ;;
 			1) g_del+=("${p}"); g_reason+=("corrompue") ;;
@@ -1371,7 +1393,8 @@ main() {
 		--dry-run)     DRY_RUN=1 ;;
 		--yes|-y)      ASSUME_YES=1 ;;
 		--no-verify)   VERIFY=0 ;;
-		--orphans)     ORPHANS=1 ;;
+		--orphans)       ORPHANS=1 ;;
+		--purge-orphans) PURGE_ORPHANS=1 ;;
 		--snapshot)    SNAPSHOT_MODE="yes" ;;
 		--no-snapshot) SNAPSHOT_MODE="no" ;;
 		--keep)        shift; KEEP="${1:-}" ;;
