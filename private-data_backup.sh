@@ -336,6 +336,7 @@ _config_defaults() {
 	: "${SNAPSHOT_DEFAULT:=auto}"
 	: "${SNAPSHOT_MAX_MB:=512}"
 	: "${NAS_TIMEOUT:=20}"
+	: "${LOG_FILES:=1}"
 	: "${ENCRYPT:=}"
 	: "${GPG_RECIPIENT:=}"
 	: "${AGE_RECIPIENT:=}"
@@ -429,6 +430,13 @@ _config_validate() {
 		_ERR "NAS_TIMEOUT doit être un entier >= 1 (reçu : ${NAS_TIMEOUT})"
 		errs=1
 	fi
+	case "${LOG_FILES}" in
+	0|1) ;;
+	*)
+		_ERR "LOG_FILES doit valoir 0 ou 1 (reçu : ${LOG_FILES})"
+		errs=1
+		;;
+	esac
 	if [[ -z ${NAS} ]] || [[ -z ${BACKUP_SUBDIR} ]]; then
 		_ERR "NAS et BACKUP_SUBDIR doivent être renseignés"
 		errs=1
@@ -866,13 +874,23 @@ _find_valid_archive() {
 
 # Vérifie une archive : 0 = valide, 1 = corrompue/vide, 2 = indécidable
 # (chiffrée et clé indisponible).
+# 0 = valide, 1 = corrompue/vide, 2 = indécidable (clé indisponible).
+# `with_list` = 1 journalise la liste des entrées (si LOG_FILES=1).
 _verify_archive() {
-	local f="${1}" rc=0
+	local f="${1}" with_list="${2:-0}" rc=0
+	local listing=0
 	[[ -f ${f} ]] || return 1
 	[[ -s ${f} ]] || return 1
+	if ((with_list == 1)) && ((LOG_FILES == 1)) && [[ -n ${LOG_FILE} ]]; then
+		listing=1
+	fi
 
 	if _archive_is_encrypted "${f}"; then
-		_decrypt "${f}" 2>/dev/null | tar -tzf - >/dev/null 2>&1
+		if ((listing == 1)); then
+			_decrypt "${f}" 2>/dev/null | tar -tzvf - >>"${LOG_FILE}" 2>/dev/null
+		else
+			_decrypt "${f}" 2>/dev/null | tar -tzf - >/dev/null 2>&1
+		fi
 		rc=$?
 		((rc == 0)) && return 0
 		if ! _decrypt "${f}" >/dev/null 2>&1; then
@@ -881,7 +899,11 @@ _verify_archive() {
 		return 1
 	fi
 
-	tar -tzf "${f}" >/dev/null 2>&1
+	if ((listing == 1)); then
+		tar -tzvf "${f}" >>"${LOG_FILE}" 2>/dev/null
+	else
+		tar -tzf "${f}" >/dev/null 2>&1
+	fi
 	rc=$?
 	((rc == 0)) && return 0
 	return 1
@@ -1209,18 +1231,28 @@ _backup_tar() {
 		unset IFS
 	fi
 
-	local opts_str=""
+	local opts_str="" flag_disp="-czf"
 	if ((${#opts[@]} > 0)); then
 		opts_str="${opts[*]} "
 	fi
+	# -v journalise la liste des fichiers ajoutés (LOG_FILES=1). L'option est
+	# passée séparément : « -czfv » ferait de « v » le nom de l'archive.
+	local -a taropts=(-c -z)
+	if ((LOG_FILES == 1)); then
+		taropts+=(-v)
+		flag_disp="-czvf"
+	fi
 	if [[ -n "${ENCRYPT}" ]]; then
-		_log "tar -czf - ${opts_str}-C ${HOME} ${src} | ${ENCRYPT} > ${out}"
-		tar -czf - "${opts[@]}" -C "${HOME}" "${src}" | _encrypt >"${out}"
+		_log "tar ${flag_disp} - ${opts_str}-C ${HOME} ${src} | ${ENCRYPT} > ${out}"
+		tar "${taropts[@]}" -f - "${opts[@]}" -C "${HOME}" "${src}" | _encrypt >"${out}"
 		rc=$?
 	else
-		_log "tar -czf ${out} ${opts_str}-C ${HOME} ${src}"
-		tar -czf "${out}" "${opts[@]}" -C "${HOME}" "${src}"
+		_log "tar ${flag_disp} ${out} ${opts_str}-C ${HOME} ${src}"
+		tar "${taropts[@]}" -f "${out}" "${opts[@]}" -C "${HOME}" "${src}"
 		rc=$?
+	fi
+	if ((LOG_FILES == 1)); then
+		_log "--- fin de la liste des fichiers ---"
 	fi
 
 	# tar : 0 = OK, 1 = « fichier modifié pendant la lecture » (archive
@@ -1534,14 +1566,21 @@ _restore_extract() {
 	local file="${1}" dest="${2}" suffix="${3}" rc=0
 	local -a opts=(--extract --gzip --directory "${dest}" --no-same-owner --backup --suffix="${suffix}")
 
+	local -a vopts=()
+	if ((LOG_FILES == 1)); then
+		vopts=(--verbose)
+	fi
 	if _archive_is_encrypted "${file}"; then
-		_log "decrypt ${file} | tar ${opts[*]} --file -"
-		_decrypt "${file}" | tar "${opts[@]}" --file -
+		_log "decrypt ${file} | tar ${opts[*]} ${vopts[*]:-} --file -"
+		_decrypt "${file}" | tar "${opts[@]}" "${vopts[@]}" --file -
 		rc=$?
 	else
-		_log "tar ${opts[*]} --file ${file}"
-		tar "${opts[@]}" --file "${file}"
+		_log "tar ${opts[*]} ${vopts[*]:-} --file ${file}"
+		tar "${opts[@]}" "${vopts[@]}" --file "${file}"
 		rc=$?
+	fi
+	if ((LOG_FILES == 1)); then
+		_log "--- fin de la liste des fichiers extraits ---"
 	fi
 	if ((rc == 1)); then
 		_log "avertissement tar : fichier(s) modifié(s) pendant l'extraction"
@@ -1863,8 +1902,14 @@ verify() {
 		_ERR "fichier absent : ${f}"
 		return 1
 	fi
-	_verify_archive "${f}"
+	if ((LOG_FILES == 1)); then
+		_log "--- contenu de ${f##*/} ---"
+	fi
+	_verify_archive "${f}" 1
 	rc=$?
+	if ((LOG_FILES == 1)); then
+		_log "--- fin du contenu ---"
+	fi
 	case "${rc}" in
 	0)
 		local bytes=0 size_h=""
@@ -1917,7 +1962,7 @@ delete_archive() {
 # Clés modifiables par `config-set` (liste blanche).
 _config_key_ok() {
 	case "${1}" in
-	NAS|BACKUP_SUBDIR|KEEP_DEFAULT|VERIFY_DEFAULT|SNAPSHOT_DEFAULT|SNAPSHOT_MAX_MB|NAS_TIMEOUT|ENCRYPT|GPG_RECIPIENT|AGE_RECIPIENT) return 0 ;;
+	NAS|BACKUP_SUBDIR|KEEP_DEFAULT|VERIFY_DEFAULT|SNAPSHOT_DEFAULT|SNAPSHOT_MAX_MB|NAS_TIMEOUT|LOG_FILES|ENCRYPT|GPG_RECIPIENT|AGE_RECIPIENT) return 0 ;;
 	*) return 1 ;;
 	esac
 }

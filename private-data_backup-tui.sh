@@ -60,6 +60,7 @@ CFG_TIMEOUT=""
 CFG_ENCRYPT=""
 CFG_GPG=""
 CFG_AGE=""
+CFG_LOG_FILES=""
 PF_NAME=""
 PF_SRC=""
 PF_CMD=""
@@ -667,8 +668,9 @@ Profils       Ajouter, modifier ou retirer un profil dans le fichier de
               configuration (sauvegarde .bak, écriture validée).
 
 Configuration Modifier la destination (montage et sous-dossier), la
-              rétention, la vérification, les instantanés, le chiffrement
-              et le délai NFS — mêmes garde-fous que pour les profils.
+              rétention, la vérification, les instantanés, le chiffrement,
+              la liste des fichiers dans le journal et le délai NFS —
+              mêmes garde-fous que pour les profils.
 
 OÙ SONT LES CHOSES
 ------------------
@@ -702,6 +704,7 @@ _config_values_load() {
 	CFG_ENCRYPT="$(_config_get ENCRYPT)"
 	CFG_GPG="$(_config_get GPG_RECIPIENT)"
 	CFG_AGE="$(_config_get AGE_RECIPIENT)"
+	CFG_LOG_FILES="$(_config_get LOG_FILES)"
 	return 0
 }
 
@@ -781,6 +784,17 @@ _config_encrypt() {
 	return 0
 }
 
+_config_logging() {
+	local v="" val=0
+	v="$(gum choose --header "Journaliser la liste des fichiers (sauvegarde, vérification, restauration)" \
+		"oui" "non")" || return 0
+	if [[ ${v} == "oui" ]]; then
+		val=1
+	fi
+	_config_apply "LOG_FILES=${val}"
+	return 0
+}
+
 _config_timeout() {
 	local t=""
 	t="$(gum input --header "Délai des vérifications NFS (secondes)" --value "${CFG_TIMEOUT}")" || return 0
@@ -802,6 +816,8 @@ _screen_config() {
 		*) snap="oui" ;;
 		esac
 		local snap_line="instantané   : ${CFG_SNAP}"
+		local CFG_LISTE="non"
+		[[ ${CFG_LOG_FILES} == "1" ]] && CFG_LISTE="oui"
 		if [[ ${CFG_SNAP} == "auto" ]]; then
 			snap_line="instantané   : auto (max ${CFG_SNAP_MAX} Mo)"
 		fi
@@ -813,6 +829,7 @@ _screen_config() {
 			"vérification : ${snap} après écriture" \
 			"${snap_line}" \
 			"chiffrement  : ${CFG_ENCRYPT:-aucun}" \
+			"fichiers     : ${CFG_LISTE} (liste dans le journal)" \
 			"délai NFS    : ${CFG_TIMEOUT} s"
 
 		action="$(gum choose --header "${ICON_CONFIG}  Configuration — que modifier ?" --cursor "❯ " \
@@ -820,6 +837,7 @@ _screen_config() {
 			"Rétention et vérification…" \
 			"Instantanés avant restauration…" \
 			"Chiffrement…" \
+			"Journalisation (liste des fichiers)…" \
 			"Délai NFS…" \
 			"Retour")" || return 0
 		case "${action}" in
@@ -827,6 +845,7 @@ _screen_config() {
 		Rétention*) _config_retention ;;
 		Instantanés*) _config_snapshot ;;
 		Chiffrement*) _config_encrypt ;;
+		Journalisation*) _config_logging ;;
 		Délai*) _config_timeout ;;
 		*) return 0 ;;
 		esac
