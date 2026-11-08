@@ -1,410 +1,1473 @@
 #!/usr/bin/env bash
-# Usage : ./private-data_backup.sh backup | restore [PROFIL] | delete_old | show 
-# Dossier de stockage des sauvegardes (par exemple un point de montage d'un NAS ou d'un disque externe)
-NAS="/media/NAS"
-if findmnt "${NAS}" &>/dev/null; then
-	NAS_MOUNT="${NAS}/backup/data2restore"
-else
-	echo "NAS non monté (${NAS} n'est pas un point de montage)"
-	exit 1
-fi
+# shellcheck enable=all
+# =============================================================================
+# private-data_backup.sh — sauvegarde / restauration de données privées
+#
+# Usage :
+#   private-data_backup.sh backup  [PROFIL...] [--dry-run] [--no-verify]
+#   private-data_backup.sh restore [PROFIL]    [--yes] [--snapshot|--no-snapshot]
+#   private-data_backup.sh delete_old [--keep N] [--orphans] [--dry-run] [--yes]
+#   private-data_backup.sh show
+#   private-data_backup.sh list [PROFIL]
+#   private-data_backup.sh help | --version
+#
+# Politique d'erreur : PAS de `set -e`. Il rend le comportement des fonctions
+# imprévisible (un test qui échoue, une commande dans un `if`, une substitution
+# de processus… peuvent tuer le script). Chaque commande est donc testée
+# explicitement, les erreurs sont accumulées et le code de sortie final vaut :
+#   0 = succès, 1 = au moins un échec, 2 = usage / configuration invalide.
+#
+# Secrets : umask 077, archives et logs en 0600, dossiers en 0700.
+# =============================================================================
 
-# dossiers à sauvegarder
-declare -A SOURCES=(
-   #["HELIUM"]=".config/net.imput.helium"
-   ["BRAVE"]=".config/BraveSoftware"
-   #["LIBREWOLF"]=".config/librewolf"
-   ["SSH"]=".ssh"
-   ["IPTVNATOR"]=".iptvnator"
-   #["MSMTP"]=".config/msmtp"
-   #["IMAGES"]="Pictures"
-   ["DOCUMENTS"]="Documents"
-   #["MOK"]="mok-cachyos"
-   #["DISCORD"]=".config/vesktop"
-   ["PROJECTS"]="Projects"
-   ["ZSH_HISTORY"]=".local/share/zsh/zsh_history"
-   # ajouter ici sur le modèle ["NOM-DU-PROFIL-DE-SAUVEGARDE"]="Dossier" où Dossier est un répertoire dans $HOME
-)
+set -uo pipefail
+umask 077
+export LC_COLLATE=C
 
-# binaire à surveiller avant la sauvegarde 
-# (par exemple pour les profils navigateurs il est recommandé de fermer le navigateur avant sauvegarde/restauration
-declare -A COMMANDS=(
-   #["HELIUM"]="helium"
-   #["LIBREWOLF"]="librewolf"
-   ["IPTVNATOR"]="iptvnator.bin"
-   #["DISCORD"]="vesktop"
-   ["BRAVE"]="brave"
-   # ajouter ici sur le modèle ["NOM-DU-PROFIL-DE-SAUVEGARDE"]="nom-du-binaire"
-)
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 
-
-
-
-
-
-
-
-
-
-
-####################################################################################################################
-####################################################################################################################
-####################################################################################################################
-####################################################################################################################
-####################################################################################################################
-set -euo pipefail
-VER=1.2
+readonly VER="1.3"
 SCRIPTNAME="${0##*/}"
 SCRIPTNAME="${SCRIPTNAME%.sh}"
-readonly VER SCRIPTNAME
+readonly SCRIPTNAME
 
-trap '_CLEANUP' ERR
-trap '_INTERRUPT' INT
-trap '_DO_CLEAN' EXIT
+# Point de montage du stockage et sous-dossier des archives.
+# Surchargeables par l'environnement (utile pour les tests).
+NAS="${PRIVATE_BACKUP_NAS:-/media/NAS}"
+BACKUP_SUBDIR="${PRIVATE_BACKUP_SUBDIR:-backup/data2restore}"
+readonly SNAPSHOT_SUBDIR="pre-restore"
 
+# Profils : SOURCES[PROFIL] = chemin relatif à ${HOME}.
+# Commenter une ligne désactive le profil ; ses archives existantes ne sont
+# jamais supprimées sans `delete_old --orphans`.
+declare -A SOURCES=(
+	["BRAVE"]=".config/BraveSoftware"
+	["SSH"]=".ssh"
+	["IPTVNATOR"]=".iptvnator"
+	["DOCUMENTS"]="Documents"
+	["PROJECTS"]="Projects"
+	["ZSH_HISTORY"]=".local/share/zsh/zsh_history"
+	# ajouter ici sur le modèle ["NOM-DU-PROFIL"]="Dossier"
+)
 
+# Binaire à surveiller avant sauvegarde/restauration d'un profil.
+declare -A COMMANDS=(
+	["IPTVNATOR"]="iptvnator.bin"
+	["BRAVE"]="brave"
+	# ajouter ici sur le modèle ["NOM-DU-PROFIL"]="nom-du-binaire"
+)
 
+# Service utilisateur à arrêter pendant l'opération (redémarré dans tous les
+# cas par le trap EXIT, y compris sur erreur ou interruption).
+declare -A SERVICES=(
+	# ["HELIUM"]="psd.service"
+)
 
-########################################################################################################################
-# shellcheck disable=SC2034
-_ENABLE_COLORS() {
-    if [[ -t 1 ]] && command -v tput &>/dev/null && [[ -z "${NO_COLOR:-}" ]]; then
-        # texte
-        C_BLACK=$(tput setaf 0)
-        C_RED=$(tput setaf 1)
-        C_GREEN=$(tput setaf 2)
-        C_YELLOW=$(tput setaf 3)
-        C_BLUE=$(tput setaf 4)
-        C_MAGENTA=$(tput setaf 5)
-        C_CYAN=$(tput setaf 6)
-        C_WHITE=$(tput setaf 7)
+# Motifs tar exclus par profil, séparés par « | ». Chaque motif est appliqué
+# au nom du membre ET à chaque composant de chemin (un motif sans « / » cible
+# donc un nom de dossier, à n'importe quelle profondeur).
+declare -A EXCLUDES=(
+	["BRAVE"]="Cache|Code Cache|GPUCache|Service Worker|ScriptCache|ShaderCache|GrShaderCache|DawnCache|Crashpad|extensions_crx_cache|component_crx_cache|adblock_cache|SingletonLock|SingletonCookie|SingletonSocket"
+	["PROJECTS"]="target|node_modules|__pycache__|.venv|venv|.mypy_cache|.pytest_cache|.ruff_cache"
+)
 
-        # attribut
-        C_BOLD=$(tput bold)
-        C_DIM=$(tput dim)
-        C_RESET=$(tput sgr0)
-        C_UNDERLINE=$(tput smul)
-        C_RESET_UNDERLINE=$(tput rmul)
+# Rétention par défaut de `delete_old` (archives conservées par groupe).
+KEEP_DEFAULT=1
 
-        # background
-        BKGND_BLACK=$(tput setab 0)
-        BKGND_RED=$(tput setab 1)
-        BKGND_GREEN=$(tput setab 2)
-        BKGND_YELLOW=$(tput setab 3)
-        BKGND_BLUE=$(tput setab 4)
-        BKGND_MAGENTA=$(tput setab 5)
-        BKGND_CYAN=$(tput setab 6)
-        BKGND_WHITE=$(tput setab 7)
-    else
-        # texte
-        C_BLACK=''
-        C_RED=''
-        C_GREEN=''
-        C_YELLOW=''
-        C_BLUE=''
-        C_MAGENTA=''
-        C_CYAN=''
-        C_WHITE=''
+# Vérification d'intégrité après écriture (relit l'archive : coûteux en I/O
+# sur un gros profil, d'où l'option --no-verify).
+VERIFY_DEFAULT=1
 
-        # attribut
-        C_BOLD=''
-        C_DIM=''
-        C_RESET=''
-        C_UNDERLINE=''
-        C_RESET_UNDERLINE=''
+# Instantané de l'état courant avant restauration.
+#   auto = créé si la cible fait moins de SNAPSHOT_MAX_MB, sinon avertissement
+SNAPSHOT_DEFAULT="auto"
+readonly SNAPSHOT_MAX_MB=512
 
-        # background
-        BKGND_BLACK=''
-        BKGND_RED=''
-        BKGND_GREEN=''
-        BKGND_YELLOW=''
-        BKGND_BLUE=''
-        BKGND_MAGENTA=''
-        BKGND_CYAN=''
-        BKGND_WHITE=''
-    fi
-    local vars=(
-        C_BLACK C_RED C_GREEN C_YELLOW C_BLUE C_MAGENTA C_CYAN C_WHITE
-        C_BOLD C_DIM C_RESET C_UNDERLINE C_RESET_UNDERLINE
-        BKGND_BLACK BKGND_RED BKGND_GREEN BKGND_YELLOW
-        BKGND_BLUE BKGND_MAGENTA BKGND_CYAN BKGND_WHITE
-    )
-    export "${vars[@]}"
+# Chiffrement des archives : "" (aucun), "gpg" ou "age".
+#   ENCRYPT="gpg" + GPG_RECIPIENT="0x..."   ⇒ archives .tar.gz.gpg
+#   ENCRYPT="age" + AGE_RECIPIENT="age1..." ⇒ archives .tar.gz.age
+ENCRYPT="${PRIVATE_BACKUP_ENCRYPT:-}"
+GPG_RECIPIENT="${PRIVATE_BACKUP_GPG_RECIPIENT:-}"
+AGE_RECIPIENT="${PRIVATE_BACKUP_AGE_RECIPIENT:-}"
+
+# Délai maximal accordé aux vérifications de montage (NFS monté en `hard`).
+readonly NAS_TIMEOUT=20
+
+# =============================================================================
+# ÉTAT INTERNE
+# =============================================================================
+
+C_RED=''
+C_GREEN=''
+C_YELLOW=''
+C_CYAN=''
+C_BOLD=''
+C_DIM=''
+C_RESET=''
+
+SPIN_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+
+LOG_FILE=""
+CHILD_PID=0
+PART_FILE=""
+SERVICES_STOPPED=()
+RUN_DATE=""
+NAS_MOUNT=""
+FAILURES=0
+INTERRUPTED=0
+
+DRY_RUN=0
+ASSUME_YES=0
+VERIFY="${VERIFY_DEFAULT}"
+KEEP="${KEEP_DEFAULT}"
+ORPHANS=0
+SNAPSHOT_MODE="${SNAPSHOT_DEFAULT}"
+
+# Archives découvertes : triées par groupe puis date décroissante.
+declare -a ARCH_GROUP=() ARCH_DT=() ARCH_PATH=() ARCH_SIZE=()
+
+# Sorties de `_parse_archive`.
+ARCH_PROFILE=""
+ARCH_DATEKEY=""
+
+# Sorties de `_latest_archive`.
+LATEST_PATH=""
+LATEST_DT=""
+LATEST_SIZE=0
+
+# =============================================================================
+# OUTILLAGE GÉNÉRIQUE
+# =============================================================================
+
+_enable_colors() {
+	[[ -t 1 ]] && [[ -t 2 ]] || return 0
+	command -v tput >/dev/null 2>&1 || return 0
+	[[ -z "${NO_COLOR:-}" ]] || return 0
+	C_RED="$(tput setaf 1)"    || C_RED=''
+	C_GREEN="$(tput setaf 2)"  || C_GREEN=''
+	C_YELLOW="$(tput setaf 3)" || C_YELLOW=''
+	C_CYAN="$(tput setaf 6)"   || C_CYAN=''
+	C_BOLD="$(tput bold)"      || C_BOLD=''
+	C_DIM="$(tput dim)"        || C_DIM=''
+	C_RESET="$(tput sgr0)"     || C_RESET=''
+	return 0
 }
 
-########################################################################################################################
+# Écriture dans le log : ne doit jamais échouer, même sans log.
+_log_write() {
+	[[ -n "${LOG_FILE}" ]] || return 0
+	printf '%s\n' "${*}" >>"${LOG_FILE}" 2>/dev/null || return 0
+	return 0
+}
 
-_DO_CLEAN(){
-	echo ""
-	if [[ -e "${LOG_FILE}" ]]; then
-		echo "Log : ${LOG_FILE}"
+_init_log() {
+	local dir="${HOME}/.local/share/${SCRIPTNAME}"
+	if ! mkdir -p -- "${dir}" 2>/dev/null; then
+		LOG_FILE=""
+		_WARN "dossier de logs inaccessible (${dir}) : sortie non journalisée"
+		return 0
+	fi
+	chmod 700 -- "${dir}" 2>/dev/null
+	# Le fichier n'est créé qu'au premier message (pas de log vide).
+	LOG_FILE="${dir}/${SCRIPTNAME}-${RUN_DATE}.log"
+	local probe="${dir}/.write-probe.$$"
+	if ! : >"${probe}" 2>/dev/null; then
+		LOG_FILE=""
+		_WARN "dossier de logs non inscriptible (${dir}) : sortie non journalisée"
+		return 0
+	fi
+	rm -f -- "${probe}" 2>/dev/null
+	return 0
+}
+
+_OK() {
+	printf ' %b✓%b %s\n' "${C_GREEN}" "${C_RESET}" "${*}"
+	_log_write " ✓ ${*}"
+	return 0
+}
+
+_ERR() {
+	printf ' %b✗%b %s\n' "${C_RED}" "${C_RESET}" "${*}" >&2
+	_log_write " ✗ ${*}"
+	return 0
+}
+
+_WARN() {
+	printf ' %b!%b %s\n' "${C_YELLOW}" "${C_RESET}" "${*}" >&2
+	_log_write " ! ${*}"
+	return 0
+}
+
+_INFO() {
+	printf ' %b·%b %s\n' "${C_CYAN}" "${C_RESET}" "${*}"
+	return 0
+}
+
+_human_size() {
+	local bytes="${1:-0}"
+	LC_ALL=C awk -v b="${bytes}" 'BEGIN {
+		split("o Ko Mo Go To", u, " ")
+		i = 1
+		s = b + 0
+		while (s >= 1024 && i < 5) { s /= 1024; i++ }
+		if (i == 1) printf "%d %s", s, u[i]
+		else printf "%.1f %s", s, u[i]
+	}'
+	return 0
+}
+
+_file_size() {
+	local size
+	size="$(stat -c %s -- "${1}" 2>/dev/null)" || size=0
+	[[ ${size} =~ ^[0-9]+$ ]] || size=0
+	printf '%s' "${size}"
+}
+
+_need() {
+	local tool missing=0
+	for tool in "${@}"; do
+		if ! command -v "${tool}" >/dev/null 2>&1; then
+			_ERR "dépendance manquante : ${tool}"
+			missing=1
+		fi
+	done
+	return "${missing}"
+}
+
+_dashes() {
+	printf '%*s' "${1:-1}" '' | tr ' ' '-'
+}
+
+# =============================================================================
+# TRAPS : nettoyage garanti, quelle que soit la sortie
+# =============================================================================
+
+_cleanup_parts() {
+	if [[ -n "${PART_FILE}" ]] && [[ -e "${PART_FILE}" ]]; then
+		rm -f -- "${PART_FILE}" 2>/dev/null
+	fi
+	PART_FILE=""
+	return 0
+}
+
+_restart_services() {
+	local unit
+	((${#SERVICES_STOPPED[@]} == 0)) && return 0
+	for unit in "${SERVICES_STOPPED[@]}"; do
+		if systemctl --user start "${unit}" 2>/dev/null; then
+			_INFO "service ${unit} redémarré"
+		else
+			_WARN "échec du redémarrage de ${unit} — à relancer manuellement"
+		fi
+	done
+	SERVICES_STOPPED=()
+	return 0
+}
+
+_on_exit() {
+	_cleanup_parts
+	_restart_services
+	if [[ -n "${LOG_FILE}" ]] && [[ -s "${LOG_FILE}" ]] && ((INTERRUPTED == 0)); then
+		printf '\n %bLog%b : %s\n' "${C_DIM}" "${C_RESET}" "${LOG_FILE}"
+	fi
+	return 0
+}
+
+_on_signal() {
+	local sig="${1:-INT}" code=130
+	[[ ${sig} == "TERM" ]] && code=143
+	[[ ${sig} == "HUP" ]] && code=129
+	INTERRUPTED=1
+	printf '\n'
+	_WARN "interrompu (SIG${sig})"
+	if ((CHILD_PID > 0)); then
+		kill -TERM "${CHILD_PID}" 2>/dev/null
+		wait "${CHILD_PID}" 2>/dev/null
+	fi
+	if [[ -n "${PART_FILE}" ]] && [[ -e "${PART_FILE}" ]]; then
+		_WARN "archive partielle supprimée : ${PART_FILE##*/}"
+	fi
+	_cleanup_parts
+	_restart_services
+	exit "${code}"
+}
+
+# =============================================================================
+# EXÉCUTION AVEC INDICATEUR DE PROGRESSION
+# =============================================================================
+
+_spin() {
+	local pid="${1}" msg="${2}" i=0 total=0
+	[[ -t 2 ]] || return 0
+	total=${#SPIN_FRAMES[@]}
+	while kill -0 "${pid}" 2>/dev/null; do
+		printf '\r %b%s%b %s' "${C_RED}" "${SPIN_FRAMES[$((i % total))]}" "${C_RESET}" "${msg}" >&2
+		sleep 0.1
+		i=$((i + 1))
+	done
+	printf '\r\033[2K' >&2
+	return 0
+}
+
+# _RUN "message" commande [arguments...]
+# Lance la commande en arrière-plan (pour l'indicateur), journalise sa sortie,
+# renvoie son code de retour. Ne quitte jamais : l'appelant décide.
+_RUN() {
+	local msg="${1:-}"
+	shift || true
+	if (($# == 0)); then
+		_ERR "interne : _RUN sans commande"
+		return 2
+	fi
+
+	local rc=0 target="/dev/null"
+	[[ -n "${LOG_FILE}" ]] && target="${LOG_FILE}"
+
+	"${@}" >>"${target}" 2>&1 9>&- &
+	CHILD_PID=$!
+	_spin "${CHILD_PID}" "${msg}"
+	wait "${CHILD_PID}"
+	rc=$?
+	CHILD_PID=0
+
+	if ((rc == 0)); then
+		_OK "${msg}"
+	else
+		_ERR "${msg} — code ${rc}"
+	fi
+	return "${rc}"
+}
+
+_show_log_tail() {
+	[[ -n "${LOG_FILE}" ]] && [[ -s "${LOG_FILE}" ]] || return 0
+	printf '\n%b--- 10 dernières lignes du log ---%b\n' "${C_DIM}" "${C_RESET}"
+	tail -n 10 -- "${LOG_FILE}" 2>/dev/null
+	printf '%b-----------------------------------%b\n' "${C_DIM}" "${C_RESET}"
+	return 0
+}
+
+# =============================================================================
+# NAS
+# =============================================================================
+
+_check_nas() {
+	NAS_MOUNT="${NAS}/${BACKUP_SUBDIR}"
+
+	if ! timeout "${NAS_TIMEOUT}" findmnt -rn -M "${NAS}" -o TARGET >/dev/null 2>&1; then
+		_ERR "NAS non monté : ${NAS} n'est pas un point de montage"
+		return 1
+	fi
+	return 0
+}
+
+# Variante pour les commandes qui écrivent sur le NAS.
+_check_nas_rw() {
+	_check_nas || return 1
+	if ! mkdir -p -- "${NAS_MOUNT}" 2>/dev/null; then
+		_ERR "impossible de créer ${NAS_MOUNT}"
+		return 1
+	fi
+	if ! timeout "${NAS_TIMEOUT}" touch -- "${NAS_MOUNT}/.write-test.$$" 2>/dev/null; then
+		_ERR "NAS non inscriptible (ou injoignable) : ${NAS_MOUNT}"
+		return 1
+	fi
+	rm -f -- "${NAS_MOUNT}/.write-test.$$" 2>/dev/null
+	return 0
+}
+
+_check_nas_perms() {
+	[[ -d "${NAS_MOUNT}" ]] || return 0
+	if [[ -O "${NAS_MOUNT}" ]]; then
+		chmod 700 -- "${NAS_MOUNT}" 2>/dev/null || _WARN "chmod 700 impossible sur ${NAS_MOUNT}"
+	else
+		_WARN "${NAS_MOUNT} n'appartient pas à ${USER:-utilisateur courant} : permissions non modifiables (chiffrement conseillé)"
+	fi
+	return 0
+}
+
+_free_kb() {
+	local kb
+	kb="$(timeout "${NAS_TIMEOUT}" df -P --output=avail -- "${NAS_MOUNT}" 2>/dev/null | tail -n 1)" || kb=0
+	[[ ${kb} =~ ^[0-9]+$ ]] || kb=0
+	printf '%s' "${kb}"
+}
+
+# =============================================================================
+# ARCHIVES : nommage, découverte, vérification
+# =============================================================================
+
+_enc_suffix() {
+	case "${ENCRYPT}" in
+	gpg) printf '%s' ".gpg" ;;
+	age) printf '%s' ".age" ;;
+	*)   printf '%s' "" ;;
+	esac
+}
+
+_archive_is_encrypted() {
+	case "${1}" in
+	*.gpg|*.gpg.part|*.age|*.age.part) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+_encrypt() {
+	case "${ENCRYPT}" in
+	gpg) gpg --batch --yes --no-tty --trust-model always --encrypt --recipient "${GPG_RECIPIENT}" ;;
+	age) age --encrypt --recipient "${AGE_RECIPIENT}" ;;
+	*)   cat ;;
+	esac
+}
+
+_decrypt() {
+	case "${1}" in
+	*.gpg|*.gpg.part) gpg --batch --quiet --no-tty --decrypt -- "${1}" ;;
+	*.age|*.age.part) age --decrypt -- "${1}" ;;
+	*) cat -- "${1}" ;;
+	esac
+}
+
+# Analyse un nom d'archive ; renseigne ARCH_PROFILE et ARCH_DATEKEY
+# (AAAAMMJJHHMMSS). Reconnaît le format actuel et l'ancien (JJ_MM_AAAA).
+_parse_archive() {
+	local base="${1##*/}"
+	ARCH_PROFILE=""
+	ARCH_DATEKEY=""
+
+	if [[ ${base} =~ ^(.+)_([0-9]{4})-([0-9]{2})-([0-9]{2})-([0-9]{2})\.([0-9]{2})\.([0-9]{2})\.tar\.gz(\.gpg|\.age)?$ ]]; then
+		ARCH_PROFILE="${BASH_REMATCH[1]}"
+		ARCH_DATEKEY="${BASH_REMATCH[2]}${BASH_REMATCH[3]}${BASH_REMATCH[4]}${BASH_REMATCH[5]}${BASH_REMATCH[6]}${BASH_REMATCH[7]}"
+		return 0
+	fi
+	if [[ ${base} =~ ^(.+)_([0-9]{2})_([0-9]{2})_([0-9]{4})-([0-9]{2})\.([0-9]{2})\.([0-9]{2})\.tar\.gz(\.gpg|\.age)?$ ]]; then
+		ARCH_PROFILE="${BASH_REMATCH[1]}"
+		ARCH_DATEKEY="${BASH_REMATCH[4]}${BASH_REMATCH[3]}${BASH_REMATCH[2]}${BASH_REMATCH[5]}${BASH_REMATCH[6]}${BASH_REMATCH[7]}"
+		return 0
+	fi
+	return 1
+}
+
+# Construit les tableaux ARCH_*, triés par groupe puis date décroissante.
+# Groupe = « PROFIL » ou « pre-restore/PROFIL ».
+_collect_archives() {
+	ARCH_GROUP=()
+	ARCH_DT=()
+	ARCH_PATH=()
+	ARCH_SIZE=()
+
+	local dir rel f mtime size group dt
+	local -a files=() rows=()
+
+	for dir in "${NAS_MOUNT}" "${NAS_MOUNT}/${SNAPSHOT_SUBDIR}"; do
+		[[ -d ${dir} ]] || continue
+		rel=""
+		[[ ${dir} == "${NAS_MOUNT}/${SNAPSHOT_SUBDIR}" ]] && rel="${SNAPSHOT_SUBDIR}/"
+
+		files=()
+		mapfile -t files < <(find "${dir}" -maxdepth 1 -type f \
+			\( -name '*.tar.gz' -o -name '*.tar.gz.gpg' -o -name '*.tar.gz.age' \) \
+			-print 2>/dev/null || true)
+
+		((${#files[@]} == 0)) && continue
+		for f in "${files[@]}"; do
+			_parse_archive "${f}" || continue
+			mtime="$(stat -c %Y -- "${f}" 2>/dev/null)" || mtime=0
+			[[ ${mtime} =~ ^[0-9]+$ ]] || mtime=0
+			size="$(_file_size "${f}")"
+			rows+=("${rel}${ARCH_PROFILE}"$'\t'"${ARCH_DATEKEY}"$'\t'"${mtime}"$'\t'"${size}"$'\t'"${f}")
+		done
+	done
+
+	((${#rows[@]} == 0)) && return 0
+
+	while IFS=$'\t' read -r group dt mtime size f; do
+		[[ -n ${group} ]] || continue
+		ARCH_GROUP+=("${group}")
+		ARCH_DT+=("${dt}")
+		ARCH_SIZE+=("${size}")
+		ARCH_PATH+=("${f}")
+	done < <(printf '%s\n' "${rows[@]}" | sort -t$'\t' -k1,1 -k2,2r -k3,3r || true)
+	return 0
+}
+
+_latest_archive() {
+	local group="${1}" i
+	LATEST_PATH=""
+	LATEST_DT=""
+	LATEST_SIZE=0
+	for i in "${!ARCH_GROUP[@]}"; do
+		if [[ ${ARCH_GROUP[${i}]} == "${group}" ]]; then
+			LATEST_PATH="${ARCH_PATH[${i}]}"
+			LATEST_DT="${ARCH_DT[${i}]}"
+			LATEST_SIZE="${ARCH_SIZE[${i}]}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Comme `_latest_archive`, mais renvoie la première archive réellement valide
+# (utilisé en secours quand la plus récente est corrompue).
+_find_valid_archive() {
+	local group="${1}" i
+	for i in "${!ARCH_GROUP[@]}"; do
+		if [[ ${ARCH_GROUP[${i}]} == "${group}" ]]; then
+			if _verify_archive "${ARCH_PATH[${i}]}"; then
+				LATEST_PATH="${ARCH_PATH[${i}]}"
+				LATEST_DT="${ARCH_DT[${i}]}"
+				LATEST_SIZE="${ARCH_SIZE[${i}]}"
+				return 0
+			fi
+		fi
+	done
+	return 1
+}
+
+# Vérifie une archive : 0 = valide, 1 = corrompue/vide, 2 = indécidable
+# (chiffrée et clé indisponible).
+_verify_archive() {
+	local f="${1}" rc=0
+	[[ -f ${f} ]] || return 1
+	[[ -s ${f} ]] || return 1
+
+	if _archive_is_encrypted "${f}"; then
+		_decrypt "${f}" 2>/dev/null | tar -tzf - >/dev/null 2>&1
+		rc=$?
+		((rc == 0)) && return 0
+		if ! _decrypt "${f}" >/dev/null 2>&1; then
+			return 2
+		fi
+		return 1
+	fi
+
+	tar -tzf "${f}" >/dev/null 2>&1
+	rc=$?
+	((rc == 0)) && return 0
+	return 1
+}
+
+_known_profile() {
+	[[ -n "${SOURCES[${1}]:-}" ]]
+}
+
+_fmt_datekey() {
+	local dk="${1}"
+	if [[ ${#dk} -ne 14 ]]; then
+		printf '%s' "?"
+		return 0
+	fi
+	printf '%s-%s-%s %s:%s:%s' "${dk:0:4}" "${dk:4:2}" "${dk:6:2}" "${dk:8:2}" "${dk:10:2}" "${dk:12:2}"
+}
+
+_group_label() {
+	if [[ ${1} == "${SNAPSHOT_SUBDIR}/"* ]]; then
+		printf '%s (instantané)' "${1#"${SNAPSHOT_SUBDIR}/"}"
+	else
+		printf '%s' "${1}"
 	fi
 }
 
-########################################################################################################################
-
-_DO_LOG(){
-    if [[ -s "${LOG_FILE:-}" ]]; then
-        _OK "Extrait du Log :"
-        echo "--------------------------------------------------------------------------"
-        tail -5 "${LOG_FILE:-}" 2>/dev/null
-        echo "--------------------------------------------------------------------------"
-        _DIE "Log complet : ${LOG_FILE:-}"
-    fi
-    echo -e "${C_RESET}"
+_group_profile() {
+	printf '%s' "${1#"${SNAPSHOT_SUBDIR}/"}"
 }
 
-########################################################################################################################
+# =============================================================================
+# AFFICHAGE
+# =============================================================================
 
-_CLEANUP() {
-    echo -e "${C_BOLD}${C_RED} Plantage !${C_RESET}"
-    _DO_CLEAN
-    echo -e "${C_BOLD}${C_RED}"
-    _DO_LOG
+_usage() {
+	cat <<EOF
+${C_BOLD}${SCRIPTNAME}${C_RESET} v${VER} — sauvegarde/restauration de données privées
+
+Usage :
+  ${C_GREEN}${0} backup${C_RESET}  [PROFIL...] [--dry-run] [--no-verify]
+  ${C_GREEN}${0} restore${C_RESET} [PROFIL]    [--yes] [--dry-run] [--snapshot|--no-snapshot]
+  ${C_GREEN}${0} delete_old${C_RESET} [--keep N] [--orphans] [--dry-run] [--yes]
+  ${C_GREEN}${0} show
+  ${C_GREEN}${0} list${C_RESET}    [PROFIL]
+  ${C_GREEN}${0} help | --version
+
+Options :
+  --dry-run      n'écrit et n'efface rien : affiche ce qui serait fait
+  --yes, -y      ne pas demander de confirmation
+  --no-verify    ne pas relire l'archive après écriture (plus rapide)
+  --keep N       archives conservées par profil (delete_old, défaut ${KEEP_DEFAULT})
+  --orphans      inclure les profils absents de la configuration (delete_old)
+  --snapshot     forcer l'instantané avant restauration
+  --no-snapshot  interdire l'instantané avant restauration
+
+Stockage : ${NAS_MOUNT:-${NAS}/${BACKUP_SUBDIR}}
+Secrets  : archives et logs 0600, dossiers 0700 (umask 077)
+EOF
+	return 0
 }
 
+show() {
+	_check_nas || return 1
+	if ! [[ -d ${NAS_MOUNT} ]]; then
+		_INFO "aucune archive (${NAS_MOUNT} absent)"
+		return 0
+	fi
+	_collect_archives
 
-####################################################################################################################
+	local profil cmd src w_prof=6 w_src=20 w_cmd=12
+	local -a profils=()
+	mapfile -t profils < <(printf '%s\n' "${!SOURCES[@]}" | sort || true)
 
-backup() {
-    local profil cmd source target selected cmd1 cmd2
-    selected=${1:-}
-    local psdclosed=''
-    for profil in "${!SOURCES[@]}"; do
-    	if [[ -n "${selected}" ]]; then
-            selected="${selected^^}"
-            if [[ -z "${SOURCES["${selected}"]:-}" ]]; then
-                _DIE "Profil inconnu : ${selected}. Utilisez 'show' pour lister les profils."
-            else
-				if [[ "${profil}" != "${selected}" ]]; then continue ;fi
-			fi
-    	fi
-        source=${SOURCES["${profil}"]}
-        target="${NAS_MOUNT}/${profil}_${DATE}.tar.gz"
-        cmd=${COMMANDS["${profil}"]:-}
-		if [[ -n "${cmd}" ]] && pgrep -x "${cmd}" >/dev/null; then
-			_ERR "Ferme ${cmd} d'abord."
+	for profil in "${profils[@]}"; do
+		((${#profil} > w_prof)) && w_prof=${#profil}
+		src="${SOURCES[${profil}]}"
+		((${#src} > w_src)) && w_src=${#src}
+		cmd="${COMMANDS[${profil}]:-}"
+		((${#cmd} > w_cmd)) && w_cmd=${#cmd}
+	done
+
+	local d_prof d_src d_cmd d_arch d_size
+	d_prof="$(_dashes "${w_prof}")"
+	d_src="$(_dashes "${w_src}")"
+	d_cmd="$(_dashes "${w_cmd}")"
+	d_arch="$(_dashes 38)"
+	d_size="$(_dashes 10)"
+
+	printf '\n%bProfils configurés%b\n' "${C_BOLD}" "${C_RESET}"
+	printf '%-*s  %-*s  %-*s  %-38s  %s\n' \
+		"${w_prof}" "Profil" "${w_src}" "Dossier" "${w_cmd}" "Contrôle" "Dernière archive" "Taille"
+	printf '%s  %s  %s  %s  %s\n' "${d_prof}" "${d_src}" "${d_cmd}" "${d_arch}" "${d_size}"
+
+	local when size_h
+	for profil in "${profils[@]}"; do
+		if _latest_archive "${profil}"; then
+			when="${LATEST_PATH##*/}"
+			size_h="$(_human_size "${LATEST_SIZE}")"
+			printf '%-*s  %-*s  %-*s  %-38s  %s\n' \
+				"${w_prof}" "${profil}" \
+				"${w_src}" "${SOURCES[${profil}]}" \
+				"${w_cmd}" "${COMMANDS[${profil}]:-}" \
+				"${when}" "${size_h}"
 		else
-			if [[ "${profil}" = "HELIUM" ]] || [[ "${profil}" = "LIBREWOLF" ]]; then
-			    if systemctl --user is-active --quiet psd.service; then
-			    	cmd1=${COMMANDS["HELIUM"]:-}
-			    	cmd2=${COMMANDS["LIBREWOLF"]:-}
-			    	if ! pgrep -x "${cmd1}" >/dev/null && ! pgrep -x "${cmd2}" >/dev/null; then
-				        if systemctl --user stop psd.service; then
-				        	sleep 2
-				            psdclosed="yes"
-				            _RUN "Sauvegarde du profil ${profil} en cours..." tar -cvzf "${target}" -C "${HOME}" "${source}"			
-				        fi
-				    fi
-				else
-					_RUN "Sauvegarde du profil ${profil} en cours..." tar -cvzf "${target}" -C "${HOME}" "${source}"
-			    fi
+			printf '%-*s  %-*s  %-*s  %b(aucune)%b\n' \
+				"${w_prof}" "${profil}" \
+				"${w_src}" "${SOURCES[${profil}]}" \
+				"${w_cmd}" "${COMMANDS[${profil}]:-}" \
+				"${C_RED}" "${C_RESET}"
+		fi
+	done
+
+	local i group total=0 orphan_total=0 snap_total=0 snap_count=0
+	local -A connus=() orphelins=()
+	for profil in "${profils[@]}"; do
+		connus[${profil}]=1
+	done
+	for i in "${!ARCH_GROUP[@]}"; do
+		group="${ARCH_GROUP[${i}]}"
+		total=$((total + ARCH_SIZE[i]))
+		if [[ ${group} == "${SNAPSHOT_SUBDIR}/"* ]]; then
+			snap_total=$((snap_total + ARCH_SIZE[i]))
+			snap_count=$((snap_count + 1))
+			continue
+		fi
+		profil="$(_group_profile "${group}")"
+		if [[ -z "${connus[${profil}]:-}" ]]; then
+			orphan_total=$((orphan_total + ARCH_SIZE[i]))
+			orphelins[${profil}]=1
+		fi
+	done
+
+	local total_h
+	total_h="$(_human_size "${total}")"
+	printf '\n%bContenu de %s%b : %d archive(s), %s\n' \
+		"${C_BOLD}" "${NAS_MOUNT}" "${C_RESET}" "${#ARCH_PATH[@]}" "${total_h}"
+
+	if ((${#orphelins[@]} > 0)); then
+		local orphan_list="" orphan_h=""
+		orphan_list="$(printf '%s ' "${!orphelins[@]}")"
+		orphan_h="$(_human_size "${orphan_total}")"
+		printf ' Profils absents de la configuration : %s(%s)\n' "${orphan_list}" "${orphan_h}"
+		printf ' %b→ « delete_old --orphans » les traite ; rien n'"'"'est supprimé sans confirmation.%b\n' \
+			"${C_DIM}" "${C_RESET}"
+	fi
+
+	local snap_h
+	snap_h="$(_human_size "${snap_total}")"
+	printf ' Instantanés avant restauration : %d fichier(s), %s\n\n' "${snap_count}" "${snap_h}"
+	return 0
+}
+
+list() {
+	local filter="${1:-}"
+	_check_nas || return 1
+	if ! [[ -d ${NAS_MOUNT} ]]; then
+		_INFO "aucune archive (${NAS_MOUNT} absent)"
+		return 0
+	fi
+	_collect_archives
+
+	if ((${#ARCH_PATH[@]} == 0)); then
+		_INFO "aucune archive dans ${NAS_MOUNT}"
+		return 0
+	fi
+
+	filter="${filter^^}"
+	local d_prof d_when d_size d_file
+	d_prof="$(_dashes 26)"
+	d_when="$(_dashes 19)"
+	d_size="$(_dashes 10)"
+	d_file="$(_dashes 10)"
+
+	printf '\n%-26s  %-19s  %10s  %s\n' "Profil" "Date" "Taille" "Fichier"
+	printf '%s  %s  %s  %s\n' "${d_prof}" "${d_when}" "${d_size}" "${d_file}"
+
+	local i group label when size_h profil_group skipped=0
+	for i in "${!ARCH_PATH[@]}"; do
+		group="${ARCH_GROUP[${i}]}"
+		profil_group="$(_group_profile "${group}")"
+		if [[ -n ${filter} ]] && [[ ${profil_group} != "${filter}" ]]; then
+			skipped=$((skipped + 1))
+			continue
+		fi
+		label="$(_group_label "${group}")"
+		when="$(_fmt_datekey "${ARCH_DT[${i}]}")"
+		size_h="$(_human_size "${ARCH_SIZE[${i}]}")"
+		printf '%-26s  %-19s  %10s  %s\n' \
+			"${label}" "${when}" "${size_h}" "${ARCH_PATH[${i}]##*/}"
+	done
+	printf '\n'
+	if ((skipped > 0)); then
+		_INFO "${skipped} archive(s) masquée(s) par le filtre"
+	fi
+	return 0
+}
+
+# =============================================================================
+# BACKUP
+# =============================================================================
+
+# Écrit l'archive d'un profil dans `${out}` (fichier .part : atomicité).
+_backup_tar() {
+	local profil="${1}" src="${2}" out="${3}" rc=0 pat
+	local -a opts=()
+
+	if [[ -n "${EXCLUDES[${profil}]:-}" ]]; then
+		local IFS='|'
+		for pat in ${EXCLUDES[${profil}]}; do
+			opts+=(--exclude="${pat}" --exclude="*/${pat}")
+		done
+		unset IFS
+	fi
+
+	if [[ -n "${ENCRYPT}" ]]; then
+		tar -czf - "${opts[@]}" -C "${HOME}" "${src}" | _encrypt >"${out}"
+		rc=$?
+	else
+		tar -czf "${out}" "${opts[@]}" -C "${HOME}" "${src}"
+		rc=$?
+	fi
+
+	# tar : 0 = OK, 1 = « fichier modifié pendant la lecture » (archive
+	# utilisable), >= 2 = échec réel. Avec chiffrement, pipefail renvoie le code
+	# du dernier maillon en échec : un gpg en échec (2) l'emporte donc.
+	((rc == 0 || rc == 1)) && return 0
+	return "${rc}"
+}
+
+_backup_one() {
+	local profil="${1}" explicit="${2:-0}"
+	local src cmd abs target part enc size_h bytes
+	src="${SOURCES[${profil}]}"
+	abs="${HOME}/${src}"
+
+	if ! [[ -e ${abs} ]]; then
+		if ((explicit == 1)); then
+			_ERR "${profil} : source absente (~/${src}) — échec"
+			return 1
+		fi
+		_WARN "${profil} : source absente (~/${src}) — profil ignoré"
+		return 3
+	fi
+
+	cmd="${COMMANDS[${profil}]:-}"
+	if [[ -n ${cmd} ]] && pgrep -x -- "${cmd}" >/dev/null 2>&1; then
+		_WARN "${profil} : ${cmd} est en cours d'exécution — ferme-le puis relance"
+		return 3
+	fi
+
+	if [[ -n "${SERVICES[${profil}]:-}" ]]; then
+		if systemctl --user is-active --quiet "${SERVICES[${profil}]}" 2>/dev/null; then
+			if systemctl --user stop "${SERVICES[${profil}]}"; then
+				SERVICES_STOPPED+=("${SERVICES[${profil}]}")
 			else
-				_RUN "Sauvegarde du profil ${profil} en cours..." tar -cvzf "${target}" -C "${HOME}" "${source}"			
+				_WARN "${profil} : arrêt de ${SERVICES[${profil}]} impossible"
 			fi
 		fi
-    done
-    if [[ "${psdclosed}" = "yes" ]] && ! systemctl --user is-active --quiet psd.service; then
-		systemctl --user start psd.service
-    fi
-    echo
-    find "${NAS_MOUNT}" -maxdepth 1 -type f -printf '%f\t%s\n' | awk -F '\t' '{ printf "%s (%d Mo)\n", $1, ($2/1024/1024)+1.0 }' | sort | grep "${DATE}" | column -t
+	fi
 
+	enc="$(_enc_suffix)"
+	target="${NAS_MOUNT}/${profil}_${RUN_DATE}.tar.gz${enc}"
+	part="${target}.part"
+
+	if ((DRY_RUN == 1)); then
+		bytes="$(du -sb -- "${abs}" 2>/dev/null | cut -f1)" || bytes=0
+		[[ ${bytes} =~ ^[0-9]+$ ]] || bytes=0
+		size_h="$(_human_size "${bytes}")"
+		_INFO "${profil} : serait écrit dans ${target##*/} (~${size_h} de source)"
+		return 0
+	fi
+
+	PART_FILE="${part}"
+	if ! _RUN "Sauvegarde de ${profil} (~/${src})" _backup_tar "${profil}" "${src}" "${part}"; then
+		_show_log_tail
+		_cleanup_parts
+		return 1
+	fi
+
+	chmod 600 -- "${part}" 2>/dev/null || _WARN "${profil} : chmod 600 impossible sur l'archive"
+
+	if ((VERIFY == 1)); then
+		local vrc=0
+		_verify_archive "${part}"
+		vrc=$?
+		case "${vrc}" in
+		0) ;;
+		2) _WARN "${profil} : archive chiffrée non vérifiable (clé indisponible)" ;;
+		*)
+			_cleanup_parts
+			_ERR "${profil} : archive corrompue après écriture — rejetée et supprimée"
+			return 1
+			;;
+		esac
+	fi
+
+	if ! mv -f -- "${part}" "${target}"; then
+		_ERR "${profil} : renommage final impossible (${target##*/})"
+		_cleanup_parts
+		return 1
+	fi
+	PART_FILE=""
+	_restart_services
+
+	bytes="$(_file_size "${target}")"
+	size_h="$(_human_size "${bytes}")"
+	_INFO "${profil} : ${target##*/} (${size_h})"
+	return 0
 }
 
-####################################################################################################################
+backup() {
+	local -a wanted=("${@}")
+	local -a profils=()
+	local profil p explicit rc_one rc=0 skipped=0 done_count=0
 
-# restore() {
-#     local profil file
-#     for profil in "${!SOURCES[@]}"; do
-#     	cmd=${COMMANDS["${profil}"]:-}
-# 		file=$(find "${NAS_MOUNT}" -maxdepth 1 -name "${profil}_*.tar.gz" -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2- || true)
-# 		if [[ -n "${cmd}" ]] && pgrep -x "${cmd}" >/dev/null; then
-# 			_ERR "Ferme ${cmd} d'abord."
-# 		else
-# 			if [[ -n "${file}" ]]; then
-# 				_RUN "Restauration du profil ${profil} (${file} vers ${HOME}) en cours..." tar -xzf "${file}" -C "${HOME}"
-# 			fi
-# 		fi
-# 	done
-# }
+	_check_nas_rw || return 1
+	_check_nas_perms
+	_collect_archives
 
-####################################################################################################################
+	if ((${#wanted[@]} > 0)); then
+		for p in "${wanted[@]}"; do
+			p="${p^^}"
+			if ! _known_profile "${p}"; then
+				_ERR "profil inconnu : ${p} (voir « show »)"
+				rc=2
+				continue
+			fi
+			profils+=("${p}")
+		done
+		((rc == 2)) && return 2
+	else
+		mapfile -t profils < <(printf '%s\n' "${!SOURCES[@]}" | sort || true)
+	fi
 
-# HELPERS ----------------------------------------------------------------------------------------------------------
-_OK()       { printf " %b✓%b %s\n" "${C_GREEN}"  "${C_RESET}" "$*" | tee -a "${LOG_FILE}"; }
-_ERR()      { printf " %b✗%b %s\n" "${C_RED}"    "${C_RESET}" "$*" | tee -a "${LOG_FILE}" >&2; }
-_DIE()      { _ERR "$*"; exit 1; }
-_RUN() {
-    local msg="$1"; shift
+	# Déduplication (un profil demandé deux fois ne doit pas être sauvegardé
+	# deux fois dans la même archive nommée).
+	local -A vu=()
+	local -a uniq=()
+	for p in "${profils[@]}"; do
+		[[ -n "${vu[${p}]:-}" ]] && continue
+		vu[${p}]=1
+		uniq+=("${p}")
+	done
+	if ((${#uniq[@]} > 0)); then
+		profils=("${uniq[@]}")
+	fi
 
-    spin() {
-        local pid="$1" msg="$2" i=0
-        while kill -0 "${pid}" 2>/dev/null; do
-            printf "\r %b%s%b %s" "${C_RED}" "${SPIN_FRAMES[$((i % 10))]}" "${C_RESET}" "${msg}"
-            sleep 0.05
-            (( i++ )) || true
-        done
-        printf '\r\033[2K'
-    }
+	# Espace libre, estimé d'après la dernière archive de chaque profil.
+	local need_kb=0 free_kb size_kb need_h free_h
+	for profil in "${profils[@]}"; do
+		if _latest_archive "${profil}"; then
+			size_kb=$((LATEST_SIZE / 1024))
+			need_kb=$((need_kb + size_kb + size_kb / 5))
+		fi
+	done
+	need_kb=$((need_kb + 262144))
+	free_kb="$(_free_kb)"
+	if ((free_kb > 0)) && ((free_kb < need_kb)); then
+		need_h="$(_human_size $((need_kb * 1024)))"
+		free_h="$(_human_size $((free_kb * 1024)))"
+		_ERR "espace insuffisant sur le NAS : ${free_h} libres, ~${need_h} estimés"
+		return 1
+	fi
 
-    "$@" >> "${LOG_FILE}" 2>&1 &
-    local pid=$!
-    spin "${pid}" "${msg}"
-    if wait "${pid}"; then
-        _OK "${msg}"
-    else
-        _ERR "${msg}"
-        _DIE "Échec — détails : ${LOG_FILE}"
-    fi
-}
-####################################################################################################################
-# shellcheck disable=SC2312
-show() {
-    local profil
-    local -i w=0
+	local now
+	now="$(date '+%d/%m/%Y %H:%M:%S')" || now="?"
+	printf '\n%bSauvegarde du %s%b → %s\n' "${C_BOLD}" "${now}" "${C_RESET}" "${NAS_MOUNT}"
 
-    for profil in "${!SOURCES[@]}"; do
-        (( ${#profil} > w )) && w=${#profil}
-    done
+	for profil in "${profils[@]}"; do
+		explicit=0
+		if ((${#wanted[@]} > 0)); then
+			for p in "${wanted[@]}"; do
+				[[ ${p^^} == "${profil}" ]] && explicit=1
+			done
+		fi
+		_backup_one "${profil}" "${explicit}"
+		rc_one=$?
+		case "${rc_one}" in
+		0) done_count=$((done_count + 1)) ;;
+		3) skipped=$((skipped + 1)) ;;
+		*)
+			rc=1
+			FAILURES=$((FAILURES + 1))
+			;;
+		esac
+	done
 
-    printf '%-*s | %-40s | %s\n' \
-        "${w}" "Profil" \
-        "Dossier" \
-        "Binaire de contrôle"
-    printf '%-*s-+-%-40s-+-%s\n' \
-        "${w}" "$(printf '%*s' "${w}" '' | tr ' ' '-')" \
-        "$(printf '%*s' 40 '' | tr ' ' '-')" \
-        "$(printf '%*s' 20 '' | tr ' ' '-')"
+	_restart_services
 
-    for profil in "${!SOURCES[@]}"; do
-        printf '%-*s | %-40s | %s\n' \
-            "${w}" "${profil}" \
-            "${SOURCES[${profil}]}" \
-            "${COMMANDS[${profil}]:-}"
-    done
-    echo -e "\nContenu de la sauvegarde :"
-    find "${NAS_MOUNT}" -maxdepth 1 -type f -printf '%f\t%s\n' | awk -F '\t' '{ printf "%s (%d Mo)\n", $1, ($2/1024/1024)+1.0 }' | sort | column -t
-}
+	if ((DRY_RUN == 1)); then
+		printf '\n%bBilan (dry-run)%b : %d serait sauvegardé(e), %d ignoré(e), %d en échec\n' \
+			"${C_BOLD}" "${C_RESET}" "${done_count}" "${skipped}" "${FAILURES}"
+		return "${rc}"
+	fi
 
-####################################################################################################################
-
-delete_old() {
-    local profil file
-    local -i deleted=0
-
-    echo -e "${C_CYAN}Suppression des anciennes sauvegardes (on ne garde que la plus récente)...${C_RESET}"
-
-    for profil in "${!SOURCES[@]}"; do
-        # Liste tous les fichiers du profil triés du plus récent au plus ancien
-        local -a files=()
-        mapfile -t files < <(
-            find "${NAS_MOUNT}" -maxdepth 1 -name "${profil}_*.tar.gz" -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2- || true
-        )
-
-        if (( ${#files[@]} <= 1 )); then
-            continue  # 0 ou 1 fichier : rien à supprimer
-        fi
-
-        # On garde le premier (le plus récent), on supprime les suivants
-        echo "Profil ${profil} : "
-        echo ""
-        echo -e "${C_GREEN}✓ ${C_RESET}Conservation de ${files[0]##*/}"
-        for file in "${files[@]:1}"; do
-            _RUN "Suppression de ${file##*/}" rm -vf "${file}"
-            (( deleted++ )) || true
-        done
-        echo
-    done
-
-    if (( deleted == 0 )); then
-        printf " Rien à supprimer.\n"
-    else
-        printf "\n%b%d archive(s) supprimée(s).%b\n" "${C_GREEN}" "${deleted}" "${C_RESET}"
-        show
-    fi
+	printf '\n%bBilan%b : %d sauvegardée(s), %d ignorée(s), %d en échec\n' \
+		"${C_BOLD}" "${C_RESET}" "${done_count}" "${skipped}" "${FAILURES}"
+	if ((FAILURES > 0)); then
+		_show_log_tail
+		return 1
+	fi
+	return "${rc}"
 }
 
-####################################################################################################################
+# =============================================================================
+# RESTORE
+# =============================================================================
 
-restore() {
-    local profil cmd
-    local target_profil="${1:-}"
-	show 
-    if [[ -n "${target_profil}" ]]; then
-        target_profil="${target_profil^^}"
-        if [[ -z "${SOURCES["${target_profil}"]:-}" ]]; then
-            _DIE "Profil inconnu : ${target_profil}. Utilisez 'show' pour lister les profils."
-        fi
-        _restore_one "${target_profil}"
-        return
-    fi
-
-    local -a profils
-    # shellcheck disable=SC2312
-    mapfile -t profils < <(printf '%s\n' "${!SOURCES[@]}" | sort)
-
-    printf "\n%bChoisissez un profil à restaurer :%b\n\n" "${C_CYAN}" "${C_RESET}"
-    local -i i=1
-    for profil in "${profils[@]}"; do
-        printf "  %b%2d)%b %s\n" "${C_GREEN}" "${i}" "${C_RESET}" "${profil}"
-        (( i++ )) || true
-    done
-    printf "  %b%2d)%b TOUS\n"    "${C_GREEN}" "${i}" "${C_RESET}"; local all_idx=${i}; (( i++ )) || true
-    printf "  %b%2d)%b Annuler\n" "${C_GREEN}" "${i}" "${C_RESET}"; local cancel_idx=${i}
-
-    local choice
-    printf "\n%b#?%b " "${C_CYAN}" "${C_RESET}"
-    read -r choice
-
-    if [[ ! "${choice}" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > cancel_idx )); then
-        echo "Choix invalide."; return
-    fi
-
-    if (( choice == cancel_idx )); then
-        echo "Annulé."; return
-    elif (( choice == all_idx )); then
-        for profil in "${profils[@]}"; do
-            _restore_one "${profil}"
-        done
-    else
-        _restore_one "${profils[$(( choice - 1 ))]}"
-    fi
+_is_tty() {
+	[[ -t 0 ]]
 }
-####################################################################################################################
+
+_confirm() {
+	local question="${1}" answer=""
+	if ((ASSUME_YES == 1)); then
+		return 0
+	fi
+	if ! _is_tty; then
+		_ERR "confirmation impossible (entrée standard non interactive) — utilise --yes"
+		return 1
+	fi
+	printf ' %b?%b %s [o/N] ' "${C_CYAN}" "${C_RESET}" "${question}"
+	if ! read -r answer; then
+		printf '\n'
+		return 1
+	fi
+	case "${answer}" in
+	o|O|oui|Oui|OUI|y|Y|yes|Yes|YES) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+_dir_size_mb() {
+	local mb
+	mb="$(du -sm -- "${1}" 2>/dev/null | cut -f1)" || mb=0
+	[[ ${mb} =~ ^[0-9]+$ ]] || mb=0
+	printf '%s' "${mb}"
+}
+
+_snapshot_path() {
+	printf '%s/%s/%s_%s.tar.gz' "${NAS_MOUNT}" "${SNAPSHOT_SUBDIR}" "${1}" "${RUN_DATE}"
+}
+
+# Instantané de l'état courant avant écrasement. 0 = fait ou inutile.
+_snapshot_before_restore() {
+	local profil="${1}"
+	local src="${SOURCES[${profil}]}"
+	local abs="${HOME}/${src}"
+	local dir size_mb target
+
+	[[ -e ${abs} ]] || return 0
+
+	case "${SNAPSHOT_MODE}" in
+	no)
+		_WARN "pas d'instantané (--no-snapshot) : l'état actuel de ~/${src} sera perdu"
+		return 0
+		;;
+	auto)
+		size_mb="$(_dir_size_mb "${abs}")"
+		if ((size_mb > SNAPSHOT_MAX_MB)); then
+			_WARN "instantané ignoré : ~/${src} fait ${size_mb} Mo (> ${SNAPSHOT_MAX_MB} Mo) — utilise --snapshot pour forcer"
+			return 0
+		fi
+		;;
+	*) ;;
+	esac
+
+	dir="${NAS_MOUNT}/${SNAPSHOT_SUBDIR}"
+	if ! mkdir -p -- "${dir}" 2>/dev/null; then
+		_ERR "impossible de créer ${dir}"
+		return 1
+	fi
+	[[ -O ${dir} ]] && chmod 700 -- "${dir}" 2>/dev/null
+	target="$(_snapshot_path "${profil}")"
+
+	PART_FILE="${target}.part"
+	if ! _RUN "Instantané de ~/${src}" tar -czf "${target}.part" -C "${HOME}" "${src}"; then
+		_cleanup_parts
+		_ERR "instantané impossible — restauration annulée"
+		return 1
+	fi
+	chmod 600 -- "${target}.part" 2>/dev/null
+	PART_FILE=""
+	if ! mv -f -- "${target}.part" "${target}"; then
+		_cleanup_parts
+		_ERR "renommage de l'instantané impossible"
+		return 1
+	fi
+	_OK "instantané : ${SNAPSHOT_SUBDIR}/${target##*/}"
+	return 0
+}
+
+_restore_extract() {
+	local file="${1}" dest="${2}" suffix="${3}" rc=0
+	local -a opts=(--extract --gzip --directory "${dest}" --no-same-owner --backup --suffix="${suffix}")
+
+	if _archive_is_encrypted "${file}"; then
+		_decrypt "${file}" | tar "${opts[@]}" --file -
+		rc=$?
+	else
+		tar "${opts[@]}" --file "${file}"
+		rc=$?
+	fi
+	((rc == 1)) && return 0 # tar : avertissement (fichier modifié)
+	return "${rc}"
+}
 
 _restore_one() {
-    local profil="$1" file cmd
-    cmd=${COMMANDS["${profil}"]:-}
-    file=$(find "${NAS_MOUNT}" -maxdepth 1 -name "${profil}_*.tar.gz" -printf '%T@ %p\n' \
-        | sort -rn | head -1 | cut -d' ' -f2- || true)
+	local profil="${1}" file="" cmd suffix when size_h rc=0
+	profil="${profil^^}"
 
-    if [[ -n "${cmd}" ]] && pgrep -x "${cmd}" >/dev/null; then
-        _ERR "Ferme ${cmd} d'abord."
-        return
-    fi
-    if [[ -z "${file}" ]]; then
-        _ERR "Aucune sauvegarde trouvée pour le profil ${profil}."
-        return
-    fi
-    _RUN "Restauration du profil ${profil} (${file##*/} → ${HOME}) en cours..." \
-        tar -xzf "${file}" -C "${HOME}"
+	if ! _known_profile "${profil}"; then
+		_ERR "profil inconnu : ${profil} (voir « show »)"
+		return 2
+	fi
+	if ! _latest_archive "${profil}"; then
+		_ERR "${profil} : aucune sauvegarde dans ${NAS_MOUNT}"
+		return 1
+	fi
+	file="${LATEST_PATH}"
+
+	cmd="${COMMANDS[${profil}]:-}"
+	if [[ -n ${cmd} ]] && pgrep -x -- "${cmd}" >/dev/null 2>&1; then
+		_ERR "${profil} : ferme ${cmd} d'abord"
+		return 1
+	fi
+
+	when="$(_fmt_datekey "${LATEST_DT}")"
+	size_h="$(_human_size "${LATEST_SIZE}")"
+	printf '\n%bRestauration%b %s ← %s (%s, %s)\n' \
+		"${C_BOLD}" "${C_RESET}" "${profil}" "${file##*/}" "${when}" "${size_h}"
+
+	_verify_archive "${file}"
+	rc=$?
+	if ((rc == 1)); then
+		_WARN "${profil} : ${file##*/} est corrompue — recherche d'une archive antérieure valide"
+		if ! _find_valid_archive "${profil}"; then
+			_ERR "${profil} : aucune archive valide — restauration refusée"
+			return 1
+		fi
+		file="${LATEST_PATH}"
+		when="$(_fmt_datekey "${LATEST_DT}")"
+		size_h="$(_human_size "${LATEST_SIZE}")"
+		_INFO "reprise sur ${file##*/} (${when}, ${size_h})"
+	elif ((rc == 2)); then
+		_WARN "${profil} : archive non vérifiable (clé indisponible) — poursuite"
+	fi
+
+	if ((DRY_RUN == 1)); then
+		_INFO "${profil} : --dry-run, rien n'a été extrait"
+		return 0
+	fi
+
+	if ! _confirm "Écraser ~/${SOURCES[${profil}]} avec cette archive ?"; then
+		_INFO "${profil} : annulé"
+		return 3
+	fi
+
+	if ! _snapshot_before_restore "${profil}"; then
+		return 1
+	fi
+
+	suffix=".pre-restore-${RUN_DATE}"
+	if ! _RUN "Restauration de ${profil} (${file##*/})" _restore_extract "${file}" "${HOME}" "${suffix}"; then
+		_show_log_tail
+		_ERR "${profil} : restauration en échec (les fichiers déjà extraits sont conservés)"
+		return 1
+	fi
+	_restart_services
+	return 0
 }
 
-####################################################################################################################
-_ENABLE_COLORS
-SPIN_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-DATE=$(date +%d_%m_%Y-%H.%M.%S)
-LOG_DIR="${HOME}/.local/share/${SCRIPTNAME}"
-mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/${SCRIPTNAME}-${DATE}.log"
-mkdir -p "${NAS_MOUNT}"
-echo -e "\n${C_CYAN}${SCRIPTNAME}${C_RESET} ${C_YELLOW}v${VER}${C_RESET}\n"
-case "${1:-}" in
-    backup)      backup "${2:-}"  ;;
-    restore)     restore "${2:-}" ;;
-    delete_old)  delete_old       ;;
-    show)        show             ;;
-    *)           echo -e "Usage :${C_GREEN} $0 backup | restore [PROFIL] | delete_old | show${C_RESET}" ;;
-esac
-####################################################################################################################
+restore() {
+	local target="${1:-}" rc=0
+	_check_nas_rw || return 1
+	_check_nas_perms
+	_collect_archives
+
+	if [[ -n ${target} ]]; then
+		_restore_one "${target}"
+		return "${?}"
+	fi
+
+	if ! _is_tty; then
+		_ERR "aucun profil fourni et entrée standard non interactive — usage : restore PROFIL"
+		return 2
+	fi
+
+	local -a profils=()
+	mapfile -t profils < <(printf '%s\n' "${!SOURCES[@]}" | sort || true)
+
+	printf '\n%bChoisissez un profil à restaurer :%b\n\n' "${C_CYAN}" "${C_RESET}"
+	local -i i=1
+	local profil when size_h
+	for profil in "${profils[@]}"; do
+		if _latest_archive "${profil}"; then
+			when="$(_fmt_datekey "${LATEST_DT}")"
+			size_h="$(_human_size "${LATEST_SIZE}")"
+			printf '  %b%2d)%b %-14s %s  %s\n' \
+				"${C_GREEN}" "${i}" "${C_RESET}" "${profil}" "${when}" "${size_h}"
+		else
+			printf '  %b%2d)%b %-14s %b(aucune archive)%b\n' \
+				"${C_GREEN}" "${i}" "${C_RESET}" "${profil}" "${C_RED}" "${C_RESET}"
+		fi
+		i=$((i + 1))
+	done
+	local all_idx=${i}
+	printf '  %b%2d)%b TOUS\n' "${C_GREEN}" "${i}" "${C_RESET}"
+	i=$((i + 1))
+	local cancel_idx=${i}
+	printf '  %b%2d)%b Annuler\n' "${C_GREEN}" "${i}" "${C_RESET}"
+
+	local choice=""
+	printf '\n%b#?%b ' "${C_CYAN}" "${C_RESET}"
+	if ! read -r choice; then
+		printf '\n'
+		_ERR "aucune saisie — abandon"
+		return 2
+	fi
+	if [[ ! ${choice} =~ ^[0-9]+$ ]] || ((choice < 1 || choice > cancel_idx)); then
+		_ERR "choix invalide"
+		return 2
+	fi
+	if ((choice == cancel_idx)); then
+		_INFO "annulé"
+		return 0
+	fi
+	if ((choice == all_idx)); then
+		if ! _confirm "Restaurer TOUS les profils (écrasement de ~/Documents, ~/Projects, ~/.ssh…) ?"; then
+			_INFO "annulé"
+			return 0
+		fi
+		for profil in "${profils[@]}"; do
+			_restore_one "${profil}"
+			rc=$?
+			((rc == 1)) && FAILURES=$((FAILURES + 1))
+		done
+		((FAILURES > 0)) && return 1
+		return 0
+	fi
+
+	_restore_one "${profils[$((choice - 1))]}"
+	return "${?}"
+}
+
+# =============================================================================
+# DELETE_OLD
+# =============================================================================
+
+delete_old() {
+	_check_nas_rw || return 1
+	_check_nas_perms
+	_collect_archives
+
+	if ((${#ARCH_PATH[@]} == 0)); then
+		_INFO "aucune archive à traiter"
+		return 0
+	fi
+
+	local -a groupes=()
+	local -A seen=()
+	local i group
+	for i in "${!ARCH_GROUP[@]}"; do
+		group="${ARCH_GROUP[${i}]}"
+		if [[ -z "${seen[${group}]:-}" ]]; then
+			seen[${group}]=1
+			groupes+=("${group}")
+		fi
+	done
+
+	local -a del_paths=() del_reasons=()
+	local rc=0 kept_total=0
+	local profil is_snapshot label
+
+	for group in "${groupes[@]}"; do
+		profil="$(_group_profile "${group}")"
+		is_snapshot=0
+		[[ ${group} == "${SNAPSHOT_SUBDIR}/"* ]] && is_snapshot=1
+
+		# Les instantanés sont traités par défaut ; les profils disparus de la
+		# configuration exigent --orphans.
+		if ((is_snapshot == 0)) && ! _known_profile "${profil}" && ((ORPHANS == 0)); then
+			continue
+		fi
+
+		local -a paths=()
+		for i in "${!ARCH_GROUP[@]}"; do
+			[[ ${ARCH_GROUP[${i}]} == "${group}" ]] && paths+=("${ARCH_PATH[${i}]}")
+		done
+
+		local -a g_keep=() g_del=() g_reason=()
+		local n_keep=0 ok=0 p vrc
+		for p in "${paths[@]}"; do
+			if ((n_keep >= KEEP)); then
+				g_del+=("${p}")
+				g_reason+=("ancienne")
+				continue
+			fi
+			_verify_archive "${p}"
+			vrc=$?
+			case "${vrc}" in
+			0) g_keep+=("${p}"); n_keep=$((n_keep + 1)); ok=1 ;;
+			1) g_del+=("${p}"); g_reason+=("corrompue") ;;
+			*)
+				# Clé indisponible : on ne juge pas, on ne supprime pas.
+				g_keep+=("${p}")
+				label="$(_group_label "${group}")"
+				_WARN "${label} : ${p##*/} non vérifiable — conservée"
+				;;
+			esac
+		done
+
+		if ((ok == 0)); then
+			label="$(_group_label "${group}")"
+			_WARN "${label} : aucune archive vérifiée — rien supprimé pour ce profil"
+			continue
+		fi
+
+		kept_total=$((kept_total + ${#g_keep[@]}))
+		if ((${#g_del[@]} > 0)); then
+			del_paths+=("${g_del[@]}")
+			del_reasons+=("${g_reason[@]}")
+		fi
+	done
+
+	if ((${#del_paths[@]} == 0)); then
+		_INFO "rien à supprimer (rétention : ${KEEP} par groupe, ${kept_total} conservée(s))"
+		return "${rc}"
+	fi
+
+	printf '\n%bSuppression proposée%b (rétention : %d par groupe)\n' "${C_BOLD}" "${C_RESET}" "${KEEP}"
+	local total_bytes=0 fsize size_h name
+	for i in "${!del_paths[@]}"; do
+		fsize="$(_file_size "${del_paths[${i}]}")"
+		total_bytes=$((total_bytes + fsize))
+		size_h="$(_human_size "${fsize}")"
+		name="${del_paths[${i}]##*/}"
+		printf '  %b-%b %-60s %-12s %10s\n' \
+			"${C_RED}" "${C_RESET}" "${name}" "(${del_reasons[${i}]})" "${size_h}"
+	done
+	size_h="$(_human_size "${total_bytes}")"
+	printf '  %b→ %s libérables, %d conservée(s)%b\n' \
+		"${C_DIM}" "${size_h}" "${kept_total}" "${C_RESET}"
+
+	if ((DRY_RUN == 1)); then
+		_INFO "--dry-run : rien n'a été supprimé"
+		return "${rc}"
+	fi
+
+	if ! _confirm "Supprimer définitivement ces ${#del_paths[@]} fichier(s) ?"; then
+		_INFO "annulé — rien n'a été supprimé"
+		return 0
+	fi
+
+	local deleted=0
+	for i in "${!del_paths[@]}"; do
+		name="${del_paths[${i}]##*/}"
+		if _RUN "Suppression de ${name}" rm -f -- "${del_paths[${i}]}"; then
+			deleted=$((deleted + 1))
+		else
+			rc=1
+		fi
+	done
+
+	printf '\n%b%d archive(s) supprimée(s)%b\n' "${C_GREEN}" "${deleted}" "${C_RESET}"
+	if ((deleted != ${#del_paths[@]})); then
+		rc=1
+	fi
+	return "${rc}"
+}
+
+# =============================================================================
+# POINT D'ENTRÉE
+# =============================================================================
+
+main() {
+	local cmd="${1:-}"
+	shift || true
+
+	local -a positional=()
+	while (($# > 0)); do
+		case "${1}" in
+		--dry-run)     DRY_RUN=1 ;;
+		--yes|-y)      ASSUME_YES=1 ;;
+		--no-verify)   VERIFY=0 ;;
+		--orphans)     ORPHANS=1 ;;
+		--snapshot)    SNAPSHOT_MODE="yes" ;;
+		--no-snapshot) SNAPSHOT_MODE="no" ;;
+		--keep)        shift; KEEP="${1:-}" ;;
+		--keep=*)      KEEP="${1#*=}" ;;
+		--version)     printf '%s %s\n' "${SCRIPTNAME}" "${VER}"; return 0 ;;
+		--help|-h)     _usage; return 0 ;;
+		--)
+			shift
+			while (($# > 0)); do
+				positional+=("${1}")
+				shift
+			done
+			break
+			;;
+		-*)
+			_ERR "option inconnue : ${1}"
+			return 2
+			;;
+		*) positional+=("${1}") ;;
+		esac
+		shift
+	done
+
+	if [[ ! ${KEEP} =~ ^[0-9]+$ ]] || ((KEEP < 1)); then
+		_ERR "--keep attend un entier positif (reçu : ${KEEP})"
+		return 2
+	fi
+
+	case "${cmd}" in
+	--version|-V) printf '%s %s\n' "${SCRIPTNAME}" "${VER}"; return 0 ;;
+	--help|-h|-help) _usage; return 0 ;;
+	*) ;;
+	esac
+
+	case "${cmd}" in
+	backup|restore|delete_old|show|list|help|"") ;;
+	*)
+		_ERR "commande inconnue : ${cmd}"
+		printf '\n' >&2
+		_usage >&2
+		return 2
+		;;
+	esac
+
+	if [[ -z ${cmd} ]]; then
+		_usage >&2
+		return 2
+	fi
+	if [[ ${cmd} == "help" ]]; then
+		_usage
+		return 0
+	fi
+
+	_need tar find sort awk stat findmnt date timeout du || return 1
+	case "${ENCRYPT}" in
+	"") ;;
+	gpg)
+		_need gpg || return 1
+		if [[ -z ${GPG_RECIPIENT} ]]; then
+			_ERR "ENCRYPT=gpg mais GPG_RECIPIENT est vide"
+			return 2
+		fi
+		;;
+	age)
+		_need age || return 1
+		if [[ -z ${AGE_RECIPIENT} ]]; then
+			_ERR "ENCRYPT=age mais AGE_RECIPIENT est vide"
+			return 2
+		fi
+		;;
+	*)
+		_ERR "ENCRYPT doit valoir \"\", gpg ou age (reçu : ${ENCRYPT})"
+		return 2
+		;;
+	esac
+
+	RUN_DATE="$(date +%Y-%m-%d-%H.%M.%S)" || RUN_DATE=""
+	if [[ -z ${RUN_DATE} ]]; then
+		_ERR "date système illisible"
+		return 1
+	fi
+
+	_enable_colors
+	_init_log
+
+	trap '_on_exit' EXIT
+	trap '_on_signal INT' INT
+	trap '_on_signal TERM' TERM
+	trap '_on_signal HUP' HUP
+
+	# Verrou : une seule instance mutante à la fois (deux backups simultanés
+	# pourraient produire deux archives concurrentes, et delete_old pourrait
+	# supprimer une archive en cours d'écriture).
+	if [[ ${cmd} == "backup" ]] || [[ ${cmd} == "restore" ]] || [[ ${cmd} == "delete_old" ]]; then
+		_need flock || return 1
+		local lock_file="${XDG_RUNTIME_DIR:-/tmp}/${SCRIPTNAME}.${UID}.lock"
+		if ! exec 9>"${lock_file}"; then
+			_ERR "impossible d'ouvrir le verrou ${lock_file}"
+			return 1
+		fi
+		if ! flock -n 9; then
+			_ERR "une autre instance de ${SCRIPTNAME} est déjà en cours (${lock_file})"
+			return 1
+		fi
+	fi
+
+	printf '\n%b%s%b %bv%s%b\n' \
+		"${C_CYAN}" "${SCRIPTNAME}" "${C_RESET}" "${C_YELLOW}" "${VER}" "${C_RESET}"
+
+	local rc=0
+	case "${cmd}" in
+	backup)
+		if ((${#positional[@]} > 0)); then
+			backup "${positional[@]}"
+		else
+			backup
+		fi
+		rc=$?
+		;;
+	restore)
+		restore "${positional[0]:-}"
+		rc=$?
+		;;
+	delete_old)
+		delete_old
+		rc=$?
+		;;
+	show)
+		show
+		rc=$?
+		;;
+	list)
+		list "${positional[0]:-}"
+		rc=$?
+		;;
+	*) ;;
+	esac
+	return "${rc}"
+}
+
+# =============================================================================
+main "${@}"
