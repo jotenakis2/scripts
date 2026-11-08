@@ -25,75 +25,50 @@ umask 077
 export LC_COLLATE=C
 
 # =============================================================================
-# CONFIGURATION
+# CONSTANTES ET CONFIGURATION
 # =============================================================================
+# La configuration (profils, stockage, exclusions, chiffrement…) ne vit plus
+# dans ce script : elle est lue dans un fichier bash, chargé au niveau global
+# juste avant `main` (voir « AMORÇAGE » en fin de fichier) pour que ses
+# tableaux associatifs restent globaux.
+#
+# Emplacements recherchés, dans l'ordre :
+#   1. --config FICHIER
+#   2. $PRIVATE_BACKUP_CONFIG
+#   3. private_data_backup.conf à côté du script (liens symboliques résolus)
+#   4. ${XDG_CONFIG_HOME:-$HOME/.config}/private-data_backup/config
+#
+# Toute variable absente du fichier retombe sur `_config_defaults`.
 
 readonly VER="1.3"
 SCRIPTNAME="${0##*/}"
 SCRIPTNAME="${SCRIPTNAME%.sh}"
 readonly SCRIPTNAME
 
-# Point de montage du stockage et sous-dossier des archives.
-# Surchargeables par l'environnement (utile pour les tests).
-NAS="${PRIVATE_BACKUP_NAS:-/media/NAS}"
-BACKUP_SUBDIR="${PRIVATE_BACKUP_SUBDIR:-backup/data2restore}"
+readonly CONFIG_BASENAME="private_data_backup.conf"
 readonly SNAPSHOT_SUBDIR="pre-restore"
 
-# Profils : SOURCES[PROFIL] = chemin relatif à ${HOME}.
-# Commenter une ligne désactive le profil ; ses archives existantes ne sont
-# jamais supprimées sans `delete_old --orphans`.
-declare -A SOURCES=(
-	["BRAVE"]=".config/BraveSoftware"
-	["SSH"]=".ssh"
-	["IPTVNATOR"]=".iptvnator"
-	["DOCUMENTS"]="Documents"
-	["PROJECTS"]="Projects"
-	["ZSH_HISTORY"]=".local/share/zsh/zsh_history"
-	# ajouter ici sur le modèle ["NOM-DU-PROFIL"]="Dossier"
-)
-
-# Binaire à surveiller avant sauvegarde/restauration d'un profil.
-declare -A COMMANDS=(
-	["IPTVNATOR"]="iptvnator.bin"
-	["BRAVE"]="brave"
-	# ajouter ici sur le modèle ["NOM-DU-PROFIL"]="nom-du-binaire"
-)
-
-# Service utilisateur à arrêter pendant l'opération (redémarré dans tous les
-# cas par le trap EXIT, y compris sur erreur ou interruption).
-declare -A SERVICES=(
-	# ["HELIUM"]="psd.service"
-)
-
-# Motifs tar exclus par profil, séparés par « | ». Chaque motif est appliqué
-# au nom du membre ET à chaque composant de chemin (un motif sans « / » cible
-# donc un nom de dossier, à n'importe quelle profondeur).
-declare -A EXCLUDES=(
-	["BRAVE"]="Cache|Code Cache|GPUCache|Service Worker|ScriptCache|ShaderCache|GrShaderCache|DawnCache|Crashpad|extensions_crx_cache|component_crx_cache|adblock_cache|SingletonLock|SingletonCookie|SingletonSocket"
-	["PROJECTS"]="target|node_modules|__pycache__|.venv|venv|.mypy_cache|.pytest_cache|.ruff_cache"
-)
-
-# Rétention par défaut de `delete_old` (archives conservées par groupe).
+# Valeurs de repli (surchargées par le fichier de configuration).
+NAS=""
+BACKUP_SUBDIR=""
 KEEP_DEFAULT=1
-
-# Vérification d'intégrité après écriture (relit l'archive : coûteux en I/O
-# sur un gros profil, d'où l'option --no-verify).
 VERIFY_DEFAULT=1
-
-# Instantané de l'état courant avant restauration.
-#   auto = créé si la cible fait moins de SNAPSHOT_MAX_MB, sinon avertissement
 SNAPSHOT_DEFAULT="auto"
-readonly SNAPSHOT_MAX_MB=512
+SNAPSHOT_MAX_MB=512
+NAS_TIMEOUT=20
+ENCRYPT=""
+GPG_RECIPIENT=""
+AGE_RECIPIENT=""
 
-# Chiffrement des archives : "" (aucun), "gpg" ou "age".
-#   ENCRYPT="gpg" + GPG_RECIPIENT="0x..."   ⇒ archives .tar.gz.gpg
-#   ENCRYPT="age" + AGE_RECIPIENT="age1..." ⇒ archives .tar.gz.age
-ENCRYPT="${PRIVATE_BACKUP_ENCRYPT:-}"
-GPG_RECIPIENT="${PRIVATE_BACKUP_GPG_RECIPIENT:-}"
-AGE_RECIPIENT="${PRIVATE_BACKUP_AGE_RECIPIENT:-}"
+# Tableaux remplis par le fichier de configuration. Déclarés ici (et non dans
+# le fichier) pour qu'il puisse faire de simples affectations.
+declare -A SOURCES=()
+declare -A COMMANDS=()
+declare -A SERVICES=()
+declare -A EXCLUDES=()
 
-# Délai maximal accordé aux vérifications de montage (NFS monté en `hard`).
-readonly NAS_TIMEOUT=20
+# Fichier de configuration effectivement chargé.
+CFG_FILE=""
 
 # =============================================================================
 # ÉTAT INTERNE
@@ -120,11 +95,11 @@ INTERRUPTED=0
 
 DRY_RUN=0
 ASSUME_YES=0
-VERIFY="${VERIFY_DEFAULT}"
-KEEP="${KEEP_DEFAULT}"
+VERIFY=1
+KEEP=1
 ORPHANS=0
 PURGE_ORPHANS=0
-SNAPSHOT_MODE="${SNAPSHOT_DEFAULT}"
+SNAPSHOT_MODE="auto"
 
 # Archives découvertes : triées par groupe puis date décroissante.
 declare -a ARCH_GROUP=() ARCH_DT=() ARCH_PATH=() ARCH_SIZE=()
@@ -242,6 +217,214 @@ _dashes() {
 }
 
 # =============================================================================
+# FICHIER DE CONFIGURATION
+# =============================================================================
+
+# La configuration n'est pas nécessaire pour l'aide et la version.
+_cfg_needed() {
+	local i=0
+	local -a a=("${@}")
+	((${#a[@]} == 0)) && return 1
+	while ((i < ${#a[@]})); do
+		case "${a[${i}]}" in
+		--config|--keep)
+			i=$((i + 2))
+			continue
+			;;
+		--config=*|--keep=*)
+			i=$((i + 1))
+			continue
+			;;
+		help|--help|-h|-help|--version|-V) return 1 ;;
+		*) ;;
+		esac
+		i=$((i + 1))
+	done
+	return 0
+}
+
+_script_dir() {
+	local src="${BASH_SOURCE[0]:-}" real=""
+	[[ -n ${src} ]] || return 0
+	real="$(readlink -f -- "${src}" 2>/dev/null)" || real="${src}"
+	printf '%s' "${real%/*}"
+}
+
+# Résout le chemin du fichier de configuration (1 = --config sans valeur).
+_config_path() {
+	local explicit="" arg dir="" i=0
+	local -a args=("${@}")
+
+	while ((i < ${#args[@]})); do
+		arg="${args[${i}]}"
+		case "${arg}" in
+		--config)
+			i=$((i + 1))
+			explicit="${args[${i}]:-}"
+			if [[ -z ${explicit} ]]; then
+				return 1
+			fi
+			;;
+		--config=*) explicit="${arg#*=}" ;;
+		*) ;;
+		esac
+		i=$((i + 1))
+	done
+
+	if [[ -n ${explicit} ]]; then
+		printf '%s' "${explicit}"
+		return 0
+	fi
+	if [[ -n "${PRIVATE_BACKUP_CONFIG:-}" ]]; then
+		printf '%s' "${PRIVATE_BACKUP_CONFIG}"
+		return 0
+	fi
+
+	dir="$(_script_dir)"
+	if [[ -n ${dir} ]] && [[ -f "${dir}/${CONFIG_BASENAME}" ]]; then
+		printf '%s' "${dir}/${CONFIG_BASENAME}"
+		return 0
+	fi
+	dir="${XDG_CONFIG_HOME:-${HOME}/.config}/${SCRIPTNAME}/config"
+	if [[ -f ${dir} ]]; then
+		printf '%s' "${dir}"
+		return 0
+	fi
+	printf '%s' ""
+	return 0
+}
+
+_config_not_found() {
+	local dir=""
+	dir="$(_script_dir)"
+	_ERR "aucun fichier de configuration trouvé"
+	printf '   attendu : %s\n' "${dir:+${dir}/${CONFIG_BASENAME}}" >&2
+	printf '          ou %s\n' "${XDG_CONFIG_HOME:-${HOME}/.config}/${SCRIPTNAME}/config" >&2
+	printf '   ou : --config FICHIER (ou la variable %s)\n' "PRIVATE_BACKUP_CONFIG" >&2
+	return 0
+}
+
+# Exécuté par le script : un fichier modifiable par le groupe ou tous est un
+# risque d'exécution de code.
+_config_perms_warn() {
+	local perms=""
+	perms="$(stat -c %A -- "${1}" 2>/dev/null)" || perms=""
+	[[ ${#perms} -eq 10 ]] || return 0
+	if [[ ${perms:5:1} == "w" ]] || [[ ${perms:8:1} == "w" ]]; then
+		_WARN "${1} est modifiable par le groupe ou tous : ce fichier est exécuté par ${SCRIPTNAME}"
+	fi
+	return 0
+}
+
+_config_defaults() {
+	: "${NAS:=/media/NAS}"
+	: "${BACKUP_SUBDIR:=backup/data2restore}"
+	: "${KEEP_DEFAULT:=1}"
+	: "${VERIFY_DEFAULT:=1}"
+	: "${SNAPSHOT_DEFAULT:=auto}"
+	: "${SNAPSHOT_MAX_MB:=512}"
+	: "${NAS_TIMEOUT:=20}"
+	: "${ENCRYPT:=}"
+	: "${GPG_RECIPIENT:=}"
+	: "${AGE_RECIPIENT:=}"
+
+	# Surcharges d'environnement (tests, usage ponctuel) : elles ont le dernier
+	# mot sur le fichier de configuration.
+	if [[ -n "${PRIVATE_BACKUP_NAS:-}" ]]; then
+		NAS="${PRIVATE_BACKUP_NAS}"
+	fi
+	if [[ -n "${PRIVATE_BACKUP_SUBDIR:-}" ]]; then
+		BACKUP_SUBDIR="${PRIVATE_BACKUP_SUBDIR}"
+	fi
+	if [[ -n "${PRIVATE_BACKUP_ENCRYPT:-}" ]]; then
+		ENCRYPT="${PRIVATE_BACKUP_ENCRYPT}"
+	fi
+	if [[ -n "${PRIVATE_BACKUP_GPG_RECIPIENT:-}" ]]; then
+		GPG_RECIPIENT="${PRIVATE_BACKUP_GPG_RECIPIENT}"
+	fi
+	if [[ -n "${PRIVATE_BACKUP_AGE_RECIPIENT:-}" ]]; then
+		AGE_RECIPIENT="${PRIVATE_BACKUP_AGE_RECIPIENT}"
+	fi
+
+	VERIFY="${VERIFY_DEFAULT}"
+	KEEP="${KEEP_DEFAULT}"
+	SNAPSHOT_MODE="${SNAPSHOT_DEFAULT}"
+	return 0
+}
+
+_config_validate() {
+	local k errs=0
+
+	if ((${#SOURCES[@]} == 0)); then
+		_ERR "aucun profil défini : tableau SOURCES vide dans ${CFG_FILE}"
+		return 1
+	fi
+
+	for k in "${!SOURCES[@]}"; do
+		case "${SOURCES[${k}]}" in
+		"")
+			_ERR "SOURCES[${k}] est vide"
+			errs=1
+			;;
+		/*)
+			_ERR "SOURCES[${k}] doit être relatif à \$HOME (reçu : ${SOURCES[${k}]})"
+			errs=1
+			;;
+		*) ;;
+		esac
+	done
+
+	for k in "${!COMMANDS[@]}"; do
+		_known_profile "${k}" || _WARN "COMMANDS[${k}] : profil absent de SOURCES (ignoré)"
+	done
+	for k in "${!SERVICES[@]}"; do
+		_known_profile "${k}" || _WARN "SERVICES[${k}] : profil absent de SOURCES (ignoré)"
+	done
+	for k in "${!EXCLUDES[@]}"; do
+		_known_profile "${k}" || _WARN "EXCLUDES[${k}] : profil absent de SOURCES (ignoré)"
+	done
+
+	case "${VERIFY_DEFAULT}" in
+	0|1) ;;
+	*)
+		_ERR "VERIFY_DEFAULT doit valoir 0 ou 1 (reçu : ${VERIFY_DEFAULT})"
+		errs=1
+		;;
+	esac
+	case "${SNAPSHOT_DEFAULT}" in
+	auto|yes|no) ;;
+	*)
+		_ERR "SNAPSHOT_DEFAULT doit valoir auto, yes ou no (reçu : ${SNAPSHOT_DEFAULT})"
+		errs=1
+		;;
+	esac
+	case "${ENCRYPT}" in
+	""|gpg|age) ;;
+	*)
+		_ERR "ENCRYPT doit valoir \"\", gpg ou age (reçu : ${ENCRYPT})"
+		errs=1
+		;;
+	esac
+	if [[ ! ${KEEP_DEFAULT} =~ ^[0-9]+$ ]] || ((KEEP_DEFAULT < 1)); then
+		_ERR "KEEP_DEFAULT doit être un entier >= 1 (reçu : ${KEEP_DEFAULT})"
+		errs=1
+	fi
+	if [[ ! ${SNAPSHOT_MAX_MB} =~ ^[0-9]+$ ]] || ((SNAPSHOT_MAX_MB < 1)); then
+		_ERR "SNAPSHOT_MAX_MB doit être un entier >= 1 (reçu : ${SNAPSHOT_MAX_MB})"
+		errs=1
+	fi
+	if [[ ! ${NAS_TIMEOUT} =~ ^[0-9]+$ ]] || ((NAS_TIMEOUT < 1)); then
+		_ERR "NAS_TIMEOUT doit être un entier >= 1 (reçu : ${NAS_TIMEOUT})"
+		errs=1
+	fi
+	if [[ -z ${NAS} ]] || [[ -z ${BACKUP_SUBDIR} ]]; then
+		_ERR "NAS et BACKUP_SUBDIR doivent être renseignés"
+		errs=1
+	fi
+	return "${errs}"
+}
+
+# =============================================================================
 # TRAPS : nettoyage garanti, quelle que soit la sortie
 # =============================================================================
 
@@ -354,7 +537,20 @@ _show_log_tail() {
 # =============================================================================
 
 _check_nas() {
-	NAS_MOUNT="${NAS}/${BACKUP_SUBDIR}"
+	# Garde-fou : une configuration vide ne doit jamais produire NAS_MOUNT="/".
+	if [[ -z ${NAS} ]] || [[ -z ${BACKUP_SUBDIR} ]]; then
+		_ERR "configuration incomplète : NAS et BACKUP_SUBDIR doivent être renseignés"
+		return 1
+	fi
+	if [[ ${NAS} != /* ]]; then
+		_ERR "NAS doit être un chemin absolu (reçu : ${NAS})"
+		return 1
+	fi
+	NAS_MOUNT="${NAS%/}/${BACKUP_SUBDIR#/}"
+	if [[ -z ${NAS_MOUNT} ]] || [[ ${NAS_MOUNT} == "/" ]]; then
+		_ERR "chemin de stockage invalide (${NAS} + ${BACKUP_SUBDIR})"
+		return 1
+	fi
 
 	if ! timeout "${NAS_TIMEOUT}" findmnt -rn -M "${NAS}" -o TARGET >/dev/null 2>&1; then
 		_ERR "NAS non monté : ${NAS} n'est pas un point de montage"
@@ -599,8 +795,11 @@ Options :
   --purge-orphans supprimer toutes les archives des profils hors configuration
   --snapshot     forcer l'instantané avant restauration
   --no-snapshot  interdire l'instantané avant restauration
+  --config FILE  fichier de configuration (défaut : ./${CONFIG_BASENAME}
+                 ou ${XDG_CONFIG_HOME:-${HOME}/.config}/${SCRIPTNAME}/config)
 
-Stockage : ${NAS_MOUNT:-${NAS}/${BACKUP_SUBDIR}}
+Configuration : ${CFG_FILE:-aucune (charge les valeurs par défaut)}
+Stockage      : ${NAS_MOUNT:-${NAS}/${BACKUP_SUBDIR}}
 Secrets  : archives et logs 0600, dossiers 0700 (umask 077)
 EOF
 	return 0
@@ -665,7 +864,8 @@ show() {
 	local hors_pad=""
 	((w_src > ${#hors_cfg})) && hors_pad="$(printf '%*s' "$((w_src - ${#hors_cfg}))" '')"
 
-	printf '\n%bProfils%b\n' "${C_BOLD}" "${C_RESET}"
+	printf '\n%bProfils%b %b(config : %s)%b\n' \
+		"${C_BOLD}" "${C_RESET}" "${C_DIM}" "${CFG_FILE:-valeurs par défaut}" "${C_RESET}"
 	printf '%-*s  %-*s  %-*s  %-*s  %s\n' \
 		"${w_prof}" "Profil" "${w_src}" "Dossier" "${w_cmd}" "Contrôle" "${w_arch}" "Dernière archive" "Taille"
 	printf '%s  %s  %s  %s  %s\n' "${d_prof}" "${d_src}" "${d_cmd}" "${d_arch}" "${d_size}"
@@ -1384,8 +1584,13 @@ delete_old() {
 # =============================================================================
 
 main() {
-	local cmd="${1:-}"
-	shift || true
+	# La commande est le premier argument qui n'est pas une option ; les
+	# options peuvent donc la précéder (ex. « --config F show »).
+	local cmd=""
+	if (($# > 0)) && [[ ${1} != -* ]]; then
+		cmd="${1}"
+		shift
+	fi
 
 	local -a positional=()
 	while (($# > 0)); do
@@ -1395,6 +1600,8 @@ main() {
 		--no-verify)   VERIFY=0 ;;
 		--orphans)       ORPHANS=1 ;;
 		--purge-orphans) PURGE_ORPHANS=1 ;;
+		--config)        shift ;;
+		--config=*)      ;;
 		--snapshot)    SNAPSHOT_MODE="yes" ;;
 		--no-snapshot) SNAPSHOT_MODE="no" ;;
 		--keep)        shift; KEEP="${1:-}" ;;
@@ -1418,16 +1625,15 @@ main() {
 		shift
 	done
 
+	if [[ -z ${cmd} ]] && ((${#positional[@]} > 0)); then
+		cmd="${positional[0]}"
+		positional=("${positional[@]:1}")
+	fi
+
 	if [[ ! ${KEEP} =~ ^[0-9]+$ ]] || ((KEEP < 1)); then
 		_ERR "--keep attend un entier positif (reçu : ${KEEP})"
 		return 2
 	fi
-
-	case "${cmd}" in
-	--version|-V) printf '%s %s\n' "${SCRIPTNAME}" "${VER}"; return 0 ;;
-	--help|-h|-help) _usage; return 0 ;;
-	*) ;;
-	esac
 
 	case "${cmd}" in
 	backup|restore|delete_old|show|list|help|"") ;;
@@ -1536,4 +1742,48 @@ main() {
 }
 
 # =============================================================================
+# AMORÇAGE
+# =============================================================================
+# Le fichier de configuration est chargé ICI, au niveau global : un `source`
+# dans une fonction rendrait locaux les `declare` du fichier et ses tableaux
+# seraient perdus. `help` et `--version` fonctionnent sans configuration.
+
+_enable_colors
+
+_cfg_loaded=0
+if _cfg_needed "${@}"; then
+	CFG_FILE="$(_config_path "${@}")"
+	_cfg_rc=$?
+	if ((_cfg_rc != 0)); then
+		_ERR "option --config sans fichier"
+		exit 2
+	fi
+	if [[ -z ${CFG_FILE} ]]; then
+		_config_not_found
+		exit 2
+	fi
+	if ! [[ -r ${CFG_FILE} ]]; then
+		_ERR "fichier de configuration illisible : ${CFG_FILE}"
+		exit 2
+	fi
+	_config_perms_warn "${CFG_FILE}"
+
+	set +u
+	# shellcheck source=/dev/null
+	source "${CFG_FILE}"
+	_cfg_rc=$?
+	set -u
+	if ((_cfg_rc != 0)); then
+		_ERR "erreur d'exécution dans ${CFG_FILE} (code ${_cfg_rc})"
+		exit 2
+	fi
+	_cfg_loaded=1
+fi
+
+_config_defaults
+
+if ((_cfg_loaded == 1)); then
+	_config_validate || exit 2
+fi
+
 main "${@}"
