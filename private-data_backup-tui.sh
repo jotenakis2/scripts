@@ -450,11 +450,11 @@ _screen_archives() {
 
 		action="$(gum choose --header "${header}" --cursor "❯ " \
 			"${ICON_EYE}  Voir les archives" \
-			"Restaurer une version…" \
-			"Vérifier une archive…" \
-			"Supprimer une archive…" \
+			"Restaurer une version" \
+			"Vérifier une archive" \
+			"Supprimer une archive" \
 			"Appliquer la politique de rétention" \
-			"Purger les profils orphelins…" \
+			"Purger les profils orphelins" \
 			"Retour")" || return 0
 		case "${action}" in
 		*Voir*)
