@@ -1,6 +1,17 @@
 #!/bin/bash
 # shellcheck disable=SC2034,SC2154
+#
+# Hook de signature Secure Boot pour noyau CachyOS.
+# Réservé à Fedora/CachyOS : dépend de pesign, de la base NSS et des
+# certificats MOK installés par CachyOS.
+
 set -euo pipefail
+
+if [[ ! -r /etc/fedora-release ]]; then
+    printf 'Ce hook est réservé à Fedora/CachyOS (MOK + pesign + NSS).\n' >&2
+    printf 'Il ne fonctionne pas sur Arch/Omarchy.\n' >&2
+    exit 1
+fi
 
 MOK_KEY_NICKNAME='CachyOS Secure Boot'
 CERT_DIR="/etc/mok-cachyos"
@@ -27,10 +38,12 @@ case "$KERNEL_IMAGE" in
         ;;
 esac
 
-if ! command -v pesign >/dev/null 2>&1; then
-    logger -t kernel-postinst "pesign non détecté"
-    exit 1
-fi
+for cmd in pesign certutil pk12util; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+        logger -t kernel-postinst "${cmd} non détecté"
+        exit 1
+    fi
+done
 
 if [[ ! -w "$KERNEL_IMAGE" ]]; then
     logger -t kernel-postinst "kernel image non modifiable donc non signable: $KERNEL_IMAGE"
@@ -41,7 +54,7 @@ fi
 certificate_in_db() {
     local nickname="$1"
     local db_path="$2"
-    certutil -d "$db_path" -L | grep -q "$nickname"
+    certutil -d "${db_path}" -L | grep -Fq -- "${nickname}"
 }
 
 # Fonction: importer le certificat s'il n'est pas dans la DB

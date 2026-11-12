@@ -1,52 +1,58 @@
 #!/usr/bin/env bash
-
+# shellcheck enable=all
+#
 # BPFDoor-like Suspicious Process Detector
 
+set -euo pipefail
+
 # Check for root permission
-if [ "$(id -u)" -ne 0 ]; then
-  echo "[!] This script must be run as root."
+if [[ "${EUID}" -ne 0 ]]; then
+  printf '[!] This script must be run as root.\n' >&2
   exit 1
 fi
 
 # Check required commands
 for cmd in ps grep readlink ss; do
-  if ! command -v $cmd &>/dev/null; then
-    echo "[!] $cmd command is required. Please install it first."
+  if ! command -v "${cmd}" >/dev/null 2>&1; then
+    printf '[!] %s command is required. Please install it first.\n' "${cmd}" >&2
     exit 1
   fi
 done
 
-echo "[*] Starting focused BPFDoor-like process detection..."
+printf '[*] Starting focused BPFDoor-like process detection...\n'
 
 found=0
+shopt -s nullglob
 
-# Iterate over all PIDs
-for pid in $(ls /proc/ | grep -E '^[0-9]+$'); do
-  [ -d "/proc/$pid" ] || continue
+# Iterate over all PIDs without parsing ls output.
+for proc_dir in /proc/[0-9]*; do
+  pid="${proc_dir#/proc/}"
+  exe_path="$(readlink "${proc_dir}/exe" 2>/dev/null || true)"
 
-  exe_path=$(readlink /proc/$pid/exe 2>/dev/null)
+  [[ "${exe_path}" == *"(deleted)" ]] || continue
 
-  if [[ $exe_path == *"(deleted)" ]]; then
-    if [ -r /proc/$pid/net/packet ] && [ -s /proc/$pid/net/packet ]; then
-      cmdline=$(ps -p $pid -o cmd= 2>/dev/null)
+  packet="${proc_dir}/net/packet"
+  [[ -r "${packet}" && -s "${packet}" ]] || continue
 
-      if [[ ! $cmdline =~ "tcpdump|wireshark|dhclient" ]]; then
-        echo "[!] Suspicious process detected:"
-        echo "    - PID: $pid"
-        echo "    - Command: $cmdline"
-        echo "    - Deleted executable: $exe_path"
-        echo "    - BPF socket is active"
-
-        ss -p -n 2>/dev/null | grep "pid=$pid," | awk '{print "    - Network: " $0}'
-        echo ""
-
-        found=1
-      fi
-    fi
+  cmdline="$(ps -p "${pid}" -o cmd= 2>/dev/null || true)"
+  if [[ "${cmdline}" =~ tcpdump|wireshark|dhclient ]]; then
+    continue
   fi
 
+  printf '[!] Suspicious process detected:\n'
+  printf '    - PID: %s\n' "${pid}"
+  printf '    - Command: %s\n' "${cmdline}"
+  printf '    - Deleted executable: %s\n' "${exe_path}"
+  printf '    - BPF socket is active\n'
+
+  ss -p -n 2>/dev/null | grep -F "pid=${pid}," | awk '{ print "    - Network: " $0 }' || true
+  printf '\n'
+
+  found=1
 done
 
-[ $found -eq 0 ] && echo "[*] No suspicious processes found."
+if (( found == 0 )); then
+  printf '[*] No suspicious processes found.\n'
+fi
 
-echo "[*] Detection completed."
+printf '[*] Detection completed.\n'
