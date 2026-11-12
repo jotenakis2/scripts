@@ -54,8 +54,26 @@ package_owner() {
         | sed -n 's/.* is owned by \([^ ]*\) .*/\1/p' || true
 }
 
+# Le noyau en cours ne s'appelle pas toujours uname -r dans /boot
+# (image renommée, UKI, noyau « aurora »…). On compare alors le contenu avec
+# l'image du module en cours : si c'est le même fichier, on refuse de le toucher.
+running_image="/usr/lib/modules/${current_kernel}/vmlinuz"
+readonly running_image
+
+is_running_kernel() {
+    local kernel="${1}"
+    [[ "${kernel}" == "${current_kernel}" ]] && return 0
+    [[ -r "${running_image}" ]] || return 1
+    cmp -s "${running_image}" "${BOOT_DIR}/vmlinuz-${kernel}"
+}
+
 for kernel in "${kernels[@]}"; do
-    if [[ "${kernel}" == "${current_kernel}" ]] || [[ "${kernel}" == *rescue* ]]; then
+    protected=0
+    # shellcheck disable=SC2310 # un retour faux = « pas le noyau courant », pas une erreur
+    if is_running_kernel "${kernel}"; then
+        protected=1
+    fi
+    if [[ "${protected}" -eq 1 ]] || [[ "${kernel}" == *rescue* ]]; then
         printf '🔒 Protégé : %s\n\n' "${kernel}"
         continue
     fi

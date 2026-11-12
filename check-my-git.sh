@@ -28,10 +28,14 @@ else
     C_RESET=''
 fi
 
+# Les greffons tiers (zsh, node_modules…) ne sont pas des dépôts du projet :
+# on élague ces répertoires pour ne pas polluer le tableau.
 repos=()
 while IFS= read -r -d '' gitdir; do
     repos+=("$(dirname "${gitdir}")")
-done < <(find "${PROJECTS_DIR}" -type d -name '.git' -print0 2>/dev/null || true)
+done < <(find "${PROJECTS_DIR}" \
+    \( -name '.local' -o -name 'node_modules' -o -name 'vendor' -o -name '.cache' \) -prune -o \
+    -type d -name '.git' -print0 2>/dev/null || true)
 
 if [[ ${#repos[@]} -eq 0 ]]; then
     printf 'Aucun dépôt Git trouvé dans %s\n' "${PROJECTS_DIR}"

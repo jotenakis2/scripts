@@ -234,7 +234,10 @@ update-term() {
 	# [] + " cpu" + num + " offline"
 	local i=$((2 + 4 + ${#highest_cpu} + 8))
 	BAR_LENGTH=$((COLUMNS - i))
-	(( BAR_LENGTH < 10 )) && BAR_LENGTH=10
+	# Ne pas terminer la fonction sur un test faux : set -e ferait sortir le script.
+	if (( BAR_LENGTH < 10 )); then
+		BAR_LENGTH=10
+	fi
 }
 
 #------------------------------------------------------------------------------------------------------------------------
