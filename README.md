@@ -21,10 +21,9 @@ Les dépendances varient d'un script à l'autre. Les principales sont :
 - `openssl` (wanip, si géolocalisation activée)
 - `gh` authentifié (`gh-pr-watch`)
 - `stress-ng`, `fio`, `iperf3` (`omastress`, `nvme-sched-bench3.sh`)
-- `power-profiles-daemon` (`powerprofilesctl`, `cpufreq-boost-test.sh`)
 - `ufw` et accès en lecture au journal noyau (`ufw-watch`, groupe `wheel`)
 
-Sous Arch : `pacman -S --needed curl jq git gum lm_sensors upower chkrootkit rkhunter s-nail stress-ng fio iperf3 power-profiles-daemon ufw github-cli`.
+Sous Arch : `pacman -S --needed curl jq git gum lm_sensors upower chkrootkit rkhunter s-nail stress-ng fio iperf3 ufw github-cli`.
 Certains paquets peuvent être dans AUR selon les dépôts activés.
 
 ## Scripts
@@ -37,7 +36,6 @@ Certains paquets peuvent être dans AUR selon les dépôts activés.
 | `check-my-git.sh` | État de synchronisation des dépôts Git de `~/Projects`. | Accès réseau (`git fetch`). |
 | `color.sh` | Palette des 256 couleurs du terminal. | Sans effet de bord. |
 | `cpu` | Moniteur d'usage CPU par cœur. | Terminal interactif. |
-| `cpufreq-boost-test.sh` | Mesure si le boost cpufreq d'`apple-cpufreq` suit les profils power-profiles-daemon. | Root. Change governors et profil, restaurés par `trap`. |
 | `crypto.sh` | Tableau des principales cryptomonnaies (CoinGecko). | Réseau + `gum`, `jq`, `awk`. |
 | `dnstest.sh` | Test de fuite DNS via `bash.ws`. | Réseau. |
 | `freeim` | Affichage détaillé RAM/swap (zram, zswap). | Sans dépendance externe. |
