@@ -1,0 +1,2021 @@
+#!/usr/bin/env bash
+# shellcheck enable=all
+# shellcheck shell=bash
+#
+# SC2312 : les substitutions $(cfg_get …), $(icon_of …) sont de la pure
+#   mise en forme ; leur code retour est volontairement ignoré (le script
+#   n'utilise pas « set -e », une erreur d'affichage ne doit rien interrompre).
+# SC2329 : tool_* et worker_cleanup/on_exit sont appelés indirectement
+#   (via ${tool}, « trap … EXIT »), ce que shellcheck ne peut pas suivre.
+# shellcheck disable=SC2312,SC2329
+#
+# omastress — session de stress CPU / DISK / NET / RAM, interface gum.
+#
+#   • 4 modules indépendants, lançables ensemble ou séparément
+#   • paliers de montée/descente réglables, cycles, durée de palier
+#   • tableau de bord temps réel, arrêt immédiat par « q »
+#   • rapport CSV par session, alerte et arrêt thermique
+#
+# Dépendances : gum, stress-ng, fio, iperf3.
+# Essai sans charge : omastress --demo
+
+set -uo pipefail  # pas de -e : une erreur d'affichage ne doit pas tuer la session
+export LC_NUMERIC=C  # nombres à point (PSI, awk) quel que soit le locale
+
+readonly SCRIPT_VERSION="1.1"
+readonly SCRIPT_NAME="${0##*/}"
+
+#--- Icônes Nerd Font -------------------------------------------------------------------------------------------------------------
+# il faut \U (8 chiffres) au-delà de U+FFFF : bash ne lit que 4 chiffres après \u
+readonly I_CPU=$'\uf2db'          # nf-fa-microchip
+readonly I_DISK=$'\U000f02ca'     # nf-md-harddisk
+readonly I_NET=$'\U000f0200'      # nf-md-ethernet (compact, aligné sur les autres)
+readonly I_RAM=$'\uefc5'          # barrette mémoire (U+EFC5, fournie par l'utilisateur)
+readonly I_PLAY=$'\U000f040a'     # nf-md-play
+readonly I_STOP=$'\U000f04db'     # nf-md-stop
+readonly I_COG=$'\U000f0493'      # nf-md-cog
+readonly I_FILE=$'\U000f0219'     # nf-md-file_document
+readonly I_EXIT=$'\uf08b'         # nf-fa-sign_out
+readonly I_SPEED=$'\U000f04c5'    # nf-md-speedometer
+readonly I_CHART=$'\U000f012a'    # nf-md-chart_line
+readonly I_FIRE=$'\U000f0238'     # nf-md-fire
+readonly I_CHECK=$'\U000f05e0'    # nf-md-check_circle
+readonly I_ALERT=$'\U000f0026'    # nf-md-alert
+readonly I_THERMO=$'\U000f050f'   # nf-md-thermometer
+readonly I_TIMER=$'\U000f13ab'    # nf-md-timer
+readonly I_LIST=$'\U000f04ab'     # nf-md-playlist_play
+readonly I_REFRESH=$'\U000f0450'  # nf-md-refresh
+readonly I_TUNE=$'\U000f062a'     # nf-md-tune
+readonly I_TABLE=$'\U000f05eb'    # nf-md-table
+readonly I_LEFT=$'\U000f004d'     # nf-md-arrow_left
+readonly I_UP=$'\U000f0045'       # nf-md-arrow_up
+readonly I_DOWN=$'\U000f0046'     # nf-md-arrow_down
+
+#--- Répertoires ------------------------------------------------------------------------------------------------------------------
+readonly CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/omastress"
+readonly CONFIG_FILE="${CONFIG_DIR}/config"
+readonly STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/omastress"
+readonly REPORT_DIR="${STATE_DIR}/reports"
+readonly DISK_PROBE="${STATE_DIR}/probe.dat"
+
+DEMO=0
+CLI_SETTINGS=0
+BOX_W=76
+RUNDIR=""
+INTERRUPT=0
+NET_PORT=""
+NET_MODE_EFF=""
+NET_HOST_EFF=""
+NET_HTTP_SCRIPT=""
+NET_URL_EFF=""
+NET_NOTE=""
+NET_USED=0
+NET_LOCAL_SERVER=0
+PSI_AVAIL=0
+declare -A PSI=()
+# historiques lus indirectement via eval dans render_graphs
+# shellcheck disable=SC2034
+CPU_HIST=()
+BRAILLE=()
+RAM_HIST=()
+DISK_HIST=()
+NET_HIST=()
+TEMP_HIST=()
+TEMP_AVAIL=0
+readonly HIST_MAX=300
+DISK_RATE_MIB="0"
+TOOL_PID=""
+WORKER_MOD=""
+ST_PHASE="Démarrage"
+ST_LEVEL=0
+ST_CYCLE=0
+ST_DEADLINE=0
+report_path=""
+
+declare -A CFG=()
+declare -A WPID=()
+
+#--- Thème Omarchy ---------------------------------------------------------------------------------------------------------------
+THEME_FILE=""
+
+theme_find() {
+  local f
+  for f in \
+    "${HOME}/.local/state/omarchy/current/theme/colors.toml" \
+    "${HOME}/.config/omarchy/current/theme/colors.toml" \
+    "${OMARCHY_PATH:-/usr/share/omarchy}/current/theme/colors.toml"; do
+    if [[ -r ${f} ]]; then
+      THEME_FILE=${f}
+      return 0
+    fi
+  done
+  return 1
+}
+
+theme_color() {
+  local key="${1}" fallback="${2}" val=""
+  if [[ -n ${THEME_FILE} ]]; then
+    val=$(sed -nE "s/^${key}[[:space:]]*=[[:space:]]*\"(#[0-9a-fA-F]{6})\".*/\1/p" "${THEME_FILE}" | head -n 1)
+  fi
+  printf '%s\n' "${val:-${fallback}}"
+}
+
+theme_load() {
+  theme_find || true
+  C_FG=$(theme_color foreground "#eae6ee")
+  C_MUTED=$(theme_color muted "#705881")
+  C_ACCENT=$(theme_color accent "#ec4df0")
+  C_RED=$(theme_color red "#fe1e9c")
+  C_GREEN=$(theme_color green "#1ce3c0")
+  C_YELLOW=$(theme_color yellow "#fee4b7")
+  C_ORANGE=$(theme_color orange "#fda184")
+  C_BLUE=$(theme_color blue "#7b6bfd")
+  C_CYAN=$(theme_color cyan "#23e7e1")
+  C_MAGENTA=$(theme_color magenta "#ec4df0")
+  C_BG=$(theme_color background "#0b0113")
+
+  export GUM_CHOOSE_CURSOR_FOREGROUND="${C_ACCENT}"
+  export GUM_CHOOSE_SELECTED_FOREGROUND="${C_GREEN}"
+  export GUM_CHOOSE_HEADER_FOREGROUND="${C_CYAN}"
+  export GUM_CONFIRM_SELECTED_BACKGROUND="${C_GREEN}"
+  export GUM_CONFIRM_SELECTED_FOREGROUND="${C_BG}"
+  export GUM_CONFIRM_UNSELECTED_BACKGROUND="${C_BG}"
+  export GUM_CONFIRM_UNSELECTED_FOREGROUND="${C_FG}"
+  export GUM_CONFIRM_SHOW_HELP=false
+  export GUM_INPUT_CURSOR_FOREGROUND="${C_ACCENT}"
+  export GUM_SPIN_SPINNER="dot"
+  export GUM_SPIN_TITLE_FOREGROUND="${C_CYAN}"
+}
+
+C_FG=""
+C_MUTED=""
+C_ACCENT=""
+C_RED=""
+C_GREEN=""
+C_YELLOW=""
+C_ORANGE=""
+C_BLUE=""
+C_CYAN=""
+C_MAGENTA=""
+C_BG=""
+
+#--- Couleurs ANSI (tableau de bord) ---------------------------------------------------------------------------------------------
+ansi_fg() {
+  printf '\033[38;2;%d;%d;%dm' "0x${1:1:2}" "0x${1:3:2}" "0x${1:5:2}"
+}
+
+#--- Cycle de vie ----------------------------------------------------------------------------------------------------------------
+cleanup_paths() {
+  if [[ -n ${RUNDIR} && -d ${RUNDIR} ]]; then
+    rm -rf "${RUNDIR}"
+  fi
+}
+
+on_exit() {
+  tput cnorm 2>/dev/null || true
+  cleanup_paths
+}
+
+#--- Configuration ---------------------------------------------------------------------------------------------------------------
+cfg_defaults() {
+  CFG[cpu_max]=100  CFG[cpu_steps]=5  CFG[cpu_cycles]=2  CFG[cpu_dwell]=10
+  CFG[ram_max]=40   CFG[ram_steps]=4  CFG[ram_cycles]=2  CFG[ram_dwell]=15
+  CFG[disk_max]=400 CFG[disk_steps]=4 CFG[disk_cycles]=2 CFG[disk_dwell]=10 CFG[disk_target]=file
+  CFG[net_max]=900  CFG[net_steps]=4  CFG[net_cycles]=2  CFG[net_dwell]=10
+  CFG[net_mode]=local CFG[net_host]=127.0.0.1 CFG[net_port]=5201
+  CFG[net_url]="https://ash-speed.hetzner.com/1GB.bin"
+  CFG[g_hold]=20
+  CFG[g_poll]=1
+  CFG[g_temp_alert]=88
+  CFG[g_temp_abort]=97
+}
+
+cfg_get() {
+  printf '%s' "${CFG[${1}]:-}"
+}
+
+cfg_set() {
+  CFG["${1}"]="${2}"
+}
+
+cfg_load() {
+  local key val
+  [[ -r ${CONFIG_FILE} ]] || return 0
+  while IFS='=' read -r key val; do
+    [[ -z ${key} || ${key} == \#* ]] && continue
+    # accepte les valeurs entre guillemets (fichier édité à la main)
+    if [[ ${val} == \"*\" && ${#val} -ge 2 ]]; then
+      val=${val:1:${#val}-2}
+    fi
+    if [[ -n ${CFG[${key}]+x} ]]; then
+      CFG["${key}"]="${val}"
+    fi
+  done < "${CONFIG_FILE}"
+}
+
+cfg_save() {
+  local key tmp
+  mkdir -p "${CONFIG_DIR}"
+  tmp="${CONFIG_FILE}.tmp"
+  : > "${tmp}"
+  for key in "${!CFG[@]}"; do
+    printf '%s=%s\n' "${key}" "${CFG[${key}]}" >> "${tmp}"
+  done
+  mv -f "${tmp}" "${CONFIG_FILE}"
+}
+
+#--- Petites aides ---------------------------------------------------------------------------------------------------------------
+term_width() {
+  local w
+  w=$(tput cols 2>/dev/null || printf '100')
+  (( w < 40 )) && w=40
+  printf '%d' "${w}"
+}
+
+# Largeur figée de l'encadré : identique sur tous les écrans, donc aucun saut.
+box_width() {
+  local w
+  w=$(term_width)
+  (( w > 78 )) && w=78
+  printf '%d' "$(( w - 2 ))"
+}
+
+plural() { # $1=nombre $2=singulier $3=pluriel
+  if (( ${1} > 1 )); then printf '%s' "${3}"; else printf '%s' "${2}"; fi
+}
+
+init_braille() { # table des 256 motifs braille (U+2800..U+28FF)
+  local i ch
+  BRAILLE=()
+  for (( i = 0; i < 256; i++ )); do
+    printf -v ch '\\U%08x' $(( 0x2800 + i ))
+    printf -v BRAILLE[i] '%b' "${ch}"
+  done
+}
+
+pad_right() { # $1=texte  $2=largeur en caractères
+  local txt="${1}" w="${2}"
+  (( ${#txt} > w )) && txt="${txt:0:w}"
+  printf '%s%*s' "${txt}" $(( w - ${#txt} )) ''
+}
+
+pad_left() { # $1=texte  $2=largeur en caractères (aligné à droite)
+  local txt="${1}" w="${2}"
+  (( ${#txt} > w )) && txt="${txt:0:w}"
+  printf '%*s%s' $(( w - ${#txt} )) '' "${txt}"
+}
+
+style_block() { # $1=couleur  $2...=lignes (une seule chaîne au final)
+  local color="${1}" block="" line
+  shift
+  for line in "$@"; do
+    if [[ -z ${block} ]]; then
+      block="${line}"
+    else
+      block+=$'\n'"${line}"
+    fi
+  done
+  gum style --foreground "${color}" "${block}"
+}
+
+header() {
+  local w="${BOX_W}" max
+  local title="${1}" sub="${2}"
+  max=$(( w - 10 ))
+  if (( ${#title} > max )); then title="${title:0:max-1}…"; fi
+  max=$(( w - 8 ))
+  if (( ${#sub} > max )); then sub="${sub:0:max-1}…"; fi
+  gum style --border double --border-foreground "${C_ACCENT}" --padding "0 2" --margin "1 0 0 0" \
+    --align center --width "${w}" \
+    "$(gum style --foreground "${C_FG}" --bold "${title}")" \
+    "$(gum style --foreground "${C_MUTED}" "${sub}")"
+}
+
+icon_of() {
+  case "${1}" in
+    cpu) printf '%s' "${I_CPU}" ;;
+    disk) printf '%s' "${I_DISK}" ;;
+    net) printf '%s' "${I_NET}" ;;
+    ram) printf '%s' "${I_RAM}" ;;
+    *) printf '%s' "${I_SPEED}" ;;
+  esac
+}
+
+color_of() {
+  case "${1}" in
+    cpu) printf '%s' "${C_BLUE}" ;;
+    disk) printf '%s' "${C_ORANGE}" ;;
+    net) printf '%s' "${C_CYAN}" ;;
+    ram) printf '%s' "${C_MAGENTA}" ;;
+    *) printf '%s' "${C_FG}" ;;
+  esac
+}
+
+label_of() {
+  case "${1}" in
+    cpu) printf 'CPU' ;;
+    disk) printf 'DISK' ;;
+    net) printf 'NET' ;;
+    ram) printf 'RAM' ;;
+    *) printf '%s' "${1}" ;;
+  esac
+}
+
+unit_of() {
+  case "${1}" in
+    cpu | ram) printf '%%' ;;
+    disk) printf 'Mo/s' ;;
+    net) printf 'Mbit/s' ;;
+    *) printf '' ;;
+  esac
+}
+
+human_duration() {
+  local s="${1:-0}"
+  if (( s < 60 )); then
+    printf '%ds' "${s}"
+  elif (( s < 3600 )); then
+    printf '%dm%02ds' "$(( s / 60 ))" "$(( s % 60 ))"
+  else
+    printf '%dh%02dm' "$(( s / 3600 ))" "$(( s % 3600 / 60 ))"
+  fi
+}
+
+human_bytes() {
+  awk -v v="${1:-0}" 'BEGIN {
+    split("o Kio Mio Gio Tio", u, " "); i = 1
+    while (v >= 1024 && i < 5) { v /= 1024; i++ }
+    if (i == 1) { printf "%.0f %s", v, u[i] } else { printf "%.1f %s", v, u[i] }
+  }'
+}
+
+human_bits() {
+  awk -v v="${1:-0}" 'BEGIN {
+    split("bit/s Kbit/s Mbit/s Gbit/s", u, " "); i = 1
+    while (v >= 1000 && i < 4) { v /= 1000; i++ }
+    printf "%.1f %s", v, u[i]
+  }'
+}
+
+rule_line() {
+  local width="${1}" out="" i
+  for (( i = 0; i < width; i++ )); do
+    out+="─"
+  done
+  printf '%s' "${out}"
+}
+
+pause_key() {
+  gum style --foreground "${C_MUTED}" "  ${I_LEFT}  Entrée pour continuer…"
+  read -r -s -n 1 || true
+}
+
+ask_int() { # $1=clé  $2=libellé  $3=min  $4=max
+  local key="${1}" label="${2}" min="${3}" max="${4}" def value
+  def=$(cfg_get "${key}")
+  while true; do
+    value=$(gum input --header "${label}  (${min} – ${max})" --prompt "➜ " \
+      --placeholder "défaut : ${def}") || return 1
+    [[ -z ${value} ]] && value="${def}"
+    if [[ ${value} =~ ^[0-9]+$ ]] && (( value >= min && value <= max )); then
+      cfg_set "${key}" "${value}"
+      return 0
+    fi
+    gum style --foreground "${C_RED}" "  ${I_ALERT}  valeur attendue entre ${min} et ${max}"
+  done
+}
+
+#--- Paliers ---------------------------------------------------------------------------------------------------------------------
+PH_LEVEL=()
+PH_LABEL=()
+PH_DUR=()
+
+build_phases() { # $1=module
+  local mod="${1}" max steps dwell hold i lvl
+  max=$(cfg_get "${mod}_max")
+  steps=$(cfg_get "${mod}_steps")
+  dwell=$(cfg_get "${mod}_dwell")
+  hold=$(cfg_get g_hold)
+  PH_LEVEL=()
+  PH_LABEL=()
+  PH_DUR=()
+
+  for (( i = 0; i <= steps; i++ )); do
+    lvl=$(( max * i / steps ))
+    if (( i == 0 )); then
+      PH_LABEL+=("Départ")
+      PH_DUR+=(2)
+    else
+      PH_LABEL+=("Montée ${i}/${steps}")
+      PH_DUR+=("${dwell}")
+    fi
+    PH_LEVEL+=("${lvl}")
+  done
+  PH_LABEL+=("Maintien")
+  PH_LEVEL+=("${max}")
+  PH_DUR+=("${hold}")
+  for (( i = steps - 1; i >= 0; i-- )); do
+    lvl=$(( max * i / steps ))
+    PH_LABEL+=("Descente")
+    PH_LEVEL+=("${lvl}")
+    PH_DUR+=("${dwell}")
+  done
+}
+
+phase_total() {
+  local total=0 d
+  for d in "${PH_DUR[@]}"; do
+    total=$(( total + d ))
+  done
+  printf '%d' "${total}"
+}
+
+#--- Outils de charge ------------------------------------------------------------------------------------------------------------
+prepare_disk_target() {
+  case "$(cfg_get disk_target)" in
+    file) printf '%s' "${DISK_PROBE}" ;;
+    tmpfs) printf '%s' "/dev/shm/omastress-probe.dat" ;;
+    *) printf '%s' "$(cfg_get disk_target)" ;;
+  esac
+}
+
+disk_is_tmpfs() {
+  local path
+  path=$(dirname "$(prepare_disk_target)")
+  [[ ${path} == /dev/shm* ]]
+}
+
+tool_cpu() { # $1=niveau %  $2=durée
+  local lvl="${1}" dur="${2}"
+  TOOL_PID=""
+  (( lvl <= 0 )) && return 0
+  if (( DEMO )); then
+    sleep "${dur}" &
+    TOOL_PID=$!
+    return 0
+  fi
+  setsid stress-ng --cpu 0 --cpu-load "${lvl}" --timeout "${dur}s" --quiet --metrics-brief \
+    > /dev/null 2>&1 &
+  TOOL_PID=$!
+}
+
+tool_ram() { # $1=niveau % de RAM utilisée  $2=durée
+  local lvl="${1}" dur="${2}" want
+  TOOL_PID=""
+  (( lvl <= 0 )) && return 0
+  want=$(awk -v l="${lvl}" '
+    /^MemTotal:/{tot=$2} /^MemAvailable:/{av=$2} /^SwapFree:/{sf=$2}
+    END {
+      need = int(tot * l / 100)          # mémoire à allouer
+      if (l <= 100) {
+        limit = av - 1048576             # 1 Gio laissé au système
+      } else {
+        limit = av + sf - 1048576        # au-delà de 100 %, le swap est utilisable
+      }
+      if (need > limit) need = limit
+      if (need < 65536) need = 65536
+      printf "%d", need
+    }' /proc/meminfo)
+  if (( DEMO )); then
+    sleep "${dur}" &
+    TOOL_PID=$!
+    return 0
+  fi
+  setsid stress-ng --vm 1 --vm-bytes "${want}K" --vm-keep --vm-method rand-set \
+    --timeout "${dur}s" --quiet > /dev/null 2>&1 &
+  TOOL_PID=$!
+}
+
+tool_disk() { # $1=niveau Mo/s  $2=durée
+  local lvl="${1}" dur="${2}" file log direct=1
+  TOOL_PID=""
+  (( lvl <= 0 )) && return 0
+  file=$(prepare_disk_target)
+  log="${RUNDIR}/disk-$(date +%s%N).log"
+  disk_is_tmpfs && direct=0
+  if (( DEMO )); then
+    sleep "${dur}" &
+    TOOL_PID=$!
+    return 0
+  fi
+  mkdir -p "$(dirname "${file}")"
+  setsid fio --name=omastress --filename="${file}" --rw=randwrite --bs=4k --direct="${direct}" \
+    --ioengine=libaio --iodepth=16 --size=128m --runtime="${dur}" --time_based \
+    --rate="${lvl}Mi" --status-interval=1 --eta=never --output="${log}" > /dev/null 2>&1 &
+  TOOL_PID=$!
+}
+
+tool_net() { # $1=niveau Mbit/s  $2=durée
+  local lvl="${1}" dur="${2}" rate
+  TOOL_PID=""
+  (( lvl <= 0 )) && return 0
+  if (( DEMO )); then
+    sleep "${dur}" &
+    TOOL_PID=$!
+    return 0
+  fi
+  if [[ ${NET_MODE_EFF} == http ]]; then
+    rate=$(( lvl * 125000 ))   # 1 Mbit/s = 125 000 octets/s
+    setsid bash "${NET_HTTP_SCRIPT}" "${rate}" "${NET_URL_EFF}" "$$" > /dev/null 2>&1 &
+    TOOL_PID=$!
+    return 0
+  fi
+  setsid iperf3 -c "${NET_HOST_EFF}" -p "${NET_PORT}" -t "${dur}" -b "${lvl}M" \
+    --connect-timeout 2000 > /dev/null 2>&1 &
+  TOOL_PID=$!
+}
+
+kill_tree() {
+  local pid="${1}" i
+  [[ -z ${pid} ]] && return 0
+  kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
+  for (( i = 0; i < 20; i++ )); do
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+  return 0
+}
+
+#--- Worker ----------------------------------------------------------------------------------------------------------------------
+worker_cleanup() {
+  local pid=""
+  [[ -n ${RUNDIR} && -f ${RUNDIR}/${WORKER_MOD}.toolpid ]] || return 0
+  pid=$(< "${RUNDIR}/${WORKER_MOD}.toolpid")
+  kill_tree "${pid}"
+  rm -f "${RUNDIR}/${WORKER_MOD}.toolpid"
+}
+
+worker_main() { # $1=module
+  local mod="${1}" tool cycles total cycle i dur pid left state
+  WORKER_MOD="${mod}"
+  trap worker_cleanup EXIT
+  trap 'exit 143' INT TERM
+  tool="tool_${mod}"
+
+  build_phases "${mod}"
+  total=${#PH_LEVEL[@]}
+  cycles=$(cfg_get "${mod}_cycles")
+  state="${RUNDIR}/${mod}.state"
+
+  for (( cycle = 1; cycle <= cycles; cycle++ )); do
+    for (( i = 0; i < total; i++ )); do
+      if [[ -e ${RUNDIR}/stop || -e ${RUNDIR}/${mod}.stop ]]; then
+        printf 'Arrêt|0|%s|0\n' "${cycle}" > "${state}"
+        return 0
+      fi
+      dur=${PH_DUR[i]}
+      printf '%s|%s|%s|%s\n' "${PH_LABEL[i]}" "${PH_LEVEL[i]}" "${cycle}" \
+        "$(( $(date +%s) + dur ))" > "${state}"
+      TOOL_PID=""
+      "${tool}" "${PH_LEVEL[i]}" "${dur}"
+      pid=${TOOL_PID}
+      if [[ -n ${pid} ]]; then
+        printf '%s\n' "${pid}" > "${RUNDIR}/${mod}.toolpid"
+        sleep 0.3
+        if ! kill -0 "${pid}" 2>/dev/null; then
+          printf 'Outil en échec|0|%s|0\n' "${cycle}" > "${state}"
+          pid=""
+          TOOL_PID=""
+          rm -f "${RUNDIR}/${mod}.toolpid"
+        fi
+      fi
+      left=$(( dur * 10 ))
+      while (( left > 0 )); do
+        if [[ -e ${RUNDIR}/stop || -e ${RUNDIR}/${mod}.stop ]]; then
+          break
+        fi
+        sleep 0.1
+        left=$(( left - 1 ))
+      done
+      if [[ -n ${pid} ]]; then
+        kill_tree "${pid}"
+        wait "${pid}" 2>/dev/null || true
+        rm -f "${RUNDIR}/${mod}.toolpid"
+      fi
+    done
+    printf 'Fin cycle|0|%s|0\n' "${cycle}" > "${state}"
+  done
+  printf 'Terminé|0|%s|0\n' "${cycles}" > "${state}"
+}
+
+#--- Serveur iperf3 local --------------------------------------------------------------------------------------------------------
+default_gateway() {
+  ip -o -4 route show default 2>/dev/null \
+    | awk '{for (i = 1; i <= NF; i++) if ($i == "via") {print $(i + 1); exit}}'
+}
+
+net_mode_label() {
+  case "${1}" in
+    local) printf 'loopback' ;;
+    gateway) printf 'passerelle' ;;
+    remote) printf 'distant' ;;
+    http) printf 'internet' ;;
+    *) printf '%s' "${1}" ;;
+  esac
+}
+
+probe_iperf() { # $1=hôte  $2=port
+  (( DEMO )) && return 0
+  timeout 3 iperf3 -c "${1}" -p "${2}" -t 1 --connect-timeout 1500 > /dev/null 2>&1
+}
+
+net_url_candidates() { # URL configurée puis miroirs de secours
+  {
+    printf '%s\n' "$(cfg_get net_url)"
+    printf '%s\n' "https://ash-speed.hetzner.com/1GB.bin"
+    printf '%s\n' "https://proof.ovh.net/files/1Gb.dat"
+  } | awk 'NF && !seen[$0]++'
+}
+
+probe_http() { # $1=url
+  local code
+  (( DEMO )) && return 0
+  code=$(curl -sI -o /dev/null -w '%{http_code}' --max-time 4 "${1}" 2>/dev/null || true)
+  case "${code}" in
+    200 | 206 | 301 | 302) return 0 ;;
+    *) ;;
+  esac
+  # certains serveurs refusent HEAD : on tente un GET limité à 1 Mio
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 \
+    --max-filesize 1048576 "${1}" 2>/dev/null || true)
+  case "${code}" in
+    200 | 206) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+start_local_iperf() {
+  NET_PORT=$(( 5201 + RANDOM % 400 ))
+  NET_LOCAL_SERVER=1
+  (( DEMO )) && return 0
+  # --idle-timeout : le serveur s'arrête seul s'il est orphelin après un plantage
+  iperf3 -s -p "${NET_PORT}" -D --idle-timeout 120 -I "${RUNDIR}/iperf.pid" \
+    > /dev/null 2>&1 || true
+  sleep 0.4
+}
+
+# petit script relancé en boucle pour saturer un lien internet
+write_http_loop() {
+  local f="${RUNDIR}/http_loop.sh"
+  cat > "${f}" <<'EOS'
+#!/usr/bin/env bash
+rate="${1}"
+url="${2}"
+parent="${3}"
+while :; do
+  # s'arrête si le script principal a disparu (évite les téléchargements orphelins)
+  kill -0 "${parent}" 2>/dev/null || exit 0
+  curl -sS -o /dev/null --connect-timeout 5 --speed-time 15 --speed-limit 50000 \
+    --limit-rate "${rate}" --max-time 3600 "${url}" || sleep 1
+done
+EOS
+  chmod +x "${f}"
+  printf '%s' "${f}"
+}
+
+net_prepare() {
+  local mode host cand
+  mode=$(cfg_get net_mode)
+  host=$(cfg_get net_host)
+  NET_PORT=$(cfg_get net_port)
+  NET_MODE_EFF="${mode}"
+  NET_HOST_EFF="${host}"
+  NET_NOTE=""
+  NET_LOCAL_SERVER=0
+
+  case "${mode}" in
+    local)
+      start_local_iperf
+      NET_HOST_EFF="127.0.0.1"
+      ;;
+    gateway)
+      host=$(default_gateway)
+      if [[ -z ${host} ]]; then
+        NET_NOTE="aucune passerelle → repli loopback"
+        NET_MODE_EFF="local"
+        start_local_iperf
+        NET_HOST_EFF="127.0.0.1"
+      elif probe_iperf "${host}" "${NET_PORT}"; then
+        NET_HOST_EFF="${host}"
+        NET_NOTE="iperf3 sur ${host}:${NET_PORT}"
+      else
+        NET_NOTE="pas d'iperf3 sur ${host}:${NET_PORT} → repli loopback"
+        NET_MODE_EFF="local"
+        start_local_iperf
+        NET_HOST_EFF="127.0.0.1"
+      fi
+      ;;
+    remote)
+      if probe_iperf "${host}" "${NET_PORT}"; then
+        NET_HOST_EFF="${host}"
+      else
+        NET_NOTE="${host}:${NET_PORT} injoignable → repli loopback"
+        NET_MODE_EFF="local"
+        start_local_iperf
+        NET_HOST_EFF="127.0.0.1"
+      fi
+      ;;
+    http)
+      NET_URL_EFF=""
+      while IFS= read -r cand; do
+        [[ -z ${cand} ]] && continue
+        if probe_http "${cand}"; then
+          NET_URL_EFF="${cand}"
+          break
+        fi
+      done < <(net_url_candidates)
+      if [[ -n ${NET_URL_EFF} ]]; then
+        NET_HTTP_SCRIPT=$(write_http_loop)
+        host=${NET_URL_EFF#*://}
+        NET_NOTE="source ${host%%/*}"
+      else
+        NET_NOTE="aucune URL joignable → repli loopback"
+        NET_MODE_EFF="local"
+        start_local_iperf
+        NET_HOST_EFF="127.0.0.1"
+      fi
+      ;;
+    *) ;;
+  esac
+}
+
+stop_net_server() {
+  (( NET_LOCAL_SERVER )) || return 0
+  pkill -f "iperf3 -s -p ${NET_PORT}" 2>/dev/null || true
+  return 0
+}
+
+#--- Échantillonnage -------------------------------------------------------------------------------------------------------------
+PREV_CPU_TOTAL=0
+PREV_CPU_IDLE=0
+PREV_DISK_TICKS=0
+PREV_DISK_TIME=0
+PREV_NET_BYTES=0
+PREV_NET_TIME=0
+CPU_PCT=0
+RAM_PCT=0
+RAM_USED=0
+RAM_TOTAL=0
+DISK_PCT=-1
+NET_BPS=0
+TEMP_C=0
+NET_DEV=""
+DISK_DEV=""
+
+detect_devs() {
+  local target src
+  NET_DEV=$(ip -o -4 route show default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+  NET_DEV=${NET_DEV:-lo}
+  [[ ${NET_MODE_EFF:-$(cfg_get net_mode)} == local ]] && NET_DEV="lo"
+
+  target=$(prepare_disk_target)
+  if disk_is_tmpfs; then
+    DISK_DEV=""
+  else
+    src=$(findmnt -no SOURCE --target "$(dirname "${target}")" 2>/dev/null | head -n 1)
+    src=${src%%\[*}
+    if [[ -n ${src} ]]; then
+      DISK_DEV=$(basename "$(readlink -f "${src}")")
+    fi
+  fi
+}
+
+sample_cpu() {
+  local total idle dt di
+  read -r total idle < <(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5+$6; exit}' /proc/stat)
+  dt=$(( total - PREV_CPU_TOTAL ))
+  di=$(( idle - PREV_CPU_IDLE ))
+  PREV_CPU_TOTAL=${total}
+  PREV_CPU_IDLE=${idle}
+  if (( dt > 0 )); then
+    CPU_PCT=$(( 100 * (dt - di) / dt ))
+  fi
+}
+
+sample_ram() {
+  read -r RAM_TOTAL RAM_USED < <(awk '
+    /^MemTotal:/{t=$2} /^MemAvailable:/{a=$2}
+    END { printf "%d %d", t*1024, (t-a)*1024 }' /proc/meminfo)
+  if (( RAM_TOTAL > 0 )); then
+    RAM_PCT=$(( RAM_USED * 100 / RAM_TOTAL ))
+  fi
+}
+
+sample_disk() {
+  local ticks now dt
+  if [[ -z ${DISK_DEV} ]]; then
+    DISK_PCT=-1
+    return 0
+  fi
+  ticks=$(awk -v d="${DISK_DEV}" '$3==d{print $13; f=1} END{if(!f) print 0}' /proc/diskstats)
+  now=$(date +%s%3N)
+  dt=$(( now - PREV_DISK_TIME ))
+  if (( dt > 0 && PREV_DISK_TIME > 0 && ticks >= PREV_DISK_TICKS )); then
+    DISK_PCT=$(( 100 * (ticks - PREV_DISK_TICKS) / dt ))
+    (( DISK_PCT > 100 )) && DISK_PCT=100
+  else
+    DISK_PCT=-1
+  fi
+  PREV_DISK_TICKS=${ticks}
+  PREV_DISK_TIME=${now}
+}
+
+sample_net() {
+  local bytes now dt tx rx
+  bytes=0
+  if [[ -r /sys/class/net/${NET_DEV}/statistics/tx_bytes ]]; then
+    tx=$(< "/sys/class/net/${NET_DEV}/statistics/tx_bytes")
+    rx=$(< "/sys/class/net/${NET_DEV}/statistics/rx_bytes")
+    # max() : un test iperf3 en loopback compte le même trafic en émission et réception
+    bytes=${tx}
+    (( rx > bytes )) && bytes=${rx}
+  fi
+  now=$(date +%s%3N)
+  dt=$(( now - PREV_NET_TIME ))
+  if (( dt > 0 && PREV_NET_TIME > 0 && bytes >= PREV_NET_BYTES )); then
+    NET_BPS=$(( (bytes - PREV_NET_BYTES) * 8000 / dt ))
+  fi
+  PREV_NET_BYTES=${bytes}
+  PREV_NET_TIME=${now}
+}
+
+sample_psi() { # /proc/pressure : some = au moins une tâche bloquée, full = toutes
+  local res line kind rest a b c
+  PSI=()
+  PSI_AVAIL=0
+  [[ -r /proc/pressure/cpu ]] || return 0
+  PSI_AVAIL=1
+  for res in cpu io memory; do
+    [[ -r /proc/pressure/${res} ]] || continue
+    while IFS= read -r line; do
+      kind=${line%% *}
+      rest=${line#* }
+      read -r a b c _ <<< "${rest}"
+      case "${kind}" in
+        some)
+          PSI["${res}_s10"]=${a#avg10=}
+          PSI["${res}_s60"]=${b#avg60=}
+          PSI["${res}_s300"]=${c#avg300=}
+          ;;
+        full)
+          # le noyau n'a pas de pression « full » pour CPU (toujours nulle) :
+          # on ne l'affiche pas, même si le fichier expose une ligne à zéro
+          [[ ${res} == cpu ]] && continue
+          PSI["${res}_f10"]=${a#avg10=}
+          PSI["${res}_f60"]=${b#avg60=}
+          PSI["${res}_f300"]=${c#avg300=}
+          ;;
+        *) ;;
+      esac
+    done < "/proc/pressure/${res}"
+  done
+}
+
+sample_temp() {
+  local f v max=0
+  shopt -s nullglob
+  for f in /sys/class/hwmon/hwmon*/temp*_input; do
+    v=$(< "${f}")
+    (( v > max )) && max=${v}
+  done
+  shopt -u nullglob
+  TEMP_C=$(( max / 1000 ))
+  if (( max > 0 )); then TEMP_AVAIL=1; else TEMP_AVAIL=0; fi
+}
+
+hist_add() { # $1=nom du tableau global  $2=valeur
+  local -n h="${1}"
+  h+=("${2}")
+  if (( ${#h[@]} > HIST_MAX )); then
+    h=("${h[@]:1}")
+  fi
+}
+
+sample_all() {
+  sample_cpu
+  sample_ram
+  sample_disk
+  sample_net
+  sample_temp
+  sample_psi
+  DISK_RATE_MIB=$(fio_reading)
+  hist_add HIST_CPU "${CPU_PCT}"
+  hist_add HIST_RAM "${RAM_PCT}"
+  hist_add HIST_DISK "${DISK_RATE_MIB%%.*}"
+  hist_add HIST_NET "${NET_BPS}"
+  hist_add HIST_TEMP "${TEMP_C}"
+}
+
+sample_init() {
+  detect_devs
+  PREV_CPU_TOTAL=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8; exit}' /proc/stat)
+  PREV_CPU_IDLE=$(awk '/^cpu /{print $5+$6; exit}' /proc/stat)
+  PREV_NET_BYTES=0
+  PREV_NET_TIME=0
+  PREV_DISK_TIME=0
+  PREV_DISK_TICKS=0
+  sample_ram
+  sample_temp
+  sample_psi
+}
+
+#--- Tableau de bord -------------------------------------------------------------------------------------------------------------
+bar() { # $1=pct  $2=largeur  $3=couleur
+  local pct="${1}" width="${2}" color="${3}" filled rest i
+  (( pct < 0 )) && pct=0
+  (( pct > 100 )) && pct=100
+  filled=$(( pct * width / 100 ))
+  rest=$(( width - filled ))
+  printf '%s' "$(ansi_fg "${color}")"
+  for (( i = 0; i < filled; i++ )); do
+    printf '█'
+  done
+  printf '%s' "$(ansi_fg "${C_MUTED}")"
+  for (( i = 0; i < rest; i++ )); do
+    printf '░'
+  done
+  printf '\033[0m'
+}
+
+pct_color() {
+  local pct="${1}"
+  if (( pct >= 90 )); then
+    printf '%s' "${C_RED}"
+  elif (( pct >= 70 )); then
+    printf '%s' "${C_ORANGE}"
+  elif (( pct >= 40 )); then
+    printf '%s' "${C_YELLOW}"
+  else
+    printf '%s' "${C_GREEN}"
+  fi
+}
+
+fio_reading() { # -> MiB/s (dernier journal fio du palier courant)
+  local log line value unit
+  log=$(find "${RUNDIR}" -maxdepth 1 -name 'disk-*.log' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -rn | head -n 1 | cut -d' ' -f2-)
+  [[ -n ${log} && -r ${log} ]] || {
+    printf '0'
+    return 0
+  }
+  line=$(grep -aoE 'bw=[0-9.]+[KMG]iB/s' "${log}" 2>/dev/null | tail -n 1 || true)
+  [[ -z ${line} ]] && {
+    printf '0'
+    return 0
+  }
+  value=${line#bw=}
+  unit=${value//[0-9.]/}
+  value=${value//[^0-9.]/}
+  case "${unit}" in
+    KiB/s) awk -v v="${value}" 'BEGIN{printf "%.1f", v/1024}' ;;
+    GiB/s) awk -v v="${value}" 'BEGIN{printf "%.0f", v*1024}' ;;
+    *) printf '%s' "${value}" ;;
+  esac
+}
+
+read_state() { # $1=module -> ST_PHASE, ST_LEVEL, ST_CYCLE, ST_DEADLINE
+  local f="${RUNDIR}/${1}.state"
+  if [[ -r ${f} ]]; then
+    IFS='|' read -r ST_PHASE ST_LEVEL ST_CYCLE ST_DEADLINE < "${f}"
+  else
+    ST_PHASE="Démarrage"
+    ST_LEVEL=0
+    ST_CYCLE=0
+    ST_DEADLINE=0
+  fi
+}
+
+fmt_disk_rate() { # $1 = Mio/s -> largeur <= 10
+  awk -v v="${1:-0}" 'BEGIN {
+    if (v >= 1000) printf "%.1f Go/s", v / 1024
+    else printf "%.0f Mo/s", v
+  }'
+}
+
+fmt_limit() { # $1=module  $2=valeur max -> libellé de largeur <= 10
+  case "${1}" in
+    cpu | ram) printf '%s %%' "${2}" ;;
+    disk)
+      awk -v v="${2}" 'BEGIN {
+        if (v >= 1000) printf "%.1f Go/s", v / 1024
+        else printf "%.0f Mo/s", v
+      }'
+      ;;
+    net)
+      awk -v v="${2}" 'BEGIN {
+        if (v >= 1000000) printf "%.1f Tbit/s", v / 1e6
+        else if (v >= 100000) printf "%.0f Gbit/s", v / 1000
+        else if (v >= 1000) printf "%.1f Gbit/s", v / 1000
+        else printf "%.0f Mbit/s", v
+      }'
+      ;;
+    *) printf '%s' "${2}" ;;
+  esac
+}
+
+fmt_net_rate() { # $1 = bit/s -> largeur <= 10
+  awk -v v="${1:-0}" 'BEGIN {
+    if (v >= 1e12) printf "%.1f Tbit/s", v / 1e12
+    else if (v >= 1e10) printf "%.0f Gbit/s", v / 1e9
+    else if (v >= 1e9) printf "%.1f Gbit/s", v / 1e9
+    else if (v >= 1e6) printf "%.0f Mbit/s", v / 1e6
+    else if (v >= 1e3) printf "%.0f Kbit/s", v / 1e3
+    else printf "0 bit/s"
+  }'
+}
+
+module_metric() {
+  case "${1}" in
+    cpu) printf '%s %%' "${CPU_PCT}" ;;
+    ram) printf '%s %%' "${RAM_PCT}" ;;
+    disk)
+      if (( ST_LEVEL > 0 )); then fmt_disk_rate "${DISK_RATE_MIB}"; else printf '0 Mo/s'; fi
+      ;;
+    net)
+      if (( ST_LEVEL > 0 )); then fmt_net_rate "${NET_BPS}"; else printf '0 bit/s'; fi
+      ;;
+    *) printf '-' ;;
+  esac
+}
+
+psi_color() {
+  local v="${1}" n
+  n=${v%%.*}
+  [[ -z ${n} ]] && n=0
+  if (( n >= 50 )); then
+    printf '%s' "${C_RED}"
+  elif (( n >= 20 )); then
+    printf '%s' "${C_ORANGE}"
+  elif (( n >= 5 )); then
+    printf '%s' "${C_YELLOW}"
+  else
+    printf '%s' "${C_GREEN}"
+  fi
+}
+
+render_graphs() { # $1=colonnes  $2=hauteur(1|2)  $3...=modules
+  local cols="${1}" gh="${2}"
+  shift 2
+  local -a mods=("$@")
+  local mod lab reset i n start v pmax gcols pad right line maxv
+  local v0 v1 p0 p1 h0 h1 k dr tr mask cr cx m max_disk max_net
+  local -a vals rows lastcs
+  local -a bits_l=(1 2 4 64)      # points 1,2,3,7 (colonne gauche, haut→bas)
+  local -a bits_r=(8 16 32 128)   # points 4,5,6,8 (colonne droite)
+  local c cg cy co cr_col
+
+  reset=$'\033[0m'
+  cg=$(ansi_fg "${C_GREEN}")
+  cy=$(ansi_fg "${C_YELLOW}")
+  co=$(ansi_fg "${C_ORANGE}")
+  cr_col=$(ansi_fg "${C_RED}")
+  gcols=$(( cols - 24 ))
+  (( gcols < 12 )) && gcols=12
+  (( gcols > 150 )) && gcols=150
+
+  printf '\033[K\n'   # une ligne sous la barre générale
+
+  for mod in "${mods[@]}"; do
+    case "${mod}" in
+      cpu) eval 'vals=("${HIST_CPU[@]}")'; lab="CPU" ;;
+      ram) eval 'vals=("${HIST_RAM[@]}")'; lab="RAM" ;;
+      disk) eval 'vals=("${HIST_DISK[@]}")'; lab="DISK" ;;
+      net) eval 'vals=("${HIST_NET[@]}")'; lab="NET" ;;
+      temp) eval 'vals=("${HIST_TEMP[@]}")'; lab="TEMP" ;;
+      *) continue ;;
+    esac
+
+    maxv=0
+    n=${#vals[@]}
+    start=$(( n > gcols * 2 ? n - gcols * 2 : 0 ))
+    m=$(( (n - start + 1) / 2 ))
+    (( m > gcols )) && m=${gcols}
+
+    rows=()
+    lastcs=()
+    for (( cr = 0; cr < gh; cr++ )); do
+      rows[cr]=""
+      lastcs[cr]=""
+    done
+
+    for (( cx = 0; cx < m; cx++ )); do
+      v0=${vals[start + cx * 2]}
+      if (( start + cx * 2 + 1 < n )); then
+        v1=${vals[start + cx * 2 + 1]}
+      else
+        v1=${v0}
+      fi
+      (( v0 > maxv )) && maxv=${v0}
+      (( v1 > maxv )) && maxv=${v1}
+
+      case "${mod}" in
+        cpu | ram)
+          p0=${v0}
+          p1=${v1}
+          ;;
+        disk)
+          max_disk=$(cfg_get disk_max)
+          (( max_disk < 1 )) && max_disk=1
+          p0=$(( v0 * 100 / max_disk ))
+          p1=$(( v1 * 100 / max_disk ))
+          ;;
+        net)
+          max_net=$(cfg_get net_max)
+          (( max_net < 1 )) && max_net=1
+          p0=$(( v0 * 100 / (max_net * 1000000) ))
+          p1=$(( v1 * 100 / (max_net * 1000000) ))
+          ;;
+        temp)
+          # échelle 20–100 °C
+          p0=$(( (v0 - 20) * 100 / 80 ))
+          p1=$(( (v1 - 20) * 100 / 80 ))
+          ;;
+        *) ;;
+      esac
+      (( p0 > 100 )) && p0=100
+      (( p1 > 100 )) && p1=100
+      pmax=${p0}
+      (( p1 > pmax )) && pmax=${p1}
+
+      if [[ ${mod} == temp ]]; then
+        local vmax=${v0}
+        (( v1 > vmax )) && vmax=${v1}
+        if (( vmax >= 85 )); then
+          c=${cr_col}
+        elif (( vmax >= 75 )); then
+          c=${co}
+        elif (( vmax >= 60 )); then
+          c=${cy}
+        else
+          c=${cg}
+        fi
+      elif (( pmax >= 90 )); then
+        c=${cr_col}
+      elif (( pmax >= 70 )); then
+        c=${co}
+      elif (( pmax >= 40 )); then
+        c=${cy}
+      else
+        c=${cg}
+      fi
+
+      h0=$(( p0 * gh * 4 / 100 ))
+      h1=$(( p1 * gh * 4 / 100 ))
+
+      for (( cr = 0; cr < gh; cr++ )); do
+        mask=0
+        k=$(( h0 - cr * 4 ))
+        (( k < 0 )) && k=0
+        (( k > 4 )) && k=4
+        for (( dr = 0; dr < k; dr++ )); do
+          tr=$(( 3 - dr ))
+          mask=$(( mask | bits_l[tr] ))
+        done
+        k=$(( h1 - cr * 4 ))
+        (( k < 0 )) && k=0
+        (( k > 4 )) && k=4
+        for (( dr = 0; dr < k; dr++ )); do
+          tr=$(( 3 - dr ))
+          mask=$(( mask | bits_r[tr] ))
+        done
+        if (( mask == 0 )); then
+          rows[cr]+=" "
+        else
+          if [[ ${c} != "${lastcs[cr]}" ]]; then
+            rows[cr]+="${c}"
+            lastcs[cr]="${c}"
+          fi
+          rows[cr]+="${BRAILLE[mask]}"
+        fi
+      done
+    done
+
+    pad=$(( gcols - m ))
+    (( pad < 0 )) && pad=0
+
+    case "${mod}" in
+      disk) printf -v right 'max %s' "$(fmt_disk_rate "${maxv}")" ;;
+      net) printf -v right 'max %s' "$(fmt_net_rate "${maxv}")" ;;
+      temp) printf -v right 'max %3d °C' "${maxv}" ;;
+      *) printf -v right 'max %3d %%' "${maxv}" ;;
+    esac
+    right=$(pad_left "${right}" 14)
+
+    for (( cr = gh - 1; cr >= 0; cr-- )); do
+      if (( cr == gh - 1 )); then
+        printf -v lab ' %-4s ' "${lab}"
+        line="$(ansi_fg "${C_MUTED}")${lab}${reset}${rows[cr]}${reset}"
+      else
+        line="$(pad_right '' 6)${rows[cr]}${reset}"
+      fi
+      line+="$(pad_right '' "${pad}")"
+      if (( cr == gh - 1 )); then
+        line+="  $(ansi_fg "${C_MUTED}")${right}${reset}"
+      fi
+      printf '%s\033[K\n' "${line}"
+    done
+    printf '\033[K\n'   # une ligne entre chaque graphe
+  done
+}
+
+render_pressure() { # $1=colonnes  -- tableau PSI sous la barre générale
+  local cols="${1}" reset line key v res label lab
+  local -a keys hdrs
+  reset=$'\033[0m'
+
+  if (( ! PSI_AVAIL )); then
+    printf ' %sPRESSION  indisponible (noyau sans CONFIG_PSI)%s\033[K\n' \
+      "$(ansi_fg "${C_MUTED}")" "${reset}"
+    return 0
+  fi
+
+  if (( cols >= 78 )); then
+    keys=(s10 s60 s300 f10 f60 f300)
+    hdrs=(some10 some60 some300 full10 full60 full300)
+  else
+    keys=(s10 s60 f10 f60)
+    hdrs=(some10 some60 full10 full60)
+  fi
+
+  line=" $(ansi_fg "${C_MUTED}")$(printf '%-9s' "PRESSION")"
+  for key in "${hdrs[@]}"; do
+    line+="$(printf '%9s' "${key}")"
+  done
+  line+="${reset}"
+  printf '%s\033[K\n' "${line}"
+
+  for res in cpu io memory; do
+    case "${res}" in
+      cpu) label="CPU" ;;
+      io) label="IO" ;;
+      memory) label="RAM" ;;
+      *) label="${res}" ;;
+    esac
+    printf -v lab '%-9s' "${label}"
+    line=" $(ansi_fg "${C_MUTED}")${lab}${reset}"
+    for key in "${keys[@]}"; do
+      v="${PSI[${res}_${key}]:--}"
+      if [[ ${v} == "-" ]]; then
+        line+="$(ansi_fg "${C_MUTED}")$(pad_left "—" 9)${reset}"
+      else
+        line+="$(ansi_fg "$(psi_color "${v}")")$(printf '%9s' "$(printf '%5.1f %%' "${v}")")${reset}"
+      fi
+    done
+    printf '%s\033[K\n' "${line}"
+  done
+  printf ' %s%s%s\033[K\n' "$(ansi_fg "${C_MUTED}")" \
+    "some ≥1 tâche bloquée · full toutes bloquées · % du temps" $'\033[0m'
+}
+
+render_dashboard() { # $1=écoulé  $2...=modules
+  local elapsed="${1}"
+  shift
+  local -a mods=("$@")
+  local cols barw rule mod level pct remaining color icon label metric
+  local reset line status remain max cycles s_dev metric status_w
+  local s_cpu s_ram s_mem s_disk s_net s_temp dur_txt alert_t
+  cols=$(term_width)
+  barw=$(( cols - 55 ))
+  (( barw < 6 )) && barw=6
+  (( barw > 30 )) && barw=30
+  alert_t=$(cfg_get g_temp_alert)
+
+  reset=$'\033[0m'
+  rule=$(rule_line $(( cols - 2 )))
+
+  printf '\033[H'
+  printf -v dur_txt '%-6s' "$(human_duration "${elapsed}")"
+  line=" $(ansi_fg "${C_ACCENT}")${I_SPEED} OMASTRESS${reset}"
+  line+="  $(ansi_fg "${C_MUTED}")${I_TIMER}${reset} ${dur_txt}"
+  if (( cols >= 74 )); then
+    line+="  $(ansi_fg "${C_MUTED}")${#mods[@]} $(plural "${#mods[@]}" module modules) · $(nproc) cœurs${reset}"
+  else
+    line+="  $(ansi_fg "${C_MUTED}")${#mods[@]} $(plural "${#mods[@]}" module modules)${reset}"
+  fi
+  if (( DEMO && cols >= 90 )); then
+    line+="  $(ansi_fg "${C_YELLOW}")simulation${reset}"
+  fi
+  if (( cols >= 66 )); then
+    line+="  $(ansi_fg "${C_MUTED}")${I_STOP} q = arrêt${reset}"
+  else
+    line+="  $(ansi_fg "${C_MUTED}")${I_STOP} q${reset}"
+  fi
+  # alerte ajoutée en fin de ligne : rien ne se décale devant elle
+  if (( TEMP_C >= alert_t )); then
+    line+="  $(ansi_fg "${C_RED}")${I_THERMO} ${TEMP_C} °C${reset}"
+  fi
+  printf '%s\033[K\n' "${line}"
+  printf '%s%s%s\033[K\n' "$(ansi_fg "${C_MUTED}")" "${rule}" "${reset}"
+
+  for mod in "${mods[@]}"; do
+    read_state "${mod}"
+    level=${ST_LEVEL}
+    max=$(cfg_get "${mod}_max")
+    cycles=$(cfg_get "${mod}_cycles")
+    pct=0
+    (( max > 0 )) && pct=$(( level * 100 / max ))
+    color=$(color_of "${mod}")
+    icon=$(icon_of "${mod}")
+    printf -v label '%-4s' "$(label_of "${mod}")"
+    remaining=0
+    (( ST_DEADLINE > 0 )) && remaining=$(( ST_DEADLINE - $(date +%s) ))
+    (( remaining < 0 )) && remaining=0
+    if (( remaining > 0 )); then
+      remain=$(human_duration "${remaining}")
+    else
+      remain="—"
+    fi
+
+    metric=$(module_metric "${mod}")
+    printf -v metric '%4s %-6s' "${metric% *}" "${metric##* }"
+    status_w=24
+    status="${ST_PHASE}"
+    if (( ${#status} > 14 )); then
+      status="${status:0:13}…"
+    fi
+    status="$(pad_right "${status}" 14) · c${ST_CYCLE}/${cycles}"
+    status=$(pad_right "${status}" "${status_w}")
+    remain=$(pad_left "${remain}" 6)
+
+    line=" $(ansi_fg "${color}")${icon}${reset}"
+    line+=" $(ansi_fg "${color}")${label}${reset}"
+    line+=" $(ansi_fg "${C_FG}")${metric}${reset}"
+    line+=" $(bar "${pct}" "${barw}" "${color}")"
+    line+="  $(ansi_fg "${C_MUTED}")${status} ${remain}${reset}"
+    printf '%s\033[K\n' "${line}"
+  done
+
+  printf '%s%s%s\033[K\n' "$(ansi_fg "${C_MUTED}")" "${rule}" "${reset}"
+  printf -v s_cpu '%3d %%' "${CPU_PCT}"
+  printf -v s_ram '%3d %%' "${RAM_PCT}"
+  # largeur dérivée de la RAM totale (constante pendant la session)
+  printf -v s_mem '%s' "$(awk -v u="${RAM_USED}" -v t="${RAM_TOTAL}" 'BEGIN {
+    div = (t >= 1073741824) ? 1073741824 : 1048576
+    unit = (div == 1073741824) ? "Gio" : "Mio"
+    w = length(sprintf("%.1f", t / div))
+    printf "%*.1f/%*.1f %s", w, u / div, w, t / div, unit
+  }')"
+  if (( DISK_PCT < 0 )); then
+    printf -v s_disk '%5s' "n/a"
+  else
+    printf -v s_disk '%3d %%' "${DISK_PCT}"
+  fi
+  metric=$(fmt_net_rate "${NET_BPS}")
+  printf -v s_net '%4s %-6s' "${metric% *}" "${metric##* }"
+  printf -v s_dev '%-5.5s' "${NET_DEV}"
+  printf -v s_temp '%3d °C' "${TEMP_C}"
+
+  line=" $(ansi_fg "${C_MUTED}")${I_CPU}${reset} $(ansi_fg "$(pct_color "${CPU_PCT}")")${s_cpu}${reset}"
+  line+="  $(ansi_fg "${C_MUTED}")${I_RAM}${reset} $(ansi_fg "$(pct_color "${RAM_PCT}")")${s_ram}${reset}"
+  (( cols >= 92 )) && line+=" (${s_mem})"
+  line+="  $(ansi_fg "${C_MUTED}")${I_DISK}${reset} ${s_disk}"
+  line+="  $(ansi_fg "${C_MUTED}")${I_NET}${reset} ${s_net} ${s_dev}"
+  line+="  $(ansi_fg "${C_MUTED}")${I_THERMO}${reset} $(ansi_fg "$(pct_color "${TEMP_C}")")${s_temp}${reset}"
+  printf '%s\033[K\n' "${line}"
+  local lines budget gh gcount
+  local -a glist=("${mods[@]}")
+  (( TEMP_AVAIL )) && glist+=("temp")
+  gcount=${#glist[@]}
+  lines=$(tput lines 2>/dev/null || printf '40')
+  budget=$(( lines - 10 - gcount ))
+  if (( budget >= 1 + 5 * gcount )); then
+    gh=4
+  elif (( budget >= 1 + 3 * gcount )); then
+    gh=2
+  elif (( budget >= 1 + 2 * gcount )); then
+    gh=1
+  else
+    gh=0
+  fi
+  if (( gh > 0 )); then
+    render_graphs "${cols}" "${gh}" "${glist[@]}"
+  else
+    printf '\033[K\n'
+  fi
+  render_pressure "${cols}"
+  printf '\033[J'
+}
+
+#--- Rapport ---------------------------------------------------------------------------------------------------------------------
+report_open() {
+  local stamp
+  stamp=$(date +%Y%m%d-%H%M%S)
+  mkdir -p "${REPORT_DIR}"
+  report_path="${REPORT_DIR}/session-${stamp}.csv"
+  printf 'horodatage,module,cycle,phase,niveau,cpu_pct,ram_pct,disque_pct,net_mbit,temp_c\n' \
+    > "${report_path}"
+}
+
+report_line() { # $1=module
+  read_state "${1}"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$(date +%Y-%m-%dT%H:%M:%S)" "${1}" "${ST_CYCLE}" "${ST_PHASE}" "${ST_LEVEL}" \
+    "${CPU_PCT}" "${RAM_PCT}" "${DISK_PCT}" "$(( NET_BPS / 1000000 ))" "${TEMP_C}" \
+    >> "${report_path}"
+}
+
+show_report() {
+  local file="${1}" rows view
+  if [[ ! -r ${file} ]]; then
+    gum style --foreground "${C_RED}" "  ${I_ALERT}  Aucun rapport"
+    return 1
+  fi
+  rows=$(awk 'END{print NR}' "${file}")
+  if (( rows < 3 )); then
+    gum pager < "${file}"
+    return 0
+  fi
+  # vue compacte : heure seule, en-têtes courts, tableau défilable dans gum
+  view=$(mktemp "${TMPDIR:-/tmp}/omastress-view.XXXXXX.csv")
+  awk -F, 'NR == 1 {
+             print "heure,mod,cyc,phase,niv,cpu,ram,disq,net,degC"
+             next
+           }
+           { sub(/^.*T/, "", $1); print }' OFS=, "${file}" > "${view}"
+  if command -v less > /dev/null 2>&1; then
+    gum table --file "${view}" --print --border rounded --separator "," \
+      --padding "0 0" --widths 8,4,3,11,4,4,4,5,5,4 \
+      --border.foreground "${C_ACCENT}" --header.foreground "${C_CYAN}" \
+      | less -SR
+  else
+    gum table --file "${view}" --print --border rounded --separator "," \
+      --padding "0 0" --widths 8,4,3,11,4,4,4,5,5,4 \
+      --border.foreground "${C_ACCENT}" --header.foreground "${C_CYAN}" \
+      | gum pager
+  fi
+  rm -f "${view}"
+  gum style --foreground "${C_MUTED}" \
+    "  niv = palier cible · cpu/ram/disq en % · net en Mbit/s · degC en °C"
+  gum style --foreground "${C_MUTED}" --padding "0 0 0 3" "${I_FILE}  ${file}"
+}
+
+#--- Session ---------------------------------------------------------------------------------------------------------------------
+stop_workers() {
+  local mod f pid
+  [[ -n ${RUNDIR} ]] && touch "${RUNDIR}/stop"
+  for mod in "${!WPID[@]}"; do
+    kill -TERM "${WPID[${mod}]}" 2>/dev/null || true
+  done
+  sleep 0.4
+  for mod in "${!WPID[@]}"; do
+    kill -KILL "${WPID[${mod}]}" 2>/dev/null || true
+  done
+  if [[ -n ${RUNDIR} ]]; then
+    shopt -s nullglob
+    for f in "${RUNDIR}"/*.toolpid; do
+      pid=$(< "${f}")
+      kill_tree "${pid}"
+      rm -f "${f}"
+    done
+    shopt -u nullglob
+  fi
+  stop_net_server
+}
+
+session_summary() {
+  local elapsed="${1}" rows peak_cpu peak_ram peak_temp
+  printf '\n'
+  gum style --foreground "${C_GREEN}" --bold "  ${I_CHECK}  Session terminée en $(human_duration "${elapsed}")"
+  if [[ -n ${report_path} && -s ${report_path} ]]; then
+    rows=$(awk 'END{print NR-1}' "${report_path}")
+    peak_cpu=$(awk -F, 'NR>1 && $6+0>m {m=$6+0} END{printf "%d", m}' "${report_path}")
+    peak_ram=$(awk -F, 'NR>1 && $7+0>m {m=$7+0} END{printf "%d", m}' "${report_path}")
+    peak_temp=$(awk -F, 'NR>1 && $10+0>m {m=$10+0} END{printf "%d", m}' "${report_path}")
+    gum style --foreground "${C_MUTED}" \
+      "  ${I_TABLE}  ${rows} $(plural "${rows}" échantillon échantillons) · pic CPU ${peak_cpu} % · pic RAM ${peak_ram} % · pic ${peak_temp} °C"
+    gum style --foreground "${C_MUTED}" "  ${I_FILE}  ${report_path}"
+  fi
+  if (( NET_USED )); then
+    local net_txt note note_max
+    net_txt="  ${I_NET}  $(net_mode_label "${NET_MODE_EFF}") · interface ${NET_DEV}"
+    gum style --foreground "${C_MUTED}" "${net_txt}"
+    if [[ -n ${NET_NOTE} ]]; then
+      note_max=$(( $(term_width) - 10 ))
+      note="${NET_NOTE}"
+      if (( ${#note} > note_max )); then note="${note:0:note_max-1}…"; fi
+      gum style --foreground "${C_MUTED}" "       ${note}"
+    fi
+  fi
+}
+
+run_session() { # $1...=modules
+  local -a mods=("$@")
+  local mod key elapsed start now poll abort_t alert_t alive abort_msg=""
+  poll=$(cfg_get g_poll)
+  abort_t=$(cfg_get g_temp_abort)
+
+  RUNDIR=$(mktemp -d "${TMPDIR:-/tmp}/omastress.XXXXXX")
+  WPID=()
+  # shellcheck disable=SC2034
+  CPU_HIST=() RAM_HIST=() DISK_HIST=() NET_HIST=() TEMP_HIST=()
+  report_open
+  if [[ " ${mods[*]} " == *" net "* ]]; then
+    NET_USED=1
+    net_prepare
+  else
+    NET_USED=0
+    NET_MODE_EFF=$(cfg_get net_mode)
+  fi
+  sample_init
+
+  for mod in "${mods[@]}"; do
+    worker_main "${mod}" &
+    WPID["${mod}"]=$!
+  done
+
+  start=$(date +%s)
+  INTERRUPT=0
+  tput civis 2>/dev/null || true
+  printf '\033[2J'
+  while true; do
+    now=$(date +%s)
+    elapsed=$(( now - start ))
+    sample_all
+    for mod in "${mods[@]}"; do
+      report_line "${mod}" 2>/dev/null || true
+    done
+    render_dashboard "${elapsed}" "${mods[@]}"
+
+    # l'alerte thermique s'affiche dans l'en-tête : aucune ligne ajoutée,
+    # donc aucun décalage de l'interface pendant la session
+    if (( TEMP_C >= abort_t )); then
+      abort_msg="Arrêt thermique : ${TEMP_C} °C (seuil ${abort_t} °C)"
+      break
+    fi
+
+    read -r -s -n 1 -t "${poll}" key || key=""
+    case "${key}" in
+      q | Q | x | X) break ;;
+      *) ;;
+    esac
+    (( INTERRUPT )) && break
+
+    alive=0
+    for mod in "${mods[@]}"; do
+      if kill -0 "${WPID[${mod}]}" 2>/dev/null; then
+        alive=$(( alive + 1 ))
+      fi
+    done
+    (( alive == 0 )) && break
+  done
+
+  tput cnorm 2>/dev/null || true
+  stop_workers
+  for mod in "${mods[@]}"; do
+    wait "${WPID[${mod}]}" 2>/dev/null || true
+  done
+
+  # on laisse le dernier tableau de bord à l'écran, avec les graphes
+  elapsed=$(( $(date +%s) - start ))
+  render_dashboard "${elapsed}" "${mods[@]}"
+  if [[ -n ${abort_msg} ]]; then
+    printf '  %s%s  %s%s\n' "$(ansi_fg "${C_RED}")" "${I_ALERT}" "${abort_msg}" $'\033[0m'
+  fi
+  printf '  %s%s  Entrée pour quitter%s\n' "$(ansi_fg "${C_ACCENT}")" "${I_STOP}" $'\033[0m'
+  read -r _ || true
+  printf '\033[2J\033[H'
+  session_summary "${elapsed}"
+  printf '\n'
+  if gum confirm --affirmative "  ${I_CHART}  Ouvrir le rapport" --negative "  ${I_LEFT}  Menu" \
+    "  Rapport de session ?"; then
+    show_report "${report_path}"
+  fi
+}
+
+#--- Menus -----------------------------------------------------------------------------------------------------------------------
+summary_line() { # $1=module  -> colonnes de largeur fixe
+  local mod="${1}" max steps cycles dwell extra="" col_max col_steps col_cycles
+  max=$(cfg_get "${mod}_max")
+  steps=$(cfg_get "${mod}_steps")
+  cycles=$(cfg_get "${mod}_cycles")
+  dwell=$(cfg_get "${mod}_dwell")
+  if (( $(term_width) >= 72 )); then
+    case "${mod}" in
+      disk) extra="  → $(cfg_get disk_target)" ;;
+      net) extra="  → $(net_mode_label "$(cfg_get net_mode)")" ;;
+      *) ;;
+    esac
+  fi
+  local max_txt
+  max_txt=$(fmt_limit "${mod}" "${max}")
+  printf -v col_max '%4s %-6s' "${max_txt% *}" "${max_txt##* }"
+  printf -v col_steps '%2s %-10s' "${steps}" "$(plural "${steps}" 'palier ' 'paliers')"
+  printf -v col_cycles '%2s %-8s' "${cycles}" "$(plural "${cycles}" 'cycle ' 'cycles')"
+  printf '%s  %-4s %s %s %s %3s s%s' \
+    "$(icon_of "${mod}")" "$(label_of "${mod}")" "${col_max}" \
+    "${col_steps}" "${col_cycles}" "${dwell}" "${extra}"
+}
+
+module_menu() { # $1=module
+  local mod="${1}" choice dur
+  while true; do
+    clear
+    build_phases "${mod}"
+    dur=$(( $(phase_total) * $(cfg_get "${mod}_cycles") ))
+    header "$(icon_of "${mod}")  Stress $(label_of "${mod}")" \
+      "rampe 0 → $(cfg_get "${mod}_max") $(unit_of "${mod}") · $(cfg_get "${mod}_cycles") $(plural "$(cfg_get "${mod}_cycles")" cycle cycles)"
+    style_block "${C_MUTED}" \
+      "   $(summary_line "${mod}")" \
+      "      ${I_UP}  montée en $(cfg_get "${mod}_steps") $(plural "$(cfg_get "${mod}_steps")" palier paliers) de $(cfg_get "${mod}_dwell") s" \
+      "      ${I_DOWN}  maintien $(cfg_get g_hold) s au maximum, puis descente" \
+      "      ${I_TIMER} durée estimée : $(human_duration "${dur}")"
+    echo
+    choice=$(gum choose --height 5 --header "Action" \
+      "${I_PLAY}  Lancer" \
+      "${I_COG}  Régler ce module" \
+      "${I_REFRESH}  Retour") || return 0
+    case "${choice}" in
+      *Lancer) run_session "${mod}" ;;
+      *Régler*) module_settings "${mod}" ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+module_settings() { # $1=module
+  local mod="${1}" max_label max_step choice path host url
+  case "${mod}" in
+    cpu) max_label="Charge CPU max (%)" max_step=100 ;;
+    ram) max_label="RAM à allouer max (% de la RAM totale)" max_step=120 ;;
+    disk) max_label="Débit disque max (Mo/s)" max_step=8000 ;;
+    net) max_label="Débit réseau max (Mbit/s)" max_step=100000 ;;
+    *) return 0 ;;
+  esac
+  clear
+  header "${I_TUNE}  Réglages $(label_of "${mod}")" "chaque valeur est enregistrée"
+  ask_int "${mod}_max" "${max_label}" 1 "${max_step}" || return 0
+  if [[ ${mod} == ram ]] && (( $(cfg_get ram_max) > 50 )); then
+    local msg="Plus de 50 % de RAM : le système peut swapper. Continuer ?"
+    if (( $(cfg_get ram_max) > 100 )); then
+      msg="Plus de 100 % : débordement sur le swap, risque de gel prolongé. Continuer ?"
+    fi
+    if ! gum confirm --affirmative "Continuer" --negative "Ramener à 50 %" "${msg}"; then
+      cfg_set ram_max 50
+      gum style --foreground "${C_YELLOW}" "  ${I_ALERT}  ramené à 50 %"
+    fi
+  fi
+  ask_int "${mod}_steps" "Nombre de paliers" 1 20 || return 0
+  ask_int "${mod}_cycles" "Nombre de cycles" 1 20 || return 0
+  ask_int "${mod}_dwell" "Durée d'un palier (s)" 2 600 || return 0
+
+  case "${mod}" in
+    disk)
+      choice=$(gum choose --height 5 --header "Cible disque" \
+        "${I_FILE}  Fichier réel (${DISK_PROBE})" \
+        "${I_RAM}  Mémoire tmpfs /dev/shm (aucune usure)" \
+        "${I_TUNE}  Autre chemin…") || return 0
+      case "${choice}" in
+        *Fichier*) cfg_set disk_target file ;;
+        *Mémoire*) cfg_set disk_target tmpfs ;;
+        *)
+          path=$(gum input --header "Chemin du fichier ou du périphérique" --prompt "➜ " \
+            --value "$(cfg_get disk_target)") || return 0
+          [[ -n ${path} ]] && cfg_set disk_target "${path}"
+          ;;
+      esac
+      ;;
+    net)
+      choice=$(gum choose --height 6 --header "Mode réseau" \
+        "${I_NET}  Local — boucle locale, aucun réseau sollicité" \
+        "${I_NET}  Passerelle — iperf3 sur la box, repli local" \
+        "${I_NET}  Distant — serveur iperf3 à fournir" \
+        "${I_NET}  Internet — téléchargement saturant, sans serveur") || return 0
+      case "${choice}" in
+        *Local*)
+          cfg_set net_mode local
+          cfg_set net_host 127.0.0.1
+          ;;
+        *Passerelle*)
+          cfg_set net_mode gateway
+          ask_int net_port "Port iperf3 de la passerelle" 1 65535 || true
+          ;;
+        *Distant*)
+          host=$(gum input --header "Hôte iperf3 (IP ou nom)" --prompt "➜ " \
+            --value "$(cfg_get net_host)") || return 0
+          [[ -n ${host} ]] && cfg_set net_host "${host}"
+          cfg_set net_mode remote
+          ask_int net_port "Port iperf3 distant" 1 65535 || true
+          ;;
+        *Internet*)
+          url=$(gum input --header "URL du fichier de test (gros fichier conseillé)" --prompt "➜ " \
+            --value "$(cfg_get net_url)") || return 0
+          [[ -n ${url} ]] && cfg_set net_url "${url}"
+          cfg_set net_mode http
+          ;;
+        *) return 0 ;;
+      esac
+      ;;
+    *) ;;
+  esac
+  cfg_save
+  gum style --foreground "${C_GREEN}" "  ${I_CHECK}  Réglages enregistrés"
+  sleep 0.6
+}
+
+preset_menu() {
+  local choice mod
+  choice=$(gum choose --height 5 --header "Préréglage appliqué aux 4 modules" \
+    "${I_SPEED}  Léger — 5 paliers · 1 cycle · 5 s" \
+    "${I_SPEED}  Standard — 5 paliers · 2 cycles · 10 s" \
+    "${I_FIRE}  Agressif — 6 paliers · 3 cycles · 20 s") || return 0
+  case "${choice}" in
+    *Léger*)
+      for mod in cpu ram disk net; do
+        cfg_set "${mod}_steps" 5
+        cfg_set "${mod}_cycles" 1
+        cfg_set "${mod}_dwell" 5
+      done
+      cfg_set g_hold 10
+      ;;
+    *Standard*)
+      for mod in cpu ram disk net; do
+        cfg_set "${mod}_steps" 5
+        cfg_set "${mod}_cycles" 2
+        cfg_set "${mod}_dwell" 10
+      done
+      cfg_set g_hold 20
+      ;;
+    *Agressif*)
+      for mod in cpu ram disk net; do
+        cfg_set "${mod}_steps" 6
+        cfg_set "${mod}_cycles" 3
+        cfg_set "${mod}_dwell" 20
+      done
+      cfg_set g_hold 40
+      ;;
+    *) return 0 ;;
+  esac
+  cfg_save
+  gum style --foreground "${C_GREEN}" "  ${I_CHECK}  Préréglage appliqué"
+  sleep 0.7
+}
+
+global_settings() {
+  local choice
+  while true; do
+    clear
+    header "${I_COG}  Réglages globaux" "communs à tous les modules"
+    local l_hold l_poll l_temp l_dir dir_txt max_dir
+    dir_txt=${REPORT_DIR/#${HOME}/\~}
+    max_dir=$(( $(term_width) - 34 ))
+    if (( ${#dir_txt} > max_dir )); then dir_txt="${dir_txt:0:max_dir-1}…"; fi
+    printf -v l_hold '   %s  %-22s %s' "${I_TIMER}" "maintien au maximum" "$(cfg_get g_hold) s"
+    printf -v l_poll '   %s  %-22s %s' "${I_LIST}" "intervalle du rapport" "$(cfg_get g_poll) s"
+    printf -v l_temp '   %s  %-22s alerte %s °C · arrêt %s °C' "${I_THERMO}" "seuils thermiques" \
+      "$(cfg_get g_temp_alert)" "$(cfg_get g_temp_abort)"
+    printf -v l_dir '   %s  %-22s %s' "${I_FILE}" "rapports" "${dir_txt}"
+    style_block "${C_MUTED}" "${l_hold}" "${l_poll}" "${l_temp}" "${l_dir}"
+    echo
+    choice=$(gum choose --height 7 --header "Que régler ?" \
+      "${I_TIMER}  Maintien au maximum" \
+      "${I_LIST}  Intervalle du rapport" \
+      "${I_THERMO}  Seuils thermiques" \
+      "${I_TUNE}  Préréglages rapides" \
+      "${I_REFRESH}  Retour") || return 0
+    case "${choice}" in
+      *Maintien*) ask_int g_hold "Maintien au maximum (s)" 0 3600 || true ;;
+      *Intervalle*) ask_int g_poll "Intervalle du rapport (s)" 1 10 || true ;;
+      *Seuils*)
+        ask_int g_temp_alert "Alerte thermique (°C)" 50 105 || true
+        ask_int g_temp_abort "Arrêt thermique (°C)" 60 110 || true
+        if (( $(cfg_get g_temp_abort) <= $(cfg_get g_temp_alert) )); then
+          cfg_set g_temp_abort $(( $(cfg_get g_temp_alert) + 5 ))
+          gum style --foreground "${C_YELLOW}" "  ${I_ALERT}  arrêt relevé à $(cfg_get g_temp_abort) °C"
+        fi
+        ;;
+      *Préréglages*) preset_menu ;;
+      *) return 0 ;;
+    esac
+    cfg_save
+  done
+}
+
+multi_session() { # $1="all" pour tout présélectionner
+  local -A on=([cpu]=0 [disk]=0 [net]=0 [ram]=0)
+  local -a order=(cpu disk net ram) opts=() picked=()
+  local choice mod dur mark count preset="${1:-}"
+  if [[ ${preset} == all ]]; then
+    on=([cpu]=1 [disk]=1 [net]=1 [ram]=1)
+  fi
+
+  while true; do
+    clear
+    count=0
+    opts=()
+    for mod in "${order[@]}"; do
+      if (( on[${mod}] )); then
+        mark="${I_CHECK}"
+        count=$(( count + 1 ))
+      else
+        mark="${I_LEFT}"
+      fi
+      opts+=("${mark}  $(summary_line "${mod}")")
+    done
+    opts+=("${I_PLAY}  Valider la sélection" "${I_LEFT}  Retour")
+    if [[ ${preset} == all ]]; then
+      header "${I_PLAY}  Session complète" "les 4 modules sont déjà cochés — décocher si besoin"
+    else
+      header "${I_PLAY}  Session multi-modules" \
+        "Entrée pour cocher ou décocher un module"
+    fi
+    style_block "${C_MUTED}" \
+      "   Chaque module garde ses propres paliers et cycles." \
+      "   ${I_CHECK} = sélectionné · ${I_LEFT} = non sélectionné · ${count} $(plural "${count}" module modules) $(plural "${count}" coché cochés)"
+    echo
+    choice=$(gum choose --height 8 --header "Choisir" "${opts[@]}") || return 0
+    case "${choice}" in
+      *CPU*) on[cpu]=$(( 1 - on[cpu] )) ;;
+      *DISK*) on[disk]=$(( 1 - on[disk] )) ;;
+      *NET*) on[net]=$(( 1 - on[net] )) ;;
+      *RAM*) on[ram]=$(( 1 - on[ram] )) ;;
+      *Valider*) (( count > 0 )) && break ;;
+      *) return 0 ;;
+    esac
+  done
+
+  for mod in "${order[@]}"; do
+    (( on[${mod}] )) && picked+=("${mod}")
+  done
+
+  clear
+  header "${I_PLAY}  Récapitulatif" "${#picked[@]} $(plural "${#picked[@]}" module modules) $(plural "${#picked[@]}" sélectionné sélectionnés)"
+  for mod in "${picked[@]}"; do
+    build_phases "${mod}"
+    dur=$(( $(phase_total) * $(cfg_get "${mod}_cycles") ))
+    gum style --foreground "$(color_of "${mod}")" --padding "0 0 0 3" \
+      "$(summary_line "${mod}")"
+    gum style --foreground "${C_MUTED}" --padding "0 0 0 5" \
+      "  ${I_TIMER}  durée estimée $(human_duration "${dur}") · pic $(fmt_limit "${mod}" "$(cfg_get "${mod}_max")")"
+  done
+  echo
+  if [[ " ${picked[*]} " == *" ram "* ]] && (( $(cfg_get ram_max) > 50 )); then
+    if (( $(cfg_get ram_max) > 100 )); then
+      gum style --foreground "${C_RED}" --padding "0 0 0 3" \
+        "${I_ALERT}  RAM > 100 % : débordement sur le swap, risque de gel prolongé."
+    else
+      gum style --foreground "${C_RED}" --padding "0 0 0 3" \
+        "${I_ALERT}  RAM > 50 % alloués : le système peut swapper ou figer."
+    fi
+  fi
+  gum style --foreground "${C_MUTED}" --padding "0 0 0 3" \
+    "${I_STOP}  Pendant la session, « q » arrête tout immédiatement."
+  echo
+  if ! gum confirm --affirmative "Lancer" --negative "Annuler" "Démarrer la session ?"; then
+    return 0
+  fi
+  run_session "${picked[@]}"
+}
+
+reports_menu() {
+  local -a files=()
+  local choice
+  shopt -s nullglob
+  files=("${REPORT_DIR}"/*.csv)
+  shopt -u nullglob
+  if (( ${#files[@]} == 0 )); then
+    gum style --foreground "${C_MUTED}" --padding "0 0 0 3" \
+      "${I_FILE}  Aucun rapport dans ${REPORT_DIR}"
+    pause_key
+    return 0
+  fi
+  clear
+  header "${I_CHART}  Rapports de session" "${#files[@]} $(plural "${#files[@]}" fichier fichiers)"
+  choice=$(printf '%s\n' "${files[@]}" | xargs -n 1 basename | gum choose --height 12 \
+    --header "Ouvrir un rapport") || return 0
+  show_report "${REPORT_DIR}/${choice}"
+}
+
+#--- Menu principal --------------------------------------------------------------------------------------------------------------
+check_deps() {
+  local -a missing=()
+  local bin
+  for bin in gum stress-ng fio iperf3 curl; do
+    command -v "${bin}" > /dev/null 2>&1 || missing+=("${bin}")
+  done
+  (( ${#missing[@]} == 0 )) && return 0
+  gum style --foreground "${C_RED}" --bold "  ${I_ALERT}  Outils manquants : ${missing[*]}"
+  gum style --foreground "${C_MUTED}" "  Installer : pkexec pacman -S --needed ${missing[*]}"
+  return 1
+}
+
+main_menu() {
+  local choice ram_gb
+  ram_gb=$(human_bytes "$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) * 1024 ))")
+  while true; do
+    clear
+    header "${I_SPEED}  OMASTRESS" "CPU · DISK · NET · RAM · paliers & cycles"
+    style_block "${C_MUTED}" \
+      "   $(summary_line cpu)" \
+      "   $(summary_line disk)" \
+      "   $(summary_line net)" \
+      "   $(summary_line ram)" \
+      "" \
+      "   ${I_THERMO}  alerte $(cfg_get g_temp_alert) °C · arrêt $(cfg_get g_temp_abort) °C$( (( $(term_width) >= 64 )) && printf ' · %s cœurs · %s RAM' "$(nproc)" "${ram_gb}")" \
+      "   ${I_FILE}  ${CONFIG_FILE}"
+    echo
+    choice=$(gum choose --height 13 --header "Menu" \
+      "${I_PLAY}  Session complète (4 modules)" \
+      "${I_LIST}  Choisir les modules…" \
+      "${I_CPU}  CPU seul" \
+      "${I_DISK}  DISK seul" \
+      "${I_NET}  NET seul" \
+      "${I_RAM}  RAM seul" \
+      "${I_COG}  Réglages" \
+      "${I_CHART}  Rapports" \
+      "${I_EXIT}  Quitter") || return 1
+    case "${choice}" in
+      *Session\ complète*) multi_session all ;;
+      *Choisir\ les\ modules*) multi_session ;;
+      *"CPU seul") module_menu cpu ;;
+      *"DISK seul") module_menu disk ;;
+      *"NET seul") module_menu net ;;
+      *"RAM seul") module_menu ram ;;
+      *Réglages*) global_settings ;;
+      *Rapports*) reports_menu ;;
+      *Quitter*) return 1 ;;
+      *) ;;
+    esac
+  done
+}
+
+#--- CLI -------------------------------------------------------------------------------------------------------------------------
+usage() {
+  cat <<EOF
+${SCRIPT_NAME} ${SCRIPT_VERSION} — stress CPU / DISK / NET / RAM (interface gum)
+
+Usage : ${SCRIPT_NAME} [options]
+
+  --demo        simule les modules (aucune charge réelle, durées courtes)
+  --settings    ouvre directement les réglages
+  --help        affiche cette aide
+
+Configuration : ${CONFIG_FILE}
+Rapports      : ${REPORT_DIR}
+EOF
+}
+
+migrate_old_paths() { # reprend config et rapports de l'ancien nom
+  local old_cfg="${XDG_CONFIG_HOME:-${HOME}/.config}/stress4"
+  local old_state="${XDG_STATE_HOME:-${HOME}/.local/state}/stress4"
+  [[ -d ${old_cfg} && ! -e ${CONFIG_DIR} ]] && cp -r "${old_cfg}" "${CONFIG_DIR}" 2>/dev/null || true
+  [[ -d ${old_state} && ! -e ${STATE_DIR} ]] && cp -r "${old_state}" "${STATE_DIR}" 2>/dev/null || true
+  return 0
+}
+
+cli() {
+  local arg mod
+  for arg in "$@"; do
+    case "${arg}" in
+      --demo) DEMO=1 ;;
+      --settings) CLI_SETTINGS=1 ;;
+      --help | -h) usage; exit 0 ;;
+      *)
+        printf 'Option inconnue : %s\n' "${arg}" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  if ! command -v gum > /dev/null 2>&1; then
+    printf 'gum est requis : pkexec pacman -S --needed gum\n' >&2
+    exit 1
+  fi
+  theme_load
+  init_braille
+  BOX_W=$(box_width)
+  cfg_defaults
+  migrate_old_paths
+  cfg_load
+  NET_MODE_EFF=$(cfg_get net_mode)
+  trap on_exit EXIT
+  trap 'INTERRUPT=1' INT TERM
+
+  if (( DEMO == 0 )) && ! check_deps; then
+    exit 1
+  fi
+
+  if (( DEMO )); then
+    cfg_set g_hold 3
+    cfg_set g_poll 1
+    for mod in cpu ram disk net; do
+      cfg_set "${mod}_dwell" 2
+      cfg_set "${mod}_steps" 3
+      cfg_set "${mod}_cycles" 1
+    done
+  fi
+
+  mkdir -p "${STATE_DIR}" "${REPORT_DIR}"
+
+  if (( CLI_SETTINGS )); then
+    global_settings
+  fi
+  main_menu
+  clear
+  gum style --foreground "${C_ACCENT}" --bold "  ${I_CHECK}  À bientôt."
+  exit 0
+}
+
+cli "$@"

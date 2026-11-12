@@ -1,0 +1,550 @@
+#!/usr/bin/env bash
+# shellcheck enable=all
+#
+# shmem-parts — répartit la mémoire « Shmem » de /proc/meminfo par origine.
+#
+# Cible : Asahi Linux / Apple Silicon, où les buffers GPU sont alloués via
+# shmemfs et apparaissent donc dans Shmem (et Unevictable une fois épinglés).
+# Le script reste utilisable ailleurs : les sections absentes sont ignorées.
+#
+# Usage : shmem-parts [-n|--no-processes] [-h|--help]
+
+set -euo pipefail
+# UTF-8 pour que ${#label} compte des caractères (alignement des colonnes)
+# et non des octets : « é » pèse 2 octets mais 1 colonne.
+export LC_ALL=C.UTF-8
+
+readonly PROG=${0##*/}
+readonly TOP_PROCS=8
+readonly LABEL_W=38
+readonly BAR_W=20
+
+# --- Couleurs ---------------------------------------------------------------
+# Désactivées hors terminal ou si NO_COLOR est défini, pour rester utilisable
+# dans un pipe (grep, less, redirection).
+BOLD='' DIM='' RESET=''
+C_ACCENT='' C_TMPFS='' C_SYSV='' C_MEMFD='' C_GPU='' C_OTHER='' C_WARN=''
+term_colors=8
+if command -v tput >/dev/null 2>&1 && [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+    term_colors=$(tput colors 2>/dev/null) || term_colors=8
+    BOLD=$(tput bold)
+    DIM=$(tput dim)
+    RESET=$(tput sgr0)
+    if (( ${term_colors:-8} >= 256 )); then
+        C_ACCENT=$(tput setaf 45)     # cyan clair
+        C_TMPFS=$(tput setaf 45)
+        C_SYSV=$(tput setaf 141)      # violet
+        C_MEMFD=$(tput setaf 114)     # vert
+        C_GPU=$(tput setaf 214)       # orange
+        C_OTHER=$(tput setaf 244)     # gris
+        C_WARN=$(tput setaf 214)
+    else
+        C_ACCENT=$(tput setaf 6)
+        C_TMPFS=$(tput setaf 6)
+        C_SYSV=$(tput setaf 5)
+        C_MEMFD=$(tput setaf 2)
+        C_GPU=$(tput setaf 3)
+        C_OTHER=$(tput setaf 8)
+        C_WARN=$(tput setaf 3)
+    fi
+fi
+
+# --- Spinner ----------------------------------------------------------------
+# Affiché sur stderr uniquement : la sortie standard reste propre dans un pipe.
+SPINNER_PID=''
+EL=''
+if command -v tput >/dev/null 2>&1; then
+    EL=$(tput el 2>/dev/null) || EL=''
+fi
+readonly -a SPINNER_FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+
+start_spinner() {
+    local msg="$1"
+    SPINNER_PID=''
+    [[ -t 2 ]] || return 0
+    (
+        local i=0 ticks=0 frame
+        while :; do
+            frame=${SPINNER_FRAMES[i]}
+            printf '\r  %s%s%s %s %s%d.%ds%s' \
+                "${C_ACCENT}" "${frame}" "${RESET}" "${msg}" \
+                "${DIM}" "$(( ticks / 10 ))" "$(( ticks % 10 ))" "${RESET}" >&2
+            i=$(( (i + 1) % ${#SPINNER_FRAMES[@]} ))
+            ticks=$(( ticks + 1 ))
+            sleep 0.1
+        done
+    ) &
+    SPINNER_PID=$!
+}
+
+stop_spinner() {
+    [[ -n "${SPINNER_PID}" ]] || return 0
+    kill "${SPINNER_PID}" 2>/dev/null || true
+    wait "${SPINNER_PID}" 2>/dev/null || true
+    SPINNER_PID=''
+    if [[ -n "${EL}" ]]; then
+        printf '\r%s' "${EL}" >&2
+    fi
+    return 0
+}
+
+usage() {
+    cat <<EOF
+Usage : ${PROG} [options]
+
+Répartit la mémoire Shmem de /proc/meminfo :
+  tmpfs par montage, segments shm SysV, memfd, mémoire GPU (asahi)
+  et résidu non attribuable (noyau, drivers, autres).
+
+Options :
+  -n, --no-processes   ne pas lister les processus consommateurs
+  -h, --help           afficher cette aide
+
+La couleur et les barres s'adaptent à la sortie : NO_COLOR=1 ou un pipe
+désactive les couleurs, le texte reste aligné et lisible tel quel.
+EOF
+}
+
+# --- Mise en forme ----------------------------------------------------------
+
+# Valeur d'un champ de /proc/meminfo, en kiB (0 si absent).
+meminfo_kib() {
+    local key="$1" value
+    value=$(awk -v k="${key}" '$1 == k":" { print $2; exit }' /proc/meminfo)
+    printf '%s\n' "${value:-0}"
+}
+
+# kiB -> "1234.5"
+fmt_mib() {
+    local kib="$1"
+    printf '%d.%d' "$(( kib / 1024 ))" "$(( (kib % 1024) * 10 / 1024 ))"
+}
+
+# kiB -> "456 KiB", "12.3 MiB" ou "1.33 GiB" selon l'ordre de grandeur.
+fmt_human() {
+    local kib="$1" num
+    if (( kib < 1024 )); then
+        printf '%d KiB' "${kib}"
+    elif (( kib < 1048576 )); then
+        num=$(fmt_mib "${kib}")
+        printf '%s MiB' "${num}"
+    else
+        printf '%d.%02d GiB' \
+            "$(( kib / 1048576 ))" \
+            "$(( (kib % 1048576) * 100 / 1048576 ))"
+    fi
+}
+
+# part/whole en kiB -> "42.7%"
+fmt_pct() {
+    local part="$1" whole="$2" permille
+    if (( whole <= 0 )); then
+        printf '  -  '
+        return
+    fi
+    permille=$(( part * 1000 / whole ))
+    printf '%d.%d%%' "$(( permille / 10 ))" "$(( permille % 10 ))"
+}
+
+# Complète un libellé avec des espaces jusqu'à `width` caractères.
+pad_label() {
+    local label="$1" width="$2" pad
+    pad=$(( width - ${#label} ))
+    printf '%s' "${label}"
+    if (( pad > 0 )); then
+        printf '%*s' "${pad}" ''
+    fi
+}
+
+# Aligne `text` à droite sur `width` caractères. Ne pas utiliser %<n>s de
+# printf : sa largeur se compte en octets, et « — » en pèse 3 pour 1 colonne.
+pad_right() {
+    local text="$1" width="$2" pad
+    pad=$(( width - ${#text} ))
+    if (( pad > 0 )); then
+        printf '%*s' "${pad}" ''
+    fi
+    printf '%s' "${text}"
+}
+
+# Texte colorié (couleur en $1, texte en $2). Ne fait rien si les couleurs
+# sont désactivées : les variables valent alors la chaîne vide.
+paint() {
+    printf '%s%s%s' "$1" "$2" "${RESET}"
+}
+
+# Barre proportionnelle `kib`/`total` sur `cols` cellules, à la couleur `color`.
+bar() {
+    local kib="$1" total="$2" cols="$3" color="$4"
+    local filled=0 i on='' off=''
+    if (( kib > 0 )); then
+        if (( total > 0 )); then
+            filled=$(( kib * cols / total ))
+        fi
+        # Un minimum d'une cellule pour qu'une petite part reste visible.
+        if (( filled < 1 )); then
+            filled=1
+        elif (( filled > cols )); then
+            filled=${cols}
+        fi
+    fi
+    for (( i = 0; i < filled; i++ )); do on+='█'; done
+    for (( i = filled; i < cols; i++ )); do off+='░'; done
+    printf '%s%s%s%s%s' "${color}" "${on}" "${DIM}" "${off}" "${RESET}"
+}
+
+# Titre de section : barre d'accent + libellé en gras.
+section() {
+    printf '\n%s▌%s %s%s%s\n' "${C_ACCENT}" "${RESET}" "${BOLD}" "$1" "${RESET}"
+}
+
+# Ligne « libellé ... valeur » avec note atténuée optionnelle.
+info_row() {
+    local label="$1" kib="$2" note="${3:-}" padded human
+    padded=$(pad_label "${label}" "${LABEL_W}")
+    human=$(fmt_human "${kib}")
+    human=$(pad_right "${human}" 10)
+    printf '  %s %s' "${padded}" "${human}"
+    if [[ -n "${note}" ]]; then
+        printf '  %s%s%s' "${DIM}" "${note}" "${RESET}"
+    fi
+    printf '\n'
+}
+
+# Ligne de répartition : libellé colorié, valeur, part, barre.
+share_row() {
+    local label="$1" kib="$2" total="$3" color="$4" padded human pct graph
+    padded=$(pad_label "${label}" "${LABEL_W}")
+    if (( kib == 0 )); then
+        human='—'
+    else
+        human=$(fmt_human "${kib}")
+    fi
+    human=$(pad_right "${human}" 10)
+    pct=$(fmt_pct "${kib}" "${total}")
+    graph=$(bar "${kib}" "${total}" "${BAR_W}" "${color}")
+    printf '  %s%s%s %s %6s  %s\n' \
+        "${color}" "${padded}" "${RESET}" "${human}" "${pct}" "${graph}"
+}
+
+# Ligne de détail : libellé long, valeur, barre relative à `max`.
+detail_row() {
+    local label="$1" kib="$2" max="$3" color="$4" width="$5" padded human graph
+    padded=$(pad_label "${label}" "${width}")
+    human=$(fmt_human "${kib}")
+    human=$(pad_right "${human}" 10)
+    graph=$(bar "${kib}" "${max}" "${BAR_W}" "${color}")
+    printf '  %s%s%s %s  %s\n' \
+        "${color}" "${padded}" "${RESET}" "${human}" "${graph}"
+}
+
+# --- Collecte ---------------------------------------------------------------
+
+# Plus gros consommateurs de Shmem, vus par processus (smaps_rollup).
+# Attention : cette vue recoupe les catégories ci-dessous (une page tmpfs
+# ou memfd est aussi comptée dans le processus qui la mappe).
+# La collecte est séparée de l'affichage : elle est lente (lecture de tous
+# les /proc/PID/smaps_rollup) et se fait donc sous spinner, à la fin.
+TOPPROC_ROWS=()
+
+collect_top_processes() {
+    local -a files=()
+    local f kib pid
+    for f in /proc/[0-9]*/smaps_rollup; do
+        [[ -r "${f}" && -O "${f}" ]] && files+=("${f}")
+    done
+    # /proc/PID/smaps_rollup peut refuser la lecture (processus non dumpable,
+    # ex. pipewire) : on ignore alors ce processus.
+    for f in "${files[@]}"; do
+        kib=$(awk '/^Pss_Shmem:/ { print $2; exit }' "${f}" 2>/dev/null) || continue
+        [[ -n "${kib:-}" ]] || continue
+        (( kib > 0 )) || continue
+        pid=${f#/proc/}
+        pid=${pid%/smaps_rollup}
+        TOPPROC_ROWS+=("${kib} ${pid}")
+    done
+}
+
+print_top_processes() {
+    local limit="$1"
+    local kib pid comm human pidp sorted top
+    if (( ${#TOPPROC_ROWS[@]} == 0 )); then
+        printf '  %s(aucun processus inspectable ne mappe de shmem)%s\n' "${DIM}" "${RESET}"
+        return
+    fi
+    sorted=$(printf '%s\n' "${TOPPROC_ROWS[@]}" | sort -rn) || sorted=''
+    top=$(head -n "${limit}" <<< "${sorted}") || top=''
+    while read -r kib pid; do
+        [[ -n "${kib:-}" ]] || continue
+        comm=$(cat "/proc/${pid}/comm" 2>/dev/null) || comm='?'
+        human=$(fmt_human "${kib}")
+        human=$(pad_right "${human}" 10)
+        comm=$(pad_label "${comm}" 20)
+        comm=$(paint "${DIM}" "${comm}")
+        pidp=$(paint "${DIM}" "pid ${pid}")
+        printf '  %s %s  %s\n' "${comm}" "${human}" "${pidp}"
+    done <<< "${top}"
+}
+
+main() {
+    local no_procs=false
+    while (( $# > 0 )); do
+        case "$1" in
+            -h|--help) usage; return 0 ;;
+            -n|--no-processes) no_procs=true ;;
+            *)
+                printf 'Option inconnue : %s\n' "$1" >&2
+                usage >&2
+                return 2
+                ;;
+        esac
+        shift
+    done
+
+    # --- lecture rapide : tout ce qui ne dépend pas de /proc/PID ----------
+    local total_kib unevict_kib huge_kib pmd_kib
+    total_kib=$(meminfo_kib Shmem)
+    unevict_kib=$(meminfo_kib Unevictable)
+    huge_kib=$(meminfo_kib ShmemHugePages)
+    pmd_kib=$(meminfo_kib ShmemPmdMapped)
+
+    # --- tmpfs, montage par montage -------------------------------------
+    local -a tmpfs_targets=() tmpfs_used=()
+    local target _size used _avail i
+    while read -r target _size used _avail; do
+        [[ -n "${target:-}" ]] || continue
+        tmpfs_targets+=("${target}")
+        tmpfs_used+=("${used}")
+    done < <(findmnt -rnb -t tmpfs -o TARGET,SIZE,USED,AVAIL 2>/dev/null || true)
+
+    local tmpfs_kib=0
+    for i in "${!tmpfs_targets[@]}"; do
+        tmpfs_kib=$(( tmpfs_kib + tmpfs_used[i] / 1024 ))
+    done
+
+    # --- GPU asahi : /sys/class/drm/card*/device/gpu_memory ---------------
+    local gpu_file gpu_user_b=0 gpu_kernel_b=0 gpu_name cards=""
+    local key bytes info
+    for gpu_file in /sys/class/drm/card*/device/gpu_memory; do
+        [[ -e "${gpu_file}" ]] || continue
+        gpu_name=$(readlink -f "${gpu_file%/device/gpu_memory}")
+        gpu_name=${gpu_name##*/}
+        while read -r key bytes; do
+            case "${key}" in
+                user_committed) gpu_user_b=$(( gpu_user_b + bytes )) ;;
+                kernel_resident) gpu_kernel_b=$(( gpu_kernel_b + bytes )) ;;
+                *) ;;
+            esac
+        done < "${gpu_file}"
+        cards+="${cards:+, }${gpu_name}"
+    done
+    local gpu_user_kib=$(( gpu_user_b / 1024 ))
+    local gpu_kernel_kib=$(( gpu_kernel_b / 1024 ))
+
+    # --- shm SysV --------------------------------------------------------
+    local sysv_b=0 sysv_out
+    if command -v ipcs >/dev/null 2>&1; then
+        if sysv_out=$(ipcs -m 2>/dev/null); then
+            sysv_b=$(awk '$5 ~ /^[0-9]+$/ { sum += $5 } END { print sum + 0 }' <<< "${sysv_out}")
+        fi
+    fi
+    local sysv_kib=$(( sysv_b / 1024 ))
+
+    # --- affichage immédiat, avant le parcours (lent) de /proc ------------
+    local host kernel locked_kib in_shmem_kib outside_kib
+    host=$(uname -n)
+    kernel=$(uname -r)
+
+    # Unevictable et Shmem ne sont pas emboîtés :
+    #   Unevictable = toutes les pages sur la liste non récupérable
+    #                 (shmem épinglé + anonyme mlocké + pages noyau/pilotes)
+    #   Shmem       = toutes les pages shmem, épinglées ou non
+    # D'où : min(Shmem, Unevictable) est une borne haute du shmem épinglé,
+    # et max(0, Unevictable - Shmem) une borne basse du non-shmem épinglé.
+    locked_kib=$(meminfo_kib Mlocked)
+    if (( unevict_kib >= total_kib )); then
+        in_shmem_kib=${total_kib}
+        outside_kib=$(( unevict_kib - total_kib ))
+    else
+        in_shmem_kib=${unevict_kib}
+        outside_kib=0
+    fi
+
+    local hdr_title hdr_host hdr_sep
+    hdr_title=$(paint "${BOLD}${C_ACCENT}" 'shmem-parts')
+    hdr_sep=$(paint "${DIM}" '·')
+    hdr_host=$(paint "${DIM}" "${host} · ${kernel}")
+    printf '\n  %s %s %s\n' "${hdr_title}" "${hdr_sep}" "${hdr_host}"
+
+    local pad_total val_total
+    pad_total=$(pad_label 'Shmem (meminfo)' "${LABEL_W}")
+    pad_total=$(paint "${BOLD}" "${pad_total}")
+    val_total=$(fmt_human "${total_kib}")
+    val_total=$(paint "${BOLD}" "${val_total}")
+    section 'Totaux'
+    printf '  %s %10s\n' "${pad_total}" "${val_total}"
+    info_row 'Unevictable (toutes origines)' "${unevict_kib}"
+    info_row '  dont au plus dans Shmem' "${in_shmem_kib}" 'borne haute'
+    if (( outside_kib > 0 )); then
+        info_row '  dont au moins hors Shmem' "${outside_kib}" 'noyau/pilotes'
+    fi
+    info_row '  dont Mlocked' "${locked_kib}" 'mlock utilisateur'
+    if (( huge_kib > 0 )); then
+        info_row '  dont ShmemHugePages' "${huge_kib}"
+    fi
+    if (( pmd_kib > 0 )); then
+        info_row '  dont ShmemPmdMapped' "${pmd_kib}"
+    fi
+
+    # --- tmpfs par montage ------------------------------------------------
+    if (( ${#tmpfs_targets[@]} > 0 )); then
+        local -a mount_lines=()
+        local skipped=0 mount_kib mount_max=0
+        for i in "${!tmpfs_targets[@]}"; do
+            mount_kib=$(( tmpfs_used[i] / 1024 ))
+            if (( mount_kib == 0 )); then
+                skipped=$(( skipped + 1 ))
+                continue
+            fi
+            if (( mount_kib > mount_max )); then
+                mount_max=${mount_kib}
+            fi
+            mount_lines+=("${mount_kib}"$'\t'"${tmpfs_targets[i]}")
+        done
+        section 'tmpfs par montage'
+        if (( ${#mount_lines[@]} > 0 )); then
+            local mount_sorted
+            mount_sorted=$(printf '%s\n' "${mount_lines[@]}" | sort -rn -k1,1) || mount_sorted=''
+            while IFS=$'\t' read -r mount_kib target; do
+                detail_row "${target}" "${mount_kib}" "${mount_max}" "${C_TMPFS}" 45
+            done <<< "${mount_sorted}"
+        fi
+        if (( skipped > 0 )); then
+            printf '  %s(%d montage(s) à 0 omis)%s\n' "${DIM}" "${skipped}" "${RESET}"
+        fi
+    fi
+
+    # --- GPU asahi --------------------------------------------------------
+    if (( gpu_user_b > 0 )); then
+        local gpu_max=${gpu_user_kib}
+        if (( gpu_kernel_kib > gpu_max )); then
+            gpu_max=${gpu_kernel_kib}
+        fi
+        section "GPU asahi · ${cards}"
+        detail_row 'user_committed (clients)' "${gpu_user_kib}" "${gpu_max}" "${C_GPU}" 45
+        detail_row 'kernel_resident (noyau, hors clients)' "${gpu_kernel_kib}" "${gpu_max}" "${C_OTHER}" 45
+        printf '  %sRAM noyau : page tables GPUVM, firmware, réservé DT.%s\n' "${DIM}" "${RESET}"
+        printf '  %sSeule une partie apparaît dans Shmem, cf. « non attribué ».%s\n' "${DIM}" "${RESET}"
+    fi
+
+    # --- parcours de /proc : memfd, clients GPU, shmem par processus ------
+    # C'est la seule partie lente (lecture de tous les /proc/PID/fd puis
+    # smaps_rollup) : d'où le spinner, tout le reste étant déjà affiché.
+    start_spinner 'lecture de /proc…'
+    trap stop_spinner EXIT INT TERM
+
+    # memfd : objets anonymes partagés, dédupliqués par inode. On compte les
+    # blocs réellement alloués (st_blocks), pas st_size : un memfd ftruncaté
+    # mais non peuplé ne consomme pas de shmem.
+    local memfd_b=0 fd dev ino blocks ref pid
+    local -A memfd_seen=() dri_fds=()
+    for fd in /proc/[0-9]*/fd/*; do
+        ref=$(readlink "${fd}" 2>/dev/null) || continue
+        case "${ref}" in
+            */memfd:*)
+                info=$(stat -L -c '%d %i %b' -- "${fd}" 2>/dev/null) || continue
+                read -r dev ino blocks <<< "${info}"
+                key="${dev}:${ino}"
+                [[ -n "${memfd_seen[${key}]:-}" ]] && continue
+                memfd_seen[${key}]=1
+                memfd_b=$(( memfd_b + blocks * 512 ))
+                ;;
+            /dev/dri/*)
+                pid=${fd#/proc/}
+                pid=${pid%%/*}
+                dri_fds[${pid}]=$(( ${dri_fds[${pid}]:-0} + 1 ))
+                ;;
+            *) ;;
+        esac
+    done
+    local memfd_kib=$(( memfd_b / 1024 ))
+    local memfd_count=${#memfd_seen[@]}
+
+    if [[ "${no_procs}" == false ]]; then
+        collect_top_processes
+    fi
+
+    stop_spinner
+    trap - EXIT INT TERM
+
+    # --- résidu ----------------------------------------------------------
+    local known_kib other_kib
+    known_kib=$(( tmpfs_kib + sysv_kib + memfd_kib + gpu_user_kib ))
+    other_kib=$(( total_kib - known_kib ))
+    local negative=false
+    if (( other_kib < 0 )); then
+        other_kib=0
+        negative=true
+    fi
+
+    # --- répartition, triée du plus gros au plus petit --------------------
+    local -a share_lines=()
+    local share_total=${total_kib}
+    if (( gpu_user_kib > share_total )); then
+        # Trois catégories peuvent se recouvrir : la barre ne doit pas déborder.
+        share_total=${gpu_user_kib}
+    fi
+    share_lines+=("${tmpfs_kib}"$'\t'"tmpfs (montages)"$'\t'"${C_TMPFS}")
+    share_lines+=("${sysv_kib}"$'\t'"shm SysV"$'\t'"${C_SYSV}")
+    share_lines+=("${memfd_kib}"$'\t'"memfd (${memfd_count} objets)"$'\t'"${C_MEMFD}")
+    if (( gpu_user_b > 0 )); then
+        share_lines+=("${gpu_user_kib}"$'\t'"GPU asahi (user_committed)"$'\t'"${C_GPU}")
+    fi
+    share_lines+=("${other_kib}"$'\t'"non attribué (noyau, pilotes)"$'\t'"${C_OTHER}")
+
+    local share_kib share_label share_color share_sorted total_h
+    total_h=$(fmt_human "${total_kib}")
+    section "Répartition · ${total_h} au total"
+    share_sorted=$(printf '%s\n' "${share_lines[@]}" | sort -rn -k1,1) || share_sorted=''
+    while IFS=$'\t' read -r share_kib share_label share_color; do
+        share_row "${share_label}" "${share_kib}" "${share_total}" "${share_color}"
+    done <<< "${share_sorted}"
+    if [[ "${negative}" == true ]]; then
+        printf '\n  %s⚠ Somme des catégories > Shmem : recouvrement possible%s\n' \
+            "${C_WARN}" "${RESET}"
+        printf '    %s(des pages comptées deux fois ou déjà libérées).%s\n' "${DIM}" "${RESET}"
+    fi
+
+    # Qui a des handles GPU. Le nombre de fds ne dit rien de la mémoire :
+    # un client avec 2 fds peut tenir 1 GiB, le pilote n'expose pas le détail.
+    if (( ${#dri_fds[@]} > 0 )); then
+        local -a gpu_rows=()
+        local sorted top n comm fdp pidp
+        for pid in "${!dri_fds[@]}"; do
+            gpu_rows+=("${dri_fds[${pid}]} ${pid}")
+        done
+        section 'Clients GPU'
+        printf '  %sfds /dev/dri ouverts, pas la quantité de mémoire%s\n' "${DIM}" "${RESET}"
+        sorted=$(printf '%s\n' "${gpu_rows[@]}" | sort -rn) || sorted=''
+        top=$(head -n "${TOP_PROCS}" <<< "${sorted}") || top=''
+        while read -r n pid; do
+            [[ -n "${n:-}" ]] || continue
+            comm=$(cat "/proc/${pid}/comm" 2>/dev/null) || comm='?'
+            comm=$(pad_label "${comm}" 20)
+            fdp=$(pad_right "$(printf '%s fd(s)' "${n}")" 9)
+            fdp=$(paint "${DIM}" "${fdp}")
+            pidp=$(paint "${DIM}" "pid ${pid}")
+            printf '  %s %s  %s\n' \
+                "${comm}" "${fdp}" "${pidp}"
+        done <<< "${top}"
+    fi
+
+    if [[ "${no_procs}" == false ]]; then
+        section 'Shmem mappé par processus'
+        printf '  %sPss_Shmem ; ne voit pas les buffers GPU%s\n' "${DIM}" "${RESET}"
+        print_top_processes "${TOP_PROCS}"
+    fi
+    printf '\n'
+}
+
+main "$@"

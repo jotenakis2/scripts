@@ -5,14 +5,15 @@ set -euo pipefail
 [[ "${EUID}" -eq 0 ]] || { echo "script to be used as root."; exit 1; }
 
 # Configuration
-terminal="${TERM}"
+terminal="${TERM:-dumb}"
 LOG_DIR="/var/log/rootkit_scanning"
 DATEdisplay=$(date +%d/%m/%Y_%H:%M:%S)
 DATE=$(date +%d%m%Y_%H%M%S)
-HOSTNAME=$(hostname)
-EMAIL_ALERT="olivier.lorillu@proton.me"
+HOST_NAME=$(hostname)
+EMAIL_ALERT="${ROOTKIT_ALERT_EMAIL:-}"
 TMP_REPORT=$(mktemp)
 TMP_CHK=$(mktemp)
+TMP_CHK_RAW=$(mktemp)
 TMP_RKH=$(mktemp)
 ALERT=0
 SCAN=0
@@ -23,7 +24,9 @@ _BANNER() {
     shift
     local text="$*"
     local fg cols
-    cols="${COLUMNS:-}"
+    cols="${COLUMNS:-80}"
+    [[ "${cols}" =~ ^[0-9]+$ ]] || cols=80
+    (( cols < 20 )) && cols=80
     case "${color}" in
         red) fg=31 ;; green) fg=32 ;; yellow) fg=33 ;; blue) fg=34 ;;
         magenta) fg=35 ;; cyan) fg=36 ;; white) fg=37 ;; *) fg=39 ;;
@@ -134,7 +137,9 @@ _SECTION() {
     [[ $# == 0 ]] && return 1
 
     declare -i term_cols # Terminal width
-    if ! term_cols="${COLUMNS:-}"; then return 1; fi
+    term_cols="${COLUMNS:-80}"
+    [[ "${term_cols}" =~ ^[0-9]+$ ]] || term_cols=80
+    (( term_cols < 20 )) && term_cols=20
     echo -e "${color}"
     term_cols=$(( term_cols - 2 ))
 
@@ -161,7 +166,7 @@ _SECTION() {
 
 ################################################################################################################
 START-SPINNER() {
-    if [[ "${terminal}" != "dumb" ]]; then
+    if [[ "${terminal}" != "dumb" && -t 1 ]]; then
         set +m
         tput civis || true # Hide cursor, ignore errors if unsupported
         echo -ne "Scan en cours...  ${C_RED})"
@@ -181,8 +186,11 @@ START-SPINNER() {
 }
 ###############################################################################################################
 STOP-SPINNER() {
-    if [[ "${terminal}" != "dumb" ]]; then
-        { kill -9 "${spinner_pid}" && wait "${spinner_pid}"; } 2>/dev/null || true # Kill spinner safely
+    if [[ "${terminal}" != "dumb" && -t 1 ]]; then
+        if [[ -n "${spinner_pid:-}" ]]; then
+            kill "${spinner_pid}" 2>/dev/null || true
+            wait "${spinner_pid}" 2>/dev/null || true
+        fi
         set -m
         echo -en "\b\b"
         tput cvvis || true # Show cursor, ignore errors if unsupported
@@ -195,21 +203,21 @@ STOP-SPINNER() {
 mkdir -p "${LOG_DIR}"
 
 _cleanup() {
-    rm -f "${TMP_REPORT}" "${TMP_CHK}" "${TMP_RKH}"
+    rm -f "${TMP_REPORT}" "${TMP_CHK}" "${TMP_CHK_RAW}" "${TMP_RKH}"
 }
 trap _cleanup EXIT
 
 _ENABLE_COLORS
-_BANNER "blue" "Rootkit Scan: ${HOSTNAME} - ${DATEdisplay}"
+_BANNER "blue" "Rootkit Scan: ${HOST_NAME} - ${DATEdisplay}"
 
 # === CHKROOTKIT ===
 _SECTION " chkrootkit " "━" "${C_YELLOW}"
-echo "=== chkrootkit: ${HOSTNAME} ===" >> "${TMP_REPORT}"
+echo "=== chkrootkit: ${HOST_NAME} ===" >> "${TMP_REPORT}"
 
 if _EXIST chkrootkit; then
-    { trap STOP-SPINNER EXIT && START-SPINNER; }
-    chkrootkit -q 2>/dev/null \
-        | grep -Eiv "can't exec|not tested" \
+    START-SPINNER
+    chkrootkit -q 2>/dev/null >"${TMP_CHK_RAW}" || true
+    grep -Eiv "can't exec|not tested" "${TMP_CHK_RAW}" \
         | grep -Eiv '/usr/lib/systemd/\.abignore|/usr/lib/debug(/usr)?/\.dwz|/usr/lib/\.build-id|/usr/lib/modules/.*/\.vmlinuz\.hmac|/usr/lib/sysimage/rpm/\.rpm\.lock' \
         | grep -Eiv '/usr/lib/python3\.[0-9]+/site-packages/glances/outputs/static/\.(eslintrc|prettierrc)\.js|/usr/lib/python3\.[0-9]+/site-packages/fastapi/\.agents' \
         | grep -Eiv '/usr/lib/node_modules_24/npm/node_modules/node-gyp/\.release-please-manifest\.json|/usr/lib/node_modules_24/npm/node_modules/node-gyp/gyp/\.release-please-manifest\.(json|js)|/usr/lib/node_modules_24/npm/node_modules/qrcode-terminal/\.travis\.yml' \
@@ -232,7 +240,7 @@ fi
 
 # === RKHUNTER ===
 _SECTION " rkhunter " "━" "${C_YELLOW}"
-echo "=== rkhunter: ${HOSTNAME} ===" >> "${TMP_REPORT}"
+echo "=== rkhunter: ${HOST_NAME} ===" >> "${TMP_REPORT}"
 
 if _EXIST rkhunter; then
     echo -n "Préparation... "
@@ -240,7 +248,7 @@ if _EXIST rkhunter; then
     rkhunter --propupd 2>/dev/null >> "${TMP_REPORT}" || true
     echo "terminée, OK."
 
-    { trap STOP-SPINNER EXIT && START-SPINNER; }
+    START-SPINNER
     rkhunter --check --skip-keypress --report-warnings-only --nocolors 2>/dev/null >> "${TMP_RKH}" || true
     { STOP-SPINNER && echo "terminé."; }
     SCAN=1
@@ -258,19 +266,31 @@ fi
 
 cp -f "${TMP_REPORT}" "${LOG_DIR}/rootkit-scan-${DATE}.log" 2>/dev/null
 cp -f "${TMP_REPORT}" "${LOG_DIR}/rootkit-scan-latest.log" 2>/dev/null
-rm -f "${TMP_REPORT}" "${TMP_CHK}" "${TMP_RKH}" 2>/dev/null
+cp -f "${TMP_CHK_RAW}" "${LOG_DIR}/chkrootkit-raw-${DATE}.log" 2>/dev/null || true
+LOG_PATH="${LOG_DIR}/rootkit-scan-${DATE}.log"
 
 # === ALERTS ===
 if [[ ${SCAN} -eq 1 ]]; then
     _SECTION " OUTCOMES " "━" "${C_YELLOW}"
     if [[ ${ALERT} -eq 1 ]]; then
-        echo -e "${C_RED}✓ Sending alert email...${C_RESET}"
-        mail -s "⚠ ROOTKIT ALERT: ${HOSTNAME} - ${DATE}" "${EMAIL_ALERT}" < "${TMP_REPORT}"
-        echo -e "${C_RED}✓ Logs saved to: ${LOG_DIR}/rootkit-scan-${DATE}.log${C_RESET}"
+        if [[ -n "${EMAIL_ALERT}" ]]; then
+            if command -v mail >/dev/null 2>&1; then
+                if mail -s "⚠ ROOTKIT ALERT: ${HOST_NAME} - ${DATE}" "${EMAIL_ALERT}" < "${LOG_PATH}"; then
+                    echo -e "${C_RED}✓ Alert email sent to ${EMAIL_ALERT}${C_RESET}"
+                else
+                    echo -e "${C_RED}⚠ Failed to send alert email${C_RESET}" >&2
+                fi
+            else
+                echo -e "${C_RED}⚠ mail introuvable : alerte non envoyée${C_RESET}" >&2
+            fi
+        else
+            echo -e "${C_RED}⚠ ROOTKIT_ALERT_EMAIL non défini : alerte non envoyée${C_RESET}" >&2
+        fi
+        echo -e "${C_RED}✓ Logs saved to: ${LOG_PATH}${C_RESET}"
         echo -e "${C_RED}✓ Full log rkhunter: /var/log/rkhunter/rkhunter.log"
     else
         echo -e "${C_GREEN}✓ Scan completed successfully (no alerts)${C_RESET}"
-        echo -e "${C_GREEN}✓ Logs saved to: ${LOG_DIR}/rootkit-scan-${DATE}.log${C_RESET}"
+        echo -e "${C_GREEN}✓ Logs saved to: ${LOG_PATH}${C_RESET}"
         echo -e "${C_GREEN}✓ Full log rkhunter: /var/log/rkhunter/rkhunter.log"
     fi
 else

@@ -1,91 +1,102 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2312
-# Cle API ipgeolocation.io : jamais dans le depot.
-# Priorite : variable d'environnement WANIP_APIKEY, puis ~/.config/wanip/apikey
-apikey="${WANIP_APIKEY:-}"
-if [[ -z "${apikey}" ]]; then
-    keyfile="${XDG_CONFIG_HOME:-${HOME}/.config}/wanip/apikey"
-    if [[ -r "${keyfile}" ]]; then
-        apikey=$(head -1 "${keyfile}" | tr -d '[:space:]')
-    fi
-fi
-cachedir="${XDG_CACHE_HOME:-${HOME}/.cache}/wanip"
-mkdir -p -- "${cachedir}"
-max_age=900 # cache refresh every 15 min to limit api call
-timeout=1 # 1s timeout max for curl to retrieve data
+# shellcheck enable=all
+#
+# Affiche l'IP WAN publique et, si une clé API est configurée, sa géolocalisation.
+#
+# Clé API (optionnelle) :
+#   export WANIP_API_KEY='...'
+# ou fichier ~/.config/wanip/apikey (chmod 600).
 
-emoji=''
-wan_ip=''
-kernel=''
-Bleu="\033[0;34m"
-Reset="\033[0m"
-spaceafter="   "
-Rouge="\033[0;31m"
+set -euo pipefail
+
+readonly max_age=900   # cache : 15 min
+readonly timeout=3     # timeout réseau : 3 s
+
+Bleu=$'\033[0;34m'
+Rouge=$'\033[0;31m'
+Reset=$'\033[0m'
+spaceafter='   '
 
 ipv4_regex='^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])$'
 
-# curl & jq are required
-if ! command -v curl >/dev/null || ! command -v jq >/dev/null; then
-	printf '%s : curl et jq sont requis\n' "$0" >&2
-	exit 1
+if ! command -v curl >/dev/null 2>&1; then
+    printf '%s : curl est requis.\n' "$0" >&2
+    exit 1
 fi
 
-# retrieve IP WAN - 3 methods
-command -v dig >/dev/null && wan_ip=$(dig -4 +short myip.opendns.com @resolver1.opendns.com 2>/dev/null | head -1)
-if [[ -z "${wan_ip}" ]] || [[ ! ${wan_ip} =~ ${ipv4_regex} ]]; then
-	wan_ip=$(curl --connect-timeout "${timeout}" -4 ifconfig.co 2>/dev/null | head -1)
+# Clé API : environnement prioritaire, puis fichier local.
+api_key="${WANIP_API_KEY:-}"
+if [[ -z "${api_key}" && -r "${HOME}/.config/wanip/apikey" ]]; then
+    api_key="$(<"${HOME}/.config/wanip/apikey")"
 fi
-if [[ -z "${wan_ip}" ]] || [[ ! ${wan_ip} =~ ${ipv4_regex} ]]; then
-	wan_ip=$(curl --connect-timeout "${timeout}" -4 ifconfig.me 2>/dev/null | head -1)
+api_key="${api_key//[$'\r\n\t ']/}"
+
+if [[ -n "${api_key}" ]] && ! command -v jq >/dev/null 2>&1; then
+    printf 'jq est requis pour la géolocalisation ; géolocalisation désactivée.\n' >&2
+    api_key=''
 fi
 
-# geoloc (uniquement si une cle est disponible)
-if [[ ${wan_ip} =~ ${ipv4_regex} ]]; then
-    file="${cachedir}/${wan_ip}.json"
-
-    if [[ -z "${apikey}" ]]; then
-        emoji=''
-    else
-        if [[ ! -e "${file}" ]] || [[ $(($(date +%s) - $(stat -c %Y "${file}" 2>/dev/null || echo 0))) -gt ${max_age} ]]; then
-            rm -f "${file}"
-            curl --connect-timeout "${timeout}" -sS "https://api.ipgeolocation.io/v3/ipgeo?apiKey=${apikey}" > "${file}" 2>/dev/null
-        fi
-
-        if [[ -s "${file}" ]] && jq -e . < "${file}" >/dev/null 2>&1; then
-            emoji=$(jq -r '.location.country_emoji // empty' < "${file}")
-            if [[ -z "${emoji}" ]]; then
-                emoji=$(jq -r '.location.country_code2 // empty' < "${file}")
-            fi
-            if [[ -z "${emoji}" ]]; then
-                emoji=$(jq -r '.location.country_code3 // empty' < "${file}")
-            fi
-        else
-            emoji="❓"
-        fi
-    fi
-else
+wan_ip=''
+if command -v dig >/dev/null 2>&1; then
+    wan_ip="$(dig -4 +short myip.opendns.com @resolver1.opendns.com 2>/dev/null | head -1 || true)"
+fi
+if [[ -z "${wan_ip}" ]] || [[ ! "${wan_ip}" =~ ${ipv4_regex} ]]; then
+    wan_ip="$(curl --connect-timeout "${timeout}" --max-time "${timeout}" -fsS -4 https://ifconfig.co 2>/dev/null | head -1 || true)"
+fi
+if [[ -z "${wan_ip}" ]] || [[ ! "${wan_ip}" =~ ${ipv4_regex} ]]; then
+    wan_ip="$(curl --connect-timeout "${timeout}" --max-time "${timeout}" -fsS -4 https://ifconfig.me 2>/dev/null | head -1 || true)"
+fi
+if [[ ! "${wan_ip}" =~ ${ipv4_regex} ]]; then
     wan_ip=''
-    emoji=''
+fi
+
+emoji=''
+if [[ -n "${wan_ip}" && -n "${api_key}" ]]; then
+    cache_dir="${XDG_CACHE_HOME:-${HOME}/.cache}/wanip"
+    mkdir -p "${cache_dir}"
+    chmod 700 "${cache_dir}" 2>/dev/null || true
+    cache_file="${cache_dir}/${wan_ip}.json"
+
+    now="$(date +%s)"
+    mtime="$(stat -c %Y "${cache_file}" 2>/dev/null || printf '0')"
+
+    if [[ ! -s "${cache_file}" ]] || (( now - mtime > max_age )); then
+        tmp_file="$(mktemp "${cache_dir}/.geo.XXXXXX")"
+        trap 'rm -f "${tmp_file}"' EXIT
+        if curl --connect-timeout "${timeout}" --max-time 10 -fsS \
+            "https://api.ipgeolocation.io/v3/ipgeo?apiKey=${api_key}&ip=${wan_ip}" \
+            -o "${tmp_file}" 2>/dev/null; then
+            chmod 600 "${tmp_file}" 2>/dev/null || true
+            mv -f "${tmp_file}" "${cache_file}"
+        else
+            rm -f "${tmp_file}"
+        fi
+        trap - EXIT
+    fi
+
+    if [[ -s "${cache_file}" ]] && jq -e . >/dev/null 2>&1 <"${cache_file}"; then
+        emoji="$(jq -r '.location.country_emoji // empty' <"${cache_file}")"
+        [[ -n "${emoji}" ]] || emoji="$(jq -r '.location.country_code2 // empty' <"${cache_file}")"
+        [[ -n "${emoji}" ]] || emoji="$(jq -r '.location.country_code3 // empty' <"${cache_file}")"
+    else
+        emoji='❓'
+    fi
 fi
 
 strkernel=''
-if [[ "${1:-}" = "-k" ]]; then
-	# kernel
-	kernel=$(uname -r | awk -F ".fc" '{print $1}' || true)
-	if [[ "${kernel}" = *cachyos* ]]; then
-		strkernel="${Bleu}${Reset} ${kernel}${spaceafter}"
-	else
-		strkernel="${Rouge}${Reset} ${kernel:-?}${spaceafter}"
-	fi
+if [[ "${1:-}" == '-k' ]]; then
+    kernel="$(uname -r)"
+    if [[ "${kernel}" == *cachyos* ]]; then
+        strkernel="${Bleu} ${Reset} ${kernel}${spaceafter}"
+    else
+        strkernel="${Rouge} ${Reset} ${kernel:-?}${spaceafter}"
+    fi
 fi
 
-# ip
-strIP=''
 if [[ -z "${wan_ip}" ]]; then
-	strIP="${Rouge}󰩟${Reset} ?"
+    strIP="${Rouge}󰩟${Reset} ?"
 else
-	strIP="${Bleu}󰩟${Reset} ${wan_ip:-?} ${emoji:-}"
+    strIP="${Bleu}󰩟${Reset} ${wan_ip} ${emoji:-}"
 fi
 
-# display
-echo -e "${strkernel}${strIP}"
+printf '%b%b\n' "${strkernel}" "${strIP}"

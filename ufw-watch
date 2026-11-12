@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# shellcheck enable=all
+#
+# ufw-watch : notifie les paquets bloqués par UFW venant d'Internet.
+#
+# La politique UFW par défaut refuse tout trafic entrant non sollicité, et
+# journalise chaque refus. En pratique, ces logs ne contiennent que du bruit
+# local : requêtes IGMP du routeur et réponses Cast des appareils du LAN
+# (toutes vers des ports éphémères, sans aucun service en écoute derrière).
+#
+# Ce service suit donc le journal en continu et n'alerte que si la source
+# n'appartient à aucun espace privé, link-local ou multicast : c'est le seul
+# signal qui mérite de déranger l'utilisateur.
+#
+# Usage:
+#   ufw-watch            suit le journal en continu (mode service)
+#   ufw-watch --dry-run  lit des lignes sur stdin, affiche sans notifier
+#   ufw-watch --test     envoie une notification d'exemple et quitte
+#
+# Variables d'environnement:
+#   UFW_WATCH_DEDUPE_SECONDS  fenêtre anti-spam par source (défaut: 300)
+
+set -uo pipefail
+
+readonly DEDUPE_SECONDS="${UFW_WATCH_DEDUPE_SECONDS:-300}"
+readonly STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/ufw-watch"
+readonly LOG_FILE="${STATE_DIR}/alerts.log"
+
+mkdir -p "${STATE_DIR}"
+
+# Une entrée par source déjà annoncée, pour ne pas matraquer sur un scan lent.
+declare -A last_seen=()
+
+log() {
+  local stamp
+  stamp=$(date -Is)
+  printf '%s %s\n' "${stamp}" "$*" >>"${LOG_FILE}"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: ufw-watch [--dry-run | --test]
+
+  (sans option)  suit le journal et notifie les sources externes bloquées
+  --dry-run      lit des lignes de log sur stdin, affiche sans notifier
+  --test         envoie une notification d'exemple et quitte
+EOF
+}
+
+# Vrai si l'adresse est privée, link-local, multicast ou réservée : dans ce cas
+# elle ne peut pas être une menace externe et ne doit pas déclencher d'alerte.
+is_local_address() {
+  local ip=${1}
+  case ${ip} in
+    0.* | 10.* | 127.* | 169.254.* | 192.168.*)
+      return 0
+      ;;
+    172.1[6-9].* | 172.2[0-9].* | 172.3[01].*)
+      return 0
+      ;;
+    100.6[4-9].* | 100.[7-9][0-9].* | 100.1[0-1][0-9].* | 100.12[0-7].*)
+      return 0
+      ;;
+    22[4-9].* | 23[0-9].* | 24[0-9].* | 25[0-5].*)
+      return 0
+      ;;
+    :: | ::1 | fe80:* | fc* | fd* | ff*)
+      return 0
+      ;;
+    *) ;;
+  esac
+  return 1
+}
+
+# Valeur d'un champ iptables (SRC=..., DPT=...) dans une ligne de log.
+field() {
+  local key=${1} line=${2}
+  if [[ ${line} =~ ${key}=([^ ]+) ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  fi
+}
+
+notify() {
+  local headline=${1} body=${2}
+
+  if command -v omarchy-notification-send >/dev/null 2>&1; then
+    if omarchy-notification-send --app-name ufw-watch -u normal \
+      "${headline}" "${body}" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  if command -v notify-send >/dev/null 2>&1; then
+    if notify-send -a ufw-watch -u normal "${headline}" "${body}" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+handle_line() {
+  local line=${1} src proto dpt iface now last headline body
+
+  [[ ${line} == *"[UFW BLOCK]"* ]] || return 0
+
+  src=$(field SRC "${line}")
+  [[ -n ${src} ]] || return 0
+  is_local_address "${src}" && return 0
+
+  now=$(date +%s)
+  last=${last_seen[${src}]:-0}
+  if ((now - last < DEDUPE_SECONDS)); then
+    return 0
+  fi
+  last_seen[${src}]=${now}
+
+  proto=$(field PROTO "${line}")
+  dpt=$(field DPT "${line}")
+  iface=$(field IN "${line}")
+
+  headline="${src} a été bloqué par le pare-feu"
+  body="${proto:-?}${dpt:+/${dpt}} refusé sur ${iface:-?} — journalctl -k -g '${src}'"
+
+  if ((DRY_RUN)); then
+    printf '%s\n  %s\n' "${headline}" "${body}"
+    return 0
+  fi
+
+  if notify "${headline}" "${body}"; then
+    log "NOTIFIE ${headline} (${body})"
+  else
+    log "ECHEC-NOTIF ${headline} (${body})"
+  fi
+}
+
+watch_journal() {
+  if ! command -v journalctl >/dev/null 2>&1; then
+    log "ERREUR commande manquante: journalctl"
+    exit 1
+  fi
+
+  # -o cat : le message seul, on n'a pas besoin de l'horodatage du journal.
+  journalctl -kf -n 0 -o cat 2>/dev/null |
+    while IFS= read -r line; do
+      handle_line "${line}"
+    done
+}
+
+main() {
+  DRY_RUN=0
+
+  while (($# > 0)); do
+    case ${1} in
+      --dry-run)
+        DRY_RUN=1
+        ;;
+      --test)
+        if notify "Test ufw-watch" "Les alertes de blocage externe sont opérationnelles."; then
+          log "TEST notification envoyée"
+          printf 'notification envoyée\n'
+        else
+          log "TEST échec de la notification"
+          printf 'échec: aucun outil de notification disponible\n' >&2
+          exit 1
+        fi
+        return 0
+        ;;
+      -h | --help)
+        usage
+        return 0
+        ;;
+      *)
+        printf 'option inconnue: %s\n' "${1}" >&2
+        usage >&2
+        return 2
+        ;;
+    esac
+    shift
+  done
+
+  if ((DRY_RUN)); then
+    while IFS= read -r line; do
+      handle_line "${line}"
+    done
+    return 0
+  fi
+
+  log "démarrage (dedupe ${DEDUPE_SECONDS}s)"
+  watch_journal
+}
+
+main "$@"

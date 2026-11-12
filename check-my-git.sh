@@ -31,7 +31,7 @@ fi
 repos=()
 while IFS= read -r -d '' gitdir; do
     repos+=("$(dirname "${gitdir}")")
-done < <(find "${PROJECTS_DIR}" -maxdepth 3 -type d -name '.git' -print0 2>/dev/null || true)
+done < <(find "${PROJECTS_DIR}" -type d -name '.git' -print0 2>/dev/null || true)
 
 if [[ ${#repos[@]} -eq 0 ]]; then
     printf 'Aucun dépôt Git trouvé dans %s\n' "${PROJECTS_DIR}"

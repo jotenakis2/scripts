@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck enable=all
 #
 # Visualize CPU usage per-core and AVG on Linux.
 #
@@ -17,9 +18,11 @@ PREVIOUS=()
 NUM_CPUS=()
 INTERVAL=1 # 1 second
 BAR_CHAR='⋮'
+BAR_LENGTH=30
+CLEANED=0
 
 main() {
-	AVG=$(nproc) # la clé AVG va stocker la valeur moyenne des core cpu
+	AVG=$(nproc 2>/dev/null || printf '1') # la clé AVG va stocker la valeur moyenne des core cpu
 	init
 	while true; do
 		update-term
@@ -105,8 +108,8 @@ read-proc() {
 		fi
 		
 
-		busy=$((user + nice + system + irq + softirq + steal + guest + guest_nice))
-		idle=$((idle + iowait))
+		busy=$(( ${user:-0} + ${nice:-0} + ${system:-0} + ${irq:-0} + ${softirq:-0} + ${steal:-0} + ${guest:-0} + ${guest_nice:-0} ))
+		idle=$(( ${idle:-0} + ${iowait:-0} ))
 
 		value="${busy} ${idle}"
 
@@ -136,7 +139,11 @@ print-bar() {
 		local idle=$((idle2 - idle1))
 		local total=$((busy + idle))
 
-		usage=$((1000 * busy / total))
+		if (( total == 0 )); then
+			usage=0
+		else
+			usage=$((1000 * busy / total))
+		fi
 		online=1
 	fi
 
@@ -185,12 +192,14 @@ print-bar() {
 #------------------------------------------------------------------------------------------------------------------------
 
 visualize-data() {
-	local ttime pttime plain left pad cpucore
+	local ttime pttime plain left pad cpucore host
+	host="${HOSTNAME:-$(uname -n 2>/dev/null || printf '?')}"
 	pttime="$(date '+%T') (${INTERVAL}sec)"
 	ttime="${DIM}$(date '+%T')${RST} ${BOLD}(${INTERVAL}sec)${RST}"
-	plain="CPU Usage on ${HOSTNAME}"
-	left="${DIM}CPU Usage on ${RST}${BOLD}${COLOR3}${HOSTNAME}${RST}"
+	plain="CPU Usage on ${host}"
+	left="${DIM}CPU Usage on ${RST}${BOLD}${COLOR3}${host}${RST}"
 	pad=$((COLUMNS - ${#pttime} - ${#plain}))
+	(( pad < 0 )) && pad=0
 
 	printf '\e[H' # move the cursor home
 	printf '%s%*s%s\n' "${left}" "${pad}" '' "${ttime}"
@@ -203,6 +212,10 @@ visualize-data() {
 #------------------------------------------------------------------------------------------------------------------------
 
 cleanup() {
+	if (( CLEANED == 1 )); then
+		return 0
+	fi
+	CLEANED=1
 	printf '\e[?1049l' # disable alternate buffer
 	printf '\e[?25h' # show the cursor
 	exit 0
@@ -211,22 +224,23 @@ cleanup() {
 #------------------------------------------------------------------------------------------------------------------------
 
 update-term() {
-	COLUMNS="$(tput cols)"
+	COLUMNS="$(tput cols 2>/dev/null || true)"
 	COLUMNS=${COLUMNS:-80}
 	
 	# figure out how much buffer room is needed
 	local cpus=( "${!CURRENT[@]}" )
-	local highest_cpu=${cpus[-2]} #-1 c'est AVG, -2 c'est le dernier core
+	local highest_cpu=${cpus[-2]:-0} #-1 c'est AVG, -2 c'est le dernier core
 
 	# [] + " cpu" + num + " offline"
 	local i=$((2 + 4 + ${#highest_cpu} + 8))
 	BAR_LENGTH=$((COLUMNS - i))
-	BAR_LENGTH=${BAR_LENGTH:-30}
+	(( BAR_LENGTH < 10 )) && BAR_LENGTH=10
 }
 
 #------------------------------------------------------------------------------------------------------------------------
 
 read-all-cpus() {
+	shopt -s nullglob
 	NUM_CPUS=(/sys/devices/system/cpu/cpu[0-9]*)
 	NUM_CPUS=("${NUM_CPUS[@]##*/cpu}" "${AVG}")
 }
@@ -239,7 +253,7 @@ init() {
 	read-all-cpus
 	read-proc
 	sleep 0.2
-	trap cleanup EXIT
+	trap cleanup EXIT INT TERM
 	trap update-term WINCH
 	printf '\e[?1049h' # enable alternate buffer
 	printf '\e[?25l' # hide the cursor

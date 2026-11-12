@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+# shellcheck enable=all
+# gh-pr-watch : notifie les nouvelles réponses (commentaires, reviews, approbation,
+# fusion, fermeture) sur mes pull requests et mes issues GitHub, ainsi que les
+# réponses directes, mentions et citations de mes commentaires dans les discussions.
+#
+# La notification reprend un extrait du dernier message et le clic ouvre
+# directement le commentaire ou la review concernée.
+#
+# Usage: gh-pr-watch [--dry-run]
+
+set -euo pipefail
+
+dry_run=0
+if [[ ${1-} == --dry-run ]]; then
+	dry_run=1
+fi
+
+state_dir="${XDG_STATE_HOME:-${HOME}/.local/state}/gh-pr-watch"
+state_file="${state_dir}/state.json"
+log_file="${state_dir}/watch.log"
+mkdir -p "${state_dir}"
+
+log() {
+	local stamp
+	stamp=$(date -Is)
+	printf '%s %s\n' "${stamp}" "${*}" >>"${log_file}"
+}
+
+notify() {
+	local headline=${1}
+	local description=${2}
+	local url=${3-}
+
+	if ((dry_run)); then
+		printf '%s\n%s\n→ %s\n\n' "${headline}" "${description}" "${url}"
+		return 0
+	fi
+
+	if command -v omarchy-notification-send >/dev/null 2>&1; then
+		if [[ -n ${url} ]]; then
+			omarchy-notification-send --app-name gh-pr-watch -g '' -u normal \
+				"${headline}" "${description}" --exec xdg-open "${url}" \
+				>/dev/null 2>&1 || true
+		else
+			omarchy-notification-send --app-name gh-pr-watch -g '' -u normal \
+				"${headline}" "${description}" >/dev/null 2>&1 || true
+		fi
+	elif command -v notify-send >/dev/null 2>&1; then
+		notify-send -a gh-pr-watch "${headline}" "${description}" >/dev/null 2>&1 || true
+	fi
+}
+
+old_json='{}'
+if [[ -s ${state_file} ]]; then
+	old_json=$(<"${state_file}")
+fi
+new_json='{}'
+
+watch() {
+	local kind=${1}
+	local list=${2}
+	local repo num key prev data report entry title item_url target snippet
+	local comment_url review_url description label fields
+	local has_new_comments has_new_reviews
+	local -a cmd
+
+	if [[ ${kind} == pr ]]; then
+		label='PR'
+		fields='state,reviewDecision,url,title,comments,reviews'
+	else
+		label='Issue'
+		fields='state,url,title,comments'
+	fi
+
+	while IFS=$'\t' read -r repo num; do
+		[[ -n ${repo} && -n ${num} ]] || continue
+		key="${repo}#${num}"
+
+		if [[ ${kind} == pr ]]; then
+			cmd=(gh pr view "${num}" --repo "${repo}" --json "${fields}")
+		else
+			cmd=(gh issue view "${num}" --repo "${repo}" --json "${fields}")
+		fi
+
+		prev=$(jq -c --arg k "${key}" '.[$k] // {}' <<<"${old_json}")
+
+		if ! data=$("${cmd[@]}" 2>>"${log_file}"); then
+			log "lecture impossible : ${label} ${key}"
+			# Conserver l'état connu pour ne pas re-notifier au prochain passage.
+			if [[ ${prev} != '{}' ]]; then
+				new_json=$(jq -c --arg k "${key}" --argjson e "${prev}" \
+					'. + {($k): $e}' <<<"${new_json}")
+			fi
+			continue
+		fi
+
+		# shellcheck disable=SC2016  # le programme jq utilise ses propres $variables
+		report=$(jq -c --arg k "${key}" --arg kind "${kind}" --argjson prev "${prev}" '
+			{
+				state: (.state // ""),
+				review: (.reviewDecision // ""),
+				comments: ((.comments // []) | length),
+				reviews: ((.reviews // []) | length),
+				last_comment_author: ((.comments // []) | last | .author.login // ""),
+				last_comment_url: ((.comments // []) | last | .url // ""),
+				last_comment_body: ((.comments // []) | last | .body // ""
+					| gsub("[\\r\\n\\t]+"; " ") | gsub("  +"; " ") | ltrimstr(" ") | .[0:220]),
+				last_review_author: ((.reviews // []) | last | .author.login // ""),
+				last_review_state: ((.reviews // []) | last | .state // ""),
+				last_review_body: ((.reviews // []) | last | .body // ""
+					| gsub("[\\r\\n\\t]+"; " ") | gsub("  +"; " ") | ltrimstr(" ") | .[0:220]),
+				title: (.title // ""),
+				url: (.url // "")
+			} as $new
+			| ([
+				(select($new.state != ($prev.state // ""))
+					| if $new.state == "MERGED" then "PR fusionnée"
+						elif $new.state == "CLOSED" then
+							(if $kind == "issue" then "issue fermée" else "PR fermée" end)
+						elif $new.state == "OPEN" and (($prev.state // "") == "CLOSED") then
+							(if $kind == "issue" then "issue rouverte" else "PR rouverte" end)
+						else empty end),
+				(select($new.review != ($prev.review // ""))
+					| if $new.review == "APPROVED" then "approuvée"
+						elif $new.review == "CHANGES_REQUESTED" then "changements demandés"
+						elif $new.review == "REVIEW_REQUIRED" then "review requise"
+						else empty end),
+				(select($new.reviews > ($prev.reviews // 0))
+					| "review de \($new.last_review_author) : \($new.last_review_state)"),
+				(select($new.comments > ($prev.comments // 0))
+					| "commentaire de \($new.last_comment_author)")
+			]) as $msgs
+			| {key: $k, entry: $new, msgs: $msgs,
+				new_comments: ($new.comments > ($prev.comments // 0)),
+				new_reviews: ($new.reviews > ($prev.reviews // 0))}' <<<"${data}")
+
+		entry=$(jq -c '.entry' <<<"${report}")
+		new_json=$(jq -c --arg k "${key}" --argjson e "${entry}" \
+			'. + {($k): $e}' <<<"${new_json}")
+
+		# Un élément jamais vu est mémorisé sans notification (ligne de base).
+		if [[ ${prev} == '{}' ]]; then
+			continue
+		fi
+
+		msgs=$(jq -r '.msgs[]' <<<"${report}")
+		if [[ -z ${msgs} ]]; then
+			continue
+		fi
+
+		has_new_comments=$(jq -r 'if .new_comments then 1 else 0 end' <<<"${report}")
+		has_new_reviews=$(jq -r 'if .new_reviews then 1 else 0 end' <<<"${report}")
+		title=$(jq -r '.entry.title' <<<"${report}")
+		item_url=$(jq -r '.entry.url' <<<"${report}")
+
+		# Cible du clic : le message précis quand on peut le cibler.
+		target=${item_url}
+		snippet=''
+		if ((has_new_comments)); then
+			snippet=$(jq -r '.entry.last_comment_body' <<<"${report}")
+			comment_url=$(jq -r '.entry.last_comment_url' <<<"${report}")
+			if [[ -n ${comment_url} ]]; then
+				target=${comment_url}
+			fi
+		elif ((has_new_reviews)); then
+			snippet=$(jq -r '.entry.last_review_body' <<<"${report}")
+			review_url=$(gh api "repos/${repo}/pulls/${num}/reviews" \
+				--jq '.[-1].html_url' 2>/dev/null || true)
+			if [[ -n ${review_url} && ${review_url} != null ]]; then
+				target=${review_url}
+			fi
+		fi
+
+		description="${title}"$'\n'"${msgs}"
+		if [[ -n ${snippet} ]]; then
+			description+=$'\n\n'"« ${snippet} »"
+		fi
+
+		notify "${label} ${key}" "${description}" "${target}"
+		log "notifié : ${label} ${key} : ${msgs//$'\n'/ ; }"
+	done <<<"${list}"
+}
+
+# Discussions : notifie seulement si on répond à l'un de mes commentaires, si on
+# me mentionne, ou si on cite une ligne de mes commentaires. Pas de notification
+# pour chaque nouveau message d'un fil où j'ai simplement participé.
+watch_discussions() {
+	local me=${1}
+	local list=${2}
+	local repo num key owner name prev prev_id prev_at data report entry
+	local hits title target description hit_author hit_kind hit_body hit_url
+	# shellcheck disable=SC2016  # $owner, $name, $num sont des variables GraphQL
+	local -r query='query($owner: String!, $name: String!, $num: Int!) {
+		repository(owner: $owner, name: $name) {
+			discussion(number: $num) {
+				title
+				url
+				comments(last: 30) {
+					nodes {
+						id
+						author { login }
+						createdAt
+						url
+						body
+						replyTo { id author { login } }
+						replies(last: 30) {
+							nodes {
+								id
+								author { login }
+								createdAt
+								url
+								body
+								replyTo { id author { login } }
+							}
+						}
+					}
+				}
+			}
+		}
+	}'
+
+	while IFS=$'\t' read -r repo num; do
+		[[ -n ${repo} && -n ${num} ]] || continue
+		key="discussion:${repo}#${num}"
+		owner=${repo%%/*}
+		name=${repo#*/}
+
+		prev=$(jq -c --arg k "${key}" '.[$k] // {}' <<<"${old_json}")
+		prev_id=$(jq -r '.last_comment_id // ""' <<<"${prev}")
+		prev_at=$(jq -r '.last_comment_at // ""' <<<"${prev}")
+
+		if ! data=$(gh api graphql -f query="${query}" \
+			-f owner="${owner}" -f name="${name}" -F num="${num}" \
+			2>>"${log_file}"); then
+			log "lecture impossible : Discussion ${repo}#${num}"
+			# Conserver l'état connu pour ne pas re-notifier au prochain passage.
+			if [[ ${prev} != '{}' ]]; then
+				new_json=$(jq -c --arg k "${key}" --argjson e "${prev}" \
+					'. + {($k): $e}' <<<"${new_json}")
+			fi
+			continue
+		fi
+
+		if ! jq -e '.data.repository.discussion != null' \
+			>/dev/null 2>&1 <<<"${data}"; then
+			log "discussion introuvable : ${repo}#${num}"
+			if [[ ${prev} != '{}' ]]; then
+				new_json=$(jq -c --arg k "${key}" --argjson e "${prev}" \
+					'. + {($k): $e}' <<<"${new_json}")
+			fi
+			continue
+		fi
+
+		# shellcheck disable=SC2016  # le programme jq utilise ses propres $variables
+		report=$(jq -c --arg me "${me}" --arg prev_id "${prev_id}" \
+			--arg prev_at "${prev_at}" '
+			.data.repository.discussion as $root
+			| [ ($root.comments.nodes[] | ., (.replies.nodes[]?)) ]
+			| sort_by(.createdAt) as $nodes
+			| ($nodes | map(.id) | index($prev_id)) as $idx
+			| (if $idx == null
+				then ($nodes | map(select(.createdAt > $prev_at)))
+				else $nodes[($idx + 1):]
+			  end) as $new
+			| ($nodes | map(select(.author.login == $me) | (.body // ""))
+				| map(split("\n")
+					| map(gsub("^[ >]+"; "") | gsub("[ \t]+$"; ""))
+					| map(select(length >= 25)) | .[])
+				| unique) as $mine
+			| ($new | map(
+				. as $c
+				| select(($c.author.login // "") != $me)
+				| ($c.body // "") as $body
+				| ($body | split("\n")
+					| map(gsub("^[ >]+"; "") | gsub("[ \t]+$"; ""))) as $lines
+				| (($c.replyTo.author.login // "") == $me) as $is_reply
+				| ($body | test("@" + $me + "([^A-Za-z0-9_-]|$)")) as $is_mention
+				| (any($lines[]; . as $l | any($mine[]; . == $l))) as $is_quote
+				| select($is_reply or $is_mention or $is_quote)
+				| {author: ($c.author.login // ""),
+				   url: ($c.url // ""),
+				   body: ($body | gsub("[\\r\\n\\t]+"; " ")
+						| gsub("  +"; " ") | ltrimstr(" ") | .[0:220]),
+				   kind: (if $is_reply then "réponse à ton commentaire"
+						elif $is_mention then "mention"
+						else "citation de ton commentaire" end)}
+			)) as $hits
+			| {entry: (($nodes | last) as $last
+				| {comments: ($nodes | length),
+				   last_comment_id: ($last.id // ""),
+				   last_comment_at: ($last.createdAt // ""),
+				   last_comment_author: ($last.author.login // ""),
+				   title: ($root.title // ""),
+				   url: ($root.url // ""),
+				   kind: "discussion"}),
+			   hits: $hits}
+		' <<<"${data}")
+
+		entry=$(jq -c '.entry' <<<"${report}")
+		new_json=$(jq -c --arg k "${key}" --argjson e "${entry}" \
+			'. + {($k): $e}' <<<"${new_json}")
+
+		# Première vue (ou état d'une version antérieure sans suivi) : ligne de base.
+		if [[ ${prev} == '{}' ]]; then
+			continue
+		fi
+		if [[ -z ${prev_id} && -z ${prev_at} ]]; then
+			continue
+		fi
+
+		hits=$(jq -r '.hits | length' <<<"${report}")
+		if [[ ${hits} -eq 0 ]]; then
+			continue
+		fi
+
+		title=$(jq -r '.entry.title' <<<"${report}")
+		hit_author=$(jq -r '.hits[-1].author' <<<"${report}")
+		hit_kind=$(jq -r '.hits[-1].kind' <<<"${report}")
+		hit_body=$(jq -r '.hits[-1].body' <<<"${report}")
+		hit_url=$(jq -r '.hits[-1].url' <<<"${report}")
+
+		description="${title}"$'\n'"${hit_kind} de ${hit_author}"
+		if [[ ${hits} -gt 1 ]]; then
+			description+=" (+$((hits - 1)) autres)"
+		fi
+		if [[ -n ${hit_body} ]]; then
+			description+=$'\n\n'"« ${hit_body} »"
+		fi
+
+		target=${hit_url:-$(jq -r '.entry.url' <<<"${report}")}
+		notify "Discussion ${repo}#${num}" "${description}" "${target}"
+		log "notifié : Discussion ${repo}#${num} : ${hit_kind} de ${hit_author}"
+	done <<<"${list}"
+}
+
+if ! command -v gh >/dev/null 2>&1; then
+	log "gh introuvable dans PATH"
+	exit 0
+fi
+
+me=''
+if ! me=$(gh api user --jq .login 2>>"${log_file}"); then
+	log "impossible de lire le login GitHub (discussions ignorées)"
+	me=''
+fi
+
+if ! prs_json=$(gh search prs --author=@me --limit 20 --sort updated \
+	--json number,title,url,repository 2>>"${log_file}"); then
+	log "échec de la recherche des PR (authentification ou réseau)"
+	exit 0
+fi
+
+if ! issues_json=$(gh search issues --author=@me --limit 50 --sort updated \
+	--json number,title,url,repository 2>>"${log_file}"); then
+	log "échec de la recherche des issues (authentification ou réseau)"
+	exit 0
+fi
+
+pr_list=$(jq -r '.[] | "\(.repository.nameWithOwner)\t\(.number)"' <<<"${prs_json}")
+issue_list=$(jq -r '.[] | "\(.repository.nameWithOwner)\t\(.number)"' <<<"${issues_json}")
+
+watch pr "${pr_list}"
+watch issue "${issue_list}"
+
+if [[ -n ${me} ]]; then
+	# shellcheck disable=SC2016  # $q est une variable GraphQL
+	disc_query='query($q: String!) {
+		search(query: $q, type: DISCUSSION, first: 50) {
+			nodes {
+				... on Discussion {
+					number
+					repository { nameWithOwner }
+				}
+			}
+		}
+	}'
+	if disc_json=$(gh api graphql -f query="${disc_query}" \
+		-f q="involves:${me} sort:updated" 2>>"${log_file}"); then
+		disc_list=$(jq -r '.data.search.nodes[]
+			| select(.number != null)
+			| "\(.repository.nameWithOwner)\t\(.number)"' <<<"${disc_json}")
+		watch_discussions "${me}" "${disc_list}"
+	else
+		log "échec de la recherche des discussions (authentification ou réseau)"
+	fi
+fi
+
+printf '%s\n' "${new_json}" >"${state_file}"
