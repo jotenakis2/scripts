@@ -14,13 +14,17 @@ Les dépendances varient d'un script à l'autre. Les principales sont :
 
 - `bash`, `coreutils`, `awk`, `grep`, `sed`
 - `procps-ng` (`ps`), `util-linux`
-- `curl`, `jq`
+- `curl`, `jq`, `git`
 - `gum` (interface interactive)
 - `sensors` (`lm_sensors`), `upower`
 - `chkrootkit`, `rkhunter`, `s-nail`/`mailx` (scan rootkit)
 - `openssl` (wanip, si géolocalisation activée)
+- `gh` authentifié (`gh-pr-watch`)
+- `stress-ng`, `fio`, `iperf3` (`omastress`, `nvme-sched-bench3.sh`)
+- `power-profiles-daemon` (`powerprofilesctl`, `cpufreq-boost-test.sh`)
+- `ufw` et accès en lecture au journal noyau (`ufw-watch`, groupe `wheel`)
 
-Sous Arch : `pacman -S --needed curl jq gum lm_sensors upower chkrootkit rkhunter s-nail`.
+Sous Arch : `pacman -S --needed curl jq git gum lm_sensors upower chkrootkit rkhunter s-nail stress-ng fio iperf3 power-profiles-daemon ufw github-cli`.
 Certains paquets peuvent être dans AUR selon les dépôts activés.
 
 ## Scripts
@@ -33,13 +37,21 @@ Certains paquets peuvent être dans AUR selon les dépôts activés.
 | `check-my-git.sh` | État de synchronisation des dépôts Git de `~/Projects`. | Accès réseau (`git fetch`). |
 | `color.sh` | Palette des 256 couleurs du terminal. | Sans effet de bord. |
 | `cpu` | Moniteur d'usage CPU par cœur. | Terminal interactif. |
+| `cpufreq-boost-test.sh` | Mesure si le boost cpufreq d'`apple-cpufreq` suit les profils power-profiles-daemon. | Root. Change governors et profil, restaurés par `trap`. |
 | `crypto.sh` | Tableau des principales cryptomonnaies (CoinGecko). | Réseau + `gum`, `jq`, `awk`. |
 | `dnstest.sh` | Test de fuite DNS via `bash.ws`. | Réseau. |
 | `freeim` | Affichage détaillé RAM/swap (zram, zswap). | Sans dépendance externe. |
-| `kernel_clean.sh` | Suppression interactive d'anciens noyaux de `/boot`. | Root. Adapté Arch (`pacman`) et Fedora (`dnf`). |
+| `gh-pr-watch` | Notifie les nouvelles réponses sur vos PR/issues GitHub, mentions et citations. | `gh` authentifié + `jq`. État dans `~/.local/state/gh-pr-watch`. `--dry-run`. |
+| `kernel_clean.sh` | Suppression interactive d'anciens noyaux de `/boot`. | Root. Arch (`pacman`) et Fedora (`dnf`). Le noyau en cours est détecté par contenu. |
+| `nvme-sched-bench3.sh` | Bench `fio` des schedulers NVMe (kyber, mq-deadline, none), ordre contrôlé. | Root. Vide `/var/tmp/nvme-sched-bench3` à chaque passage. |
+| `omastress` | Session de stress CPU / disque / réseau / RAM, interface `gum`, arrêt thermique. | `stress-ng`, `fio`, `iperf3`. `--demo` pour un essai sans charge. |
 | `psim` | Mise en forme/monitoring des processus. | `ps` + `awk`, lecture seule. |
 | `rootkit_scan.sh` | Scan `chkrootkit` + `rkhunter` et alerte. | Root. E-mail optionnel via `ROOTKIT_ALERT_EMAIL`. |
 | `sensors-HP-645-G9.sh` | Températures CPU/GPU/NVMe/Wi-Fi d'un HP EliteBook 645 G9. | Sondes matérielles codées en dur. |
+| `shmem-parts` | Répartit la mémoire « Shmem » de `/proc/meminfo` par origine (GPU `shmemfs`, tmpfs, mlocks). | Lecture seule. `-n` masque le détail par processus. |
+| `timers-journal.sh` | Timers `systemd --user` et journal du boot courant de chaque service. | Lecture seule. `-a`, `-n LIGNES`, `-t`, `-h`. |
+| `ufw-watch` | Notifie les paquets bloqués par UFW venant d'Internet (hors LAN, link-local, multicast). | Suit `journalctl -kf` ; `--dry-run`, `--test`. |
+| `update-bpc.sh` | Met à jour l'extension Bypass Paywalls Clean (dépôt tiers) dans le profil Helium. | Réseau + `git`. Écrase `~/.local/share/bpc`. |
 | `wanip.sh` | IP WAN + géolocalisation. | Clé API via `WANIP_API_KEY` (voir ci-dessous). |
 
 ## Configuration sensible
