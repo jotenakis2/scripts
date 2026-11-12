@@ -29,6 +29,17 @@ printf 'AC online : %s\n' "${ac_online}"
 printf 'batterie  : %s\n' "${battery_status}"
 printf 'profil    : %s\n' "${original_profile}"
 
+# Le script modifie governors et profil : on les restaure même en cas d'erreur
+# ou d'interruption, sinon la machine reste bloquée en performance.
+restore() {
+  local p
+  for p in "${policies[@]}"; do
+    printf 'schedutil\n' >"${p}/scaling_governor" 2>/dev/null || true
+  done
+  powerprofilesctl set "${original_profile}" >/dev/null 2>&1 || true
+}
+trap restore EXIT INT TERM
+
 # Governor performance : il demande policy->max, contrairement a schedutil.
 for p in "${policies[@]}"; do
   printf 'performance\n' > "${p}/scaling_governor"
@@ -48,9 +59,5 @@ for profile in performance power-saver; do
   done
 done
 
-# Restauration : schedutil + profil d'origine.
-for p in "${policies[@]}"; do
-  printf 'schedutil\n' > "${p}/scaling_governor"
-done
-powerprofilesctl set "${original_profile}" >/dev/null
-printf '\nRestaure : governors=schedutil, profil=%s\n' "${original_profile}"
+# Restauration : faite par le trap (schedutil + profil d'origine).
+printf '\nRestauration : governors=schedutil, profil=%s\n' "${original_profile}"

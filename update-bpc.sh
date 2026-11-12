@@ -255,7 +255,11 @@ install_extension() {
   printf 'Dépôt local           : %s\n' "${CLONE_DIR}"
   printf 'Extension installée   : %s\n' "${INSTALL_DIR}"
   printf 'Version détectée      : %s\n' "${version}"
-  [[ -n "${old_version:-}" && "${old_version}" != "${version}" ]] && printf 'Ancienne version      : %s\n' "${old_version}"
+  # Test en fin de fonction : avec set -e, un test faux ferait sortir le script
+  # avant le nettoyage de l'archive temporaire.
+  if [[ -n "${old_version:-}" && "${old_version}" != "${version}" ]]; then
+    printf 'Ancienne version      : %s\n' "${old_version}"
+  fi
 }
 
 # -------------------------------------------------------------------------------------------------------------------------
