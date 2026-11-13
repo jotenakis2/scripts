@@ -49,7 +49,7 @@ Certains paquets peuvent être dans AUR selon les dépôts activés.
 | `sensors-HP-645-G9.sh` | Températures CPU/GPU/NVMe/Wi-Fi d'un HP EliteBook 645 G9. | Sondes matérielles codées en dur. |
 | `shmem-parts` | Répartit la mémoire « Shmem » de `/proc/meminfo` par origine (GPU `shmemfs`, tmpfs, mlocks). | Lecture seule. `-n` masque le détail par processus. |
 | `timers-journal.sh` | Timers `systemd --user` et journal du boot courant de chaque service. | Lecture seule. `-a`, `-n LIGNES`, `-t`, `-h`. |
-| `update-zsh-plugins.sh` | Clone/met à jour les plugins zsh déclarés dans `plugins.toml` (sheldon) et invalide le cache d'init. | `sheldon` installé. `zsh` ne l'appelle plus au démarrage : c'est le point de maintenance. |
+| `zsh-plugins.sh` | Clone/met à jour les plugins zsh (`zsh-defer`, complétions, `fzf-tab`, `zsh-autosuggestions`) et invalide le dump de complétions. | `git`. Aucun gestionnaire de plugins : le `.zshrc` source les dépôts directement. Actions : `install`, `update` (défaut), `status`. |
 | `ufw-watch` | Notifie les paquets bloqués par UFW venant d'Internet (hors LAN, link-local, multicast). | Suit `journalctl -kf` ; `--dry-run`, `--test`. |
 | `update-bpc.sh` | Met à jour l'extension Bypass Paywalls Clean (dépôt tiers) dans le profil Helium. | Réseau + `git`. Écrase `~/.local/share/bpc`. |
 | `wanip.sh` | IP WAN + géolocalisation. | Clé API via `WANIP_API_KEY` (voir ci-dessous). |
