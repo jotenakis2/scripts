@@ -52,33 +52,55 @@ mkdir -p "${REPO_DIR}"
 
 clone_or_pull() {
   local slug="$1" path="${REPO_DIR}/$1" url="https://github.com/$1"
-  if [[ -d ${path}/.git ]]; then
-    if [[ ${action} == install ]]; then
-      printf '  %-28s déjà présent\n' "${slug}"
-      return 0
-    fi
+  local branch head
+
+  if [[ ! -d ${path}/.git ]]; then
     if [[ ${action} == status ]]; then
-      local head date
-      head=$(git -C "${path}" rev-parse --short HEAD)
-      date=$(git -C "${path}" log -1 --format=%cs)
-      printf '  %-28s %s (%s)\n' "${slug}" "${head}" "${date}"
+      printf '  %-28s absent\n' "${slug}"
       return 0
     fi
-    if git -C "${path}" pull --ff-only --quiet; then
-      local head
-      head=$(git -C "${path}" rev-parse --short HEAD)
-      printf '  %-28s à jour (%s)\n' "${slug}" "${head}"
+    printf '  %-28s clone…\n' "${slug}"
+    git clone --quiet "${url}" "${path}"
+    printf '  %-28s cloné\n' "${slug}"
+    return 0
+  fi
+
+  branch=$(git -C "${path}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo master)
+  # checkouts cloned by a tool (or in detached HEAD) may have no upstream branch:
+  # `git pull` cannot be used, we fetch and fast-forward explicitly
+  [[ ${branch} == HEAD ]] && branch=master
+
+  if [[ ${action} == install ]]; then
+    printf '  %-28s déjà présent\n' "${slug}"
+    return 0
+  fi
+
+  if [[ ${action} == status ]]; then
+    local date
+    head=$(git -C "${path}" rev-parse --short HEAD)
+    date=$(git -C "${path}" log -1 --format=%cs)
+    printf '  %-28s %s (%s) %s\n' "${slug}" "${head}" "${date}" "${branch}"
+    return 0
+  fi
+
+  if ! git -C "${path}" fetch --quiet origin; then
+    printf '  %-28s ÉCHEC du fetch\n' "${slug}" >&2
+    return 1
+  fi
+  if ! git -C "${path}" merge --ff-only --quiet "origin/${branch}" 2>/dev/null; then
+    local dirty
+    dirty=$(git -C "${path}" status --porcelain)
+    if [[ -z ${dirty} ]]; then
+      git -C "${path}" reset --hard --quiet "origin/${branch}"
     else
-      printf '  %-28s ÉCHEC du pull (dépôt modifié ?)\n' "${slug}" >&2
+      printf '  %-28s modifié localement, non mis à jour\n' "${slug}" >&2
       return 1
     fi
-  elif [[ ${action} == status ]]; then
-    printf '  %-28s absent\n' "${slug}"
-  else
-    printf '  %-28s clone…\n' "${slug}"
-    git clone --depth 1 --quiet "${url}" "${path}"
-    printf '  %-28s cloné\n' "${slug}"
   fi
+  # so that a plain `git pull` works by hand later
+  git -C "${path}" branch --set-upstream-to="origin/${branch}" "${branch}" >/dev/null 2>&1 || true
+  head=$(git -C "${path}" rev-parse --short HEAD)
+  printf '  %-28s à jour (%s)\n' "${slug}" "${head}"
 }
 
 printf 'dépôts : %s\n\n' "${REPO_DIR}"
