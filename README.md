@@ -51,6 +51,7 @@ Certains paquets peuvent être dans AUR selon les dépôts activés.
 | `ufw-watch` | Notifie les paquets bloqués par UFW venant d'Internet (hors LAN, link-local, multicast). | Suit `journalctl -kf` ; `--dry-run`, `--test`. |
 | `update-bpc.sh` | Met à jour l'extension Bypass Paywalls Clean (dépôt tiers) dans le profil Helium. | Réseau + `git`. Écrase `~/.local/share/bpc`. |
 | `wanip.sh` | IP WAN + géolocalisation. | Clé API via `WANIP_API_KEY` (voir ci-dessous). |
+| `zsh-history-clean.sh` | Nettoie l'historique zsh : entrées multi-lignes (fragments de heredoc), espaces superflus, entrées préfixées par un antislash, doublons. | `--dry-run`, `--keep N`, `--keep-escaped`, `-f`, `-d`, `--no-backup`. Sauvegarde avant écriture. Fermer les shells zsh avant. |
 
 ## Configuration sensible
 
