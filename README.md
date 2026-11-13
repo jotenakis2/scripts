@@ -20,6 +20,7 @@ Les dépendances varient d'un script à l'autre. Les principales sont :
 - `chkrootkit`, `rkhunter`, `s-nail`/`mailx` (scan rootkit)
 - `openssl` (wanip, si géolocalisation activée)
 - `gh` authentifié (`gh-pr-watch`)
+- `python3` (`zsh-startup-bench.py`, `zsh-history-clean.sh` n'en a pas besoin)
 - `stress-ng`, `fio`, `iperf3` (`omastress`, `nvme-sched-bench3.sh`)
 - `ufw` et accès en lecture au journal noyau (`ufw-watch`, groupe `wheel`)
 
@@ -52,6 +53,7 @@ Certains paquets peuvent être dans AUR selon les dépôts activés.
 | `update-bpc.sh` | Met à jour l'extension Bypass Paywalls Clean (dépôt tiers) dans le profil Helium. | Réseau + `git`. Écrase `~/.local/share/bpc`. |
 | `wanip.sh` | IP WAN + géolocalisation. | Clé API via `WANIP_API_KEY` (voir ci-dessous). |
 | `zsh-history-clean.sh` | Nettoie l'historique zsh : entrées multi-lignes (fragments de heredoc), espaces superflus, entrées préfixées par un antislash, doublons. | `--dry-run`, `--keep N`, `--keep-escaped`, `-f`, `-d`, `--no-backup`. Sauvegarde avant écriture. Fermer les shells zsh avant. |
+| `zsh-startup-bench.py` | Mesure le temps de démarrage réel d'un shell interactif dans un PTY : premier prompt et « pleinement prêt » (tâches différées incluses). | `python3`, sans effet de bord. `--runs`, `--drop-first`, `--per-prompt`, `--cmd`, `--env`. Comparer deux configs sur le `min`, pas la médiane. |
 
 ## Configuration sensible
 
