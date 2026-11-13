@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 # shellcheck enable=all
 #
-# zsh-history-clean.sh — nettoie l'historique zsh (format EXTENDED_HISTORY,
-# `: timestamp:durée;commande`).
+# zsh-history-clean.sh — cleans a zsh history file (EXTENDED_HISTORY format,
+# `: timestamp:duration;command`).
 #
-# Quatre passes, dans cet ordre :
-#   1. entrées multi-lignes supprimées. Avec SHARE_HISTORY + INC_APPEND_HISTORY,
-#      chaque ligne d'une commande multi-ligne / heredoc devient une entrée à
-#      part : la 1re ligne seule, puis des fragments (`}`, `fi`, `EOF`, `\`…).
-#      Les fragments sont jetés, et la 1re ligne aussi puisqu'elle est incomplète.
-#   2. espaces de tête et de queue retirés de chaque commande ; les entrées
-#      devenues vides sont jetées.
-#   3. entrées commençant par `\` jetées : c'est l'échappement d'alias utilisé
-#      ponctuellement (`\ps`, `\gdu`), qui ne représente pas la commande réellement
-#      tapée au quotidien. Désactivable avec --keep-escaped.
-#   4. dédoublonnage sur la commande nettoyée, en gardant la DERNIÈRE occurrence
-#      (même sémantique que HIST_IGNORE_ALL_DUPS), ordre chronologique préservé.
+# Four passes, in this order:
+#   1. multi-line entries dropped. With SHARE_HISTORY + INC_APPEND_HISTORY,
+#      each line of a multi-line command / heredoc becomes a separate entry:
+#      the first line alone, then fragments (`}`, `fi`, `EOF`, `\`…).
+#      Fragments are thrown away, and so is the first line since it is incomplete.
+#   2. leading and trailing spaces trimmed from every command; entries that
+#      became empty are dropped.
+#   3. entries starting with `\` dropped: that is the alias escape used
+#      now and then (`\ps`, `\gdu`), which is not the command actually
+#      typed day to day. Can be disabled with --keep-escaped.
+#   4. dedupe on the cleaned command, keeping the LAST occurrence
+#      (same semantics as HIST_IGNORE_ALL_DUPS), chronological order preserved.
 #
-# ATTENTION : un shell zsh encore ouvert garde sa liste d'historique en mémoire et
-# peut réécrire le fichier en sortant (SHARE_HISTORY). Ferme tes terminaux zsh
-# avant un nettoyage réel, sinon une partie du travail est perdue.
+# WARNING: an open zsh shell keeps its history list in memory and may
+# rewrite the file on exit (SHARE_HISTORY). Close your zsh terminals
+# before a real cleanup, otherwise part of the work is lost.
 
 set -euo pipefail
 
@@ -99,8 +99,8 @@ done
 [[ -r ${HISTFILE_PATH} ]] || die "fichier illisible : ${HISTFILE_PATH}"
 readonly SRC="${HISTFILE_PATH}"
 
-# Sans le préfixe EXTENDED_HISTORY, le fichier n'est pas dans le format attendu :
-# on refuse plutôt que de risquer d'effacer un historique d'un autre format.
+# Without the EXTENDED_HISTORY prefix the file is not in the expected format:
+# we refuse rather than risk wiping a history in another format.
 head -n 1 "${SRC}" | grep -q '^: ' ||
   die "format inattendu : pas de préfixe ': horodatage:;' en première ligne"
 
@@ -110,21 +110,21 @@ readonly SIZE_BEFORE LINES_BEFORE
 
 TMP=$(mktemp "${SRC}.XXXXXX")
 STATS="${TMP}.stats"
-# shellcheck disable=SC2064  # expansion voulue maintenant
+# shellcheck disable=SC2064  # expansion wanted now
 trap "rm -f '${TMP}' '${STATS}'" EXIT
 
-# Passe unique en awk : découpage en entrées, nettoyage, dédoublonnage.
+# Single awk pass: split entries, clean, dedupe.
 awk -v keep="${KEEP}" -v drop_escaped="${DROP_ESCAPED}" -v stats="${STATS}" '
 function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
 
 function flush(   i, prefix, cmd) {
   if (pending == "") return
   i = index(pending, ";")
-  if (i == 0) { pending = ""; return }              # ligne inattendue, ignorée
-  prefix = substr(pending, 1, i)                    # ": horodatage:duree;"
+  if (i == 0) { pending = ""; return }              # unexpected line, ignored
+  prefix = substr(pending, 1, i)                    # ": timestamp:duration;"
   cmd = trim(substr(pending, i + 1))
   if (cmd == "")            { empty++;  pending = ""; return }
-  if (cmd ~ /\\$/)          { orphan++; pending = ""; return }  # continuation seule
+  if (cmd ~ /\\$/)          { orphan++; pending = ""; return }  # continuation on its own
   if (drop_escaped && substr(cmd, 1, 1) == "\\") { escaped++; pending = ""; return }
   n++
   entry[n] = prefix cmd
@@ -134,12 +134,12 @@ function flush(   i, prefix, cmd) {
 }
 
 /^: / { flush(); pending = $0; next }
-{ continuation++; pending = "" }                    # fragment d une entree multi-ligne
+{ continuation++; pending = "" }                    # fragment of a multi-line entry
 
 END {
   flush()
   for (i = 1; i <= n; i++) {
-    if (last[key[i]] != i) { dup++; continue }       # garde la derniere occurrence
+    if (last[key[i]] != i) { dup++; continue }       # keep the last occurrence
     kept[++k] = entry[i]
   }
   start = (keep > 0 && k > keep) ? k - keep + 1 : 1
