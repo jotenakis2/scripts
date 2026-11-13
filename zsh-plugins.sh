@@ -41,6 +41,8 @@ usage() {
 
 command -v git >/dev/null 2>&1 || die "git introuvable dans le PATH"
 
+changed=0   # dépôts qui ont réellement bougé (conditionne l'invalidation du cache)
+
 action="${1:-update}"
 case "${action}" in
   -h | --help | help) usage; exit 0 ;;
@@ -83,6 +85,9 @@ clone_or_pull() {
     return 0
   fi
 
+  local before
+  before=$(git -C "${path}" rev-parse HEAD)
+
   if ! git -C "${path}" fetch --quiet origin; then
     printf '  %-28s ÉCHEC du fetch\n' "${slug}" >&2
     return 1
@@ -100,7 +105,12 @@ clone_or_pull() {
   # so that a plain `git pull` works by hand later
   git -C "${path}" branch --set-upstream-to="origin/${branch}" "${branch}" >/dev/null 2>&1 || true
   head=$(git -C "${path}" rev-parse --short HEAD)
-  printf '  %-28s à jour (%s)\n' "${slug}" "${head}"
+  if [[ ${head} != "${before:0:7}" ]]; then
+    changed=$((changed + 1))
+    printf '  %-28s mis à jour (%s → %s)\n' "${slug}" "${before:0:7}" "${head}"
+  else
+    printf '  %-28s déjà à jour (%s)\n' "${slug}" "${head}"
+  fi
 }
 
 printf 'dépôts : %s\n\n' "${REPO_DIR}"
@@ -109,9 +119,15 @@ for plugin in "${PLUGINS[@]}"; do
 done
 
 if [[ ${action} != status ]]; then
-  # the completion dump was built from the previous checkout state: drop it so
-  # the next shell rebuilds it (compinit TTL would otherwise keep it for 2 days)
-  zdotdir="${ZDOTDIR:-${HOME}/.config/zsh}"
-  rm -f "${zdotdir}/zcompdump" "${zdotdir}/zcompdump.zwc"
-  printf '\nCache de complétions invalidé. Ouvre un nouveau shell zsh.\n'
+  if ((changed)); then
+    # the completion dump was built from the previous checkout state: drop it so
+    # the next shell rebuilds it (the compinit TTL would otherwise keep it for
+    # two days and the new completions would not appear)
+    zdotdir="${ZDOTDIR:-${HOME}/.config/zsh}"
+    rm -f "${zdotdir}/zcompdump" "${zdotdir}/zcompdump.zwc"
+    printf '\n%d dépôt(s) mis à jour → dump de complétions invalidé.\n' "${changed}"
+    printf 'Ouvre un nouveau shell zsh : le shell courant garde les complétions déjà chargées.\n'
+  else
+    printf '\nAucun changement : dump de complétions conservé.\n'
+  fi
 fi
