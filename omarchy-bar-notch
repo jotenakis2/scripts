@@ -1,0 +1,356 @@
+#!/bin/bash
+# shellcheck enable=all
+
+set -euo pipefail
+
+# omarchy-bar-notch: rebuild a local clone of the stock Omarchy bar with a
+# centerAnchor option, and install the local.notchgap widget.
+#
+# The clone is regenerated from the bar installed in $OMARCHY_PATH on every
+# run, then the patch below is applied. When an Omarchy update changes the
+# patched regions the patch fails, the stock bar is put back, and nothing is
+# left half-applied.
+
+readonly omarchy_path="${OMARCHY_PATH:-/usr/share/omarchy}"
+readonly stock_bar_dir="${omarchy_path}/shell/plugins/bar"
+readonly plugins_dir="${HOME}/.config/omarchy/plugins"
+readonly shell_json="${HOME}/.config/omarchy/shell.json"
+readonly gap_id="local.notchgap"
+
+gap_width=185
+configure=0
+
+usage() {
+  cat <<'USAGE'
+Usage: omarchy-bar-notch [options]
+
+Rebuild the patched bar clone and install local.notchgap.
+
+Options:
+  --width N     Width of the notch gap in px (default 185).
+  --configure   Also point shell.json at the clone and the gap widget.
+  -h, --help    Show this help.
+USAGE
+}
+
+log() { printf '%s\n' "$*"; }
+warn() { printf 'omarchy-bar-notch: %s\n' "$*" >&2; }
+die() {
+  warn "$*"
+  exit 1
+}
+
+while (( $# > 0 )); do
+  case "${1}" in
+  --width)
+    [[ $# -ge 2 ]] || die "--width needs a value"
+    [[ ${2} =~ ^[0-9]+$ ]] || die "--width must be a number"
+    gap_width="${2}"
+    shift 2
+    ;;
+  --configure)
+    configure=1
+    shift
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    die "unknown option: ${1}"
+    ;;
+  esac
+done
+
+[[ -d ${stock_bar_dir} ]] || die "stock bar not found in ${stock_bar_dir}"
+[[ -n ${USER:-} ]] || die "USER is not set"
+[[ -f ${shell_json} ]] || die "shell.json not found: ${shell_json}"
+
+bar_id="${USER}.bar"
+clone_dir="${plugins_dir}/${bar_id}"
+
+work_dir="$(mktemp -d "${TMPDIR:-/tmp}/omarchy-bar-notch.XXXXXX")"
+cleanup() { rm -rf -- "${work_dir}"; }
+trap cleanup EXIT
+
+restore_stock() {
+  omarchy bar use omarchy.bar >/dev/null 2>&1 || true
+  rm -rf -- "${clone_dir}"
+}
+
+patch_file="${work_dir}/center-anchor.patch"
+cat > "${patch_file}" <<'PATCH'
+--- a/Bar.qml
++++ b/Bar.qml
+@@ -73,6 +73,11 @@
+   property bool centerHoverRevealSuppressed: false
+   property int barConfigSerial: 0
+   property string position: "top"
++  // The center widget pinned to the middle of the bar: everything before it in
++  // the center section ends at its left edge, everything after it starts at
++  // its right edge. Empty keeps the stock placement (the box centered, or
++  // beside the right section where a display notch covers the middle).
++  property string centerAnchor: ""
+   // Resolves through fontconfig at paint time (Style.font.family defaults
+   // to "monospace"), so changing the system font (via `omarchy-font-set`)
+   // updates the bar without a reload.
+@@ -794,6 +799,7 @@
+     var config = Util.isPlainObject(barConfig) ? barConfig : fallbackBarConfig
+ 
+     position = normalizePosition(config.position)
++    centerAnchor = Util.canonicalWidgetId(String(config.centerAnchor || ""))
+     // opaque, glassy or none; a config from before background says
+     // transparent instead.
+     var look = config.background || (config.transparent === true ? "none" : "opaque")
+@@ -821,6 +827,26 @@
+   property var widgetMemo: ({})
+   readonly property var layoutWidgets: BarModel.layoutWidgets(layoutConfig, widgetMemo)
+ 
++  // Where the center anchor sits in the center section, or -1 when no widget
++  // there carries its id. The center sections split around that key.
++  readonly property int centerAnchorIndex: {
++    var keys = root.layoutWidgets.sections.center || []
++    var entries = root.layoutWidgets.entries || ({})
++    var id = root.centerAnchor
++    if (id === "") return -1
++    for (var i = 0; i < keys.length; i++) {
++      var entry = entries[keys[i]]
++      if (entry && String(entry.id) === id) return i
++    }
++    return -1
++  }
++  // The anchor's layout key, which the middle list shows on its own.
++  readonly property string centerAnchorKey: {
++    var keys = root.layoutWidgets.sections.center || []
++    var index = root.centerAnchorIndex
++    return index >= 0 && index < keys.length ? String(keys[index]) : ""
++  }
++
+   onBarConfigChanged: applyBarConfig()
+ 
+   function layoutEntries(region) {
+@@ -1763,7 +1789,9 @@
+ 
+     readonly property var panelMode: root.panelModeFor(screen)
+ 
+-    readonly property bool centerBesideRight: BarModel.centerBesideRight(root.displayCutouts, root.position, screen.name, screen.width, screen.height, screen.devicePixelRatio, panelMode)
++    // A configured center anchor keeps the center sections in the middle of
++    // the bar, so a display notch no longer moves them beside the right one.
++    readonly property bool centerBesideRight: root.centerAnchorKey === "" && BarModel.centerBesideRight(root.displayCutouts, root.position, screen.name, screen.width, screen.height, screen.devicePixelRatio, panelMode)
+ 
+     readonly property bool cutoutPending: BarModel.cutoutPending(root.displayCutouts, root.position, screen.name, screen.width, screen.height, screen.devicePixelRatio, panelMode)
+     property bool cutoutWaitOver: false
+@@ -2313,19 +2341,45 @@
+     property bool active: true
+     property bool besideRight: false
+ 
+-    implicitWidth: root.vertical ? root.barSize : beginList.width + centerBox.width + endList.width
+-    implicitHeight: root.vertical ? beginList.height + centerBox.height + endList.height : root.barSize
++    // A center anchor splits the section: the keys before it end at its left
++    // edge, the keys after it start at its right edge, and the anchor itself
++    // is centered on the bar. Without one, the center box holds the whole
++    // section as stock does.
++    readonly property bool anchored: active && root.centerAnchorKey !== ""
++    readonly property var centerKeys: root.layoutWidgets.sections.center || []
++    readonly property var beforeKeys: anchored ? centerKeys.slice(0, root.centerAnchorIndex) : []
++    readonly property var afterKeys: anchored ? centerKeys.slice(root.centerAnchorIndex + 1) : []
++
++    implicitWidth: root.vertical
++      ? root.barSize
++      : (anchored
++        ? beforeList.width + anchorList.width + afterList.width
++        : beginList.width + centerBox.width + endList.width)
++    implicitHeight: root.vertical
++      ? (anchored
++        ? beforeList.height + anchorList.height + afterList.height
++        : beginList.height + centerBox.height + endList.height)
++      : root.barSize
+ 
+     // Both placements sit at the bar surface's origin or anchor off its edge,
+     // so the box's start in the sections is its start on the surface.
+-    readonly property real boxStart: root.vertical ? y + centerBox.y : x + centerBox.x
++    readonly property real boxStart: root.vertical
++      ? y + (anchored ? anchorList.y : centerBox.y)
++      : x + (anchored ? beforeList.x : centerBox.x)
++    // An anchored center is placed by its middle, so revealing the indicators
++    // moves nothing under the pointer: the whole bar can open the peek. Without
++    // an anchor the stock edge, the start of the center box, stands.
++    readonly property real peekEdge: anchored
++      ? (root.vertical ? y + height : x + width)
++      : boxStart
+     onBoxStartChanged: syncPeekEdge()
++    onPeekEdgeChanged: syncPeekEdge()
+     onActiveChanged: syncPeekEdge()
+     onWindowChanged: syncPeekEdge()
+     Component.onCompleted: syncPeekEdge()
+ 
+     function syncPeekEdge() {
+-      if (active && window) window.peekEdge = BarModel.nextPeekEdge(window.peekEdge, boxStart, root.centerSectionRevealHeld)
++      if (active && window) window.peekEdge = BarModel.nextPeekEdge(window.peekEdge, peekEdge, root.centerSectionRevealHeld)
+     }
+ 
+     Connections {
+@@ -2333,9 +2387,45 @@
+       function onCenterSectionRevealHeldChanged() { sections.syncPeekEdge() }
+     }
+ 
++    // The widgets before the anchor, ending at its leading edge.
++    ModuleList {
++      id: beforeList
++      keys: sections.beforeKeys
++      window: sections.anchored ? sections.window : null
++      pool: sections.pool
++      region: "center"
++      fixedEdge: "end"
++      x: root.vertical ? Math.round((sections.width - width) / 2) : anchorList.x - width
++      y: root.vertical ? anchorList.y - height : Math.round((sections.height - height) / 2)
++    }
++
++    // The anchor itself, in the middle of the bar.
++    ModuleList {
++      id: anchorList
++      keys: sections.anchored ? [root.centerAnchorKey] : []
++      window: sections.anchored ? sections.window : null
++      pool: sections.pool
++      region: "center"
++      fixedEdge: "center"
++      x: Math.round((sections.width - width) / 2)
++      y: Math.round((sections.height - height) / 2)
++    }
++
++    // The widgets after the anchor, starting at its trailing edge.
++    ModuleList {
++      id: afterList
++      keys: sections.afterKeys
++      window: sections.anchored ? sections.window : null
++      pool: sections.pool
++      region: "center"
++      fixedEdge: "start"
++      x: root.vertical ? Math.round((sections.width - width) / 2) : anchorList.x + anchorList.width
++      y: root.vertical ? anchorList.y + anchorList.height : Math.round((sections.height - height) / 2)
++    }
++
+     ModuleList {
+       id: beginList
+-      keys: sections.active ? root.layoutWidgets.sections.centerBegin : []
++      keys: sections.active && !sections.anchored ? root.layoutWidgets.sections.centerBegin : []
+       window: sections.active ? sections.window : null
+       pool: sections.pool
+       region: "centerBegin"
+@@ -2346,7 +2436,7 @@
+ 
+     ModuleList {
+       id: endList
+-      keys: sections.active ? root.layoutWidgets.sections.centerEnd : []
++      keys: sections.active && !sections.anchored ? root.layoutWidgets.sections.centerEnd : []
+       window: sections.active ? sections.window : null
+       pool: sections.pool
+       region: "centerEnd"
+@@ -2359,7 +2449,7 @@
+       id: centerBox
+       window: sections.window
+       pool: sections.pool
+-      active: sections.active
++      active: sections.active && !sections.anchored
+       fixedEdge: sections.besideRight ? "end" : "center"
+       crossSize: root.vertical ? sections.width : sections.height
+       x: root.vertical ? 0 : (sections.besideRight ? beginList.width : Math.round((sections.width - width) / 2))
+PATCH
+
+log "Cloning the stock bar to ${clone_dir}"
+rm -rf -- "${clone_dir}"
+clone_out="$(omarchy plugin clone omarchy.bar)"
+log "${clone_out}"
+if [[ ! -f ${clone_dir}/Bar.qml ]]; then
+  restore_stock
+  die "the clone did not appear in ${clone_dir}"
+fi
+
+log "Applying the centerAnchor patch"
+if ! patch --batch --forward -p1 -d "${clone_dir}" <"${patch_file}"; then
+  restore_stock
+  die "the patch no longer applies to ${stock_bar_dir}/Bar.qml; stock bar restored"
+fi
+
+log "Installing ${gap_id}"
+mkdir -p "${plugins_dir}/${gap_id}"
+cat >"${plugins_dir}/${gap_id}/manifest.json" <<'MANIFEST'
+{
+  "schemaVersion": 1,
+  "id": "local.notchgap",
+  "name": "Notch gap",
+  "version": "1.0.0",
+  "author": "local",
+  "license": "MIT",
+  "description": "Espace vide a la largeur du notch, pour ancrer la section centre dessus.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "NotchGap.qml"
+  },
+  "barWidget": {
+    "displayName": "Notch gap",
+    "description": "Espace de la largeur du notch",
+    "category": "Layout",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "width": 185
+    }
+  }
+}
+MANIFEST
+
+cat >"${plugins_dir}/${gap_id}/NotchGap.qml" <<'QML'
+import QtQuick
+import qs.Ui
+
+// An empty width the size of the display notch (plus a small margin on each
+// side). Put in the center section and named as the bar's centerAnchor, it is
+// what the center group is centered on: the widgets before it end at its left
+// edge, the widgets after start at its right edge, whatever their own widths.
+BarWidget {
+  id: root
+  moduleName: "local.notchgap"
+
+  readonly property int span: Math.max(0, Number(setting("width", 185)))
+
+  implicitWidth: vertical ? barSize : span
+  implicitHeight: vertical ? span : barSize
+}
+QML
+
+omarchy-shell -q shell rescanPlugins || true
+
+if (( configure )); then
+  log "Pointing ${shell_json} at ${bar_id} with ${gap_id} as the center anchor"
+  tmp_json="${work_dir}/shell.json"
+  jq \
+    --arg id "${bar_id}" \
+    --arg gap "${gap_id}" \
+    --argjson width "${gap_width}" '
+      .bar.id = $id
+      | .bar.centerAnchor = $gap
+      | .bar.layout.center = (
+          (.bar.layout.center // []) as $center
+          | if any($center[]; .id == $gap) then
+              $center | map(if .id == $gap then .width = $width else . end)
+            else
+              ($center | map(.id) | index("omarchy.clock")) as $at
+              | if $at == null then
+                  $center + [{ id: $gap, width: $width }]
+                else
+                  $center[:$at + 1] + [{ id: $gap, width: $width }] + $center[$at + 1:]
+                end
+            end
+        )
+    ' "${shell_json}" >"${tmp_json}"
+  mv -- "${tmp_json}" "${shell_json}"
+
+  if jq -e '((.bar.layout.centerBegin // []) + (.bar.layout.centerEnd // [])) | length > 0' "${shell_json}" >/dev/null; then
+    warn "centerBegin/centerEnd are not drawn while centerAnchor is set; move those widgets to another section"
+  fi
+
+  omarchy-shell -q shell rescanPlugins || true
+fi
+
+log "Done. Bar: ${bar_id}; gap: ${gap_id} (${gap_width} px)"
