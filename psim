@@ -823,9 +823,8 @@ RENDER() {
 }
 
 ##############################################################################
-# Bandeau
+# Statut
 ##############################################################################
-# Construit le bandeau dans les variables globales plain/colored.
 # Statut compact, à droite de l'entête : filtre, gel/intervalle, défilement.
 # C'est tout ce que le bandeau apportait en plus des raccourcis — ceux-ci vivent
 # maintenant dans la boîte de la touche H, ce qui rend une ligne au tableau.
@@ -1162,12 +1161,12 @@ RUN_DYNAMIC() {
         printf '\033[H'
         RENDER 1 "${LIMIT}" "${HEADER}" "${FOOTER}"
         if (( bar == 1 )); then
-            # pas d'effacement ici : la ligne du bandeau est réécrite par-dessus
+            # pas d'effacement ici : la ligne du statut est réécrite par-dessus
             # (un \033[J la blanchirait avant de la redessiner -> scintillement)
             printf '\n'
             PRINT_STATUS
         else
-            # pas de bandeau : on nettoie ce qui reste sous le pied de page
+            # pas de ligne de statut : on nettoie sous le pied de page
             printf '\033[J'
         fi
 
@@ -1210,7 +1209,7 @@ WRITE_LOG() {
         printf 'awk         : %s (%s)\n' "${AWK_BIN}" "${awkver}"
         printf 'tri         : %s | filtre : %s\n' "${SORT}" "${FILTER}"
         printf 'newbie      : %s | noyau : %s | options : %s\n' "${NEWBIE}" "${KERNEL}" "${SHOW_OPTS}"
-        printf 'entête      : %s | pied : %s | bandeau : %s | couleur : %s\n' \
+        printf 'entête      : %s | pied : %s | statut : %s | couleur : %s\n' \
             "${HEADER}" "${FOOTER}" "${TIPS}" "$(( NO_COLOR == 0 ? 1 : 0 ))"
         printf '\n'
     } >> "${LOG_FILE}" 2>/dev/null || true
