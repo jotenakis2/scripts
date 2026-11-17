@@ -45,7 +45,7 @@ readonly ICON_SCROLL=$'\u2195'
 # État
 declare -i WIDTH=120 HEIGHT=40
 declare -i LIMIT=0 OFFSET=0 TOTAL=0
-declare -i ALT=0 SESSION=0 CLEANED=0 TTY=0 STDIN_TTY=0
+declare -i ALT=0 SESSION=0 CLEANED=0 TTY=0 STDIN_TTY=0 SIZE_KNOWN=0 WINCH=0
 declare -i FILTER_EDIT=0 FILTER_INVALID=0
 declare -i NEWBIE=1 INTERVAL=1 HEADER=1 FOOTER=1 TIPS=1 NO_COLOR=0
 declare -i KERNEL=0 STATIC=1 SHOW_OPTS=0 FREEZE=0 LOG=1 DEBUG=0 CPU_MODE=0
@@ -465,6 +465,37 @@ CHECK_DEPS() {
     return 0
 }
 
+# Le shell qui tape « psim -g zzz » porte ce motif dans sa propre ligne de
+# commande : sans exclusion, il apparaît dans ses propres résultats. On remonte
+# la chaîne des parents et on écarte ceux qui nomment psim.
+#
+# Tout est fait avec des primitives bash (aucun tr/sed/cut) : le parcours ajoute
+# sinon une trentaine de forks au démarrage, ce qui coûtait plus cher que la
+# lecture de taille qu'on vient d'économiser.
+COLLECT_EXCLUDES() {
+    EXCL_PIDS=("${SELF_PID}")
+    local p="${PPID:-0}" cmd='' line='' ppid='' i=0
+    local -a _argv=()
+    while (( i < 12 )) && [[ "${p}" =~ ^[0-9]+$ ]] && (( p > 1 )); do
+        [[ -r "/proc/${p}/cmdline" ]] || break
+        mapfile -d '' -t _argv 2>/dev/null <"/proc/${p}/cmdline" || true
+        cmd="${_argv[*]}"
+        [[ "${cmd}" == *psim* ]] && EXCL_PIDS+=("${p}")
+        ppid=''
+        while IFS= read -r line; do
+            if [[ "${line}" == PPid:* ]]; then
+                ppid="${line#PPid:}"
+                ppid="${ppid//[[:space:]]/}"
+                break
+            fi
+        done 2>/dev/null <"/proc/${p}/status" || true
+        [[ -n "${ppid}" ]] || break
+        p="${ppid}"
+        i=$((i + 1))
+    done
+    return 0
+}
+
 PREPARE_CACHE() {
     if ! mkdir -p "${CACHE_DIR}" 2>/dev/null; then
         WARN "impossible de créer ${CACHE_DIR} : journal et défilement désactivés"
@@ -475,15 +506,29 @@ PREPARE_CACHE() {
         return 0
     fi
     chmod 700 "${CACHE_DIR}" 2>/dev/null || true
-    # ménage : fichiers d'état laissés par des instances tuées brutalement
-    rm -f "${CACHE_DIR}"/drawn.* 2>/dev/null || true
+    # ménage : seulement les états d'instances mortes. Effacer drawn.* sans
+    # distinction cassait le défilement d'une instance voisine (TOTAL perdu).
+    local f pid
+    for f in "${CACHE_DIR}"/drawn.*; do
+        [[ -e "${f}" ]] || continue
+        pid="${f##*.}"
+        [[ "${pid}" =~ ^[0-9]+$ ]] || { rm -f "${f}" 2>/dev/null || true; continue; }
+        (( pid == SELF_PID )) && continue
+        [[ -d "/proc/${pid}" ]] || rm -f "${f}" 2>/dev/null || true
+    done
     : > "${DRAW_FILE}" 2>/dev/null || DRAW_FILE=""
     [[ -z "${DRAW_FILE}" ]] || chmod 600 "${DRAW_FILE}" 2>/dev/null || true
     return 0
 }
 
+# La taille est lue UNE fois au lancement (deux appels tput = deux forks) puis
+# seulement sur SIGWINCH : un tick ne doit forker pour rien. READ_SIZE 1 force
+# la relecture.
 READ_SIZE() {
-    local cols lines
+    local cols lines force="${1:-0}"
+    if (( force == 0 && SIZE_KNOWN == 1 )); then
+        return 0
+    fi
     if (( TTY == 1 )); then
         cols=$(tput cols 2>/dev/null || printf '%s' "${COLUMNS:-0}")
         lines=$(tput lines 2>/dev/null || printf '%s' "${LINES:-0}")
@@ -491,6 +536,7 @@ READ_SIZE() {
         cols="${COLUMNS:-0}"
         lines="${LINES:-0}"
     fi
+    SIZE_KNOWN=1
     [[ "${cols}"  =~ ^[0-9]+$ ]] || cols=0
     [[ "${lines}" =~ ^[0-9]+$ ]] || lines=0
     (( cols  > 0 )) || cols=120
@@ -733,10 +779,13 @@ RENDER() {
     # une seule sélection : tout sauf nous-mêmes (le filtrage noyau est fait par awk,
     # ce qui évite de supposer que PID 2 est kthreadd)
     pscmd=("${PS_BIN}" -ww -o "${format}" --sort="${SORT}" --no-headers)
+    local pid
+    for pid in "${EXCL_PIDS[@]}"; do
+        (( pid > 1 )) || continue
+        pscmd+=(--deselect --pid "${pid}")
+    done
     if (( SELF_PID > 1 )); then
-        pscmd+=(--deselect --pid "${SELF_PID}" --ppid "${SELF_PID}")
-    else
-        pscmd+=(--deselect --pid "${SELF_PID}")
+        pscmd+=(--deselect --ppid "${SELF_PID}")
     fi
 
     local -i arc=0
@@ -1055,9 +1104,16 @@ RUN_DYNAMIC() {
     printf '\033[?25l\033[?1049h\033[H'
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP
+    # un redimensionnement doit être vu tout de suite : sinon, gelé (intervalle
+    # de 3599 s), la mise en page reste fausse pendant près d'une heure.
+    WINCH=0
+    trap 'WINCH=1' WINCH
 
     while :; do
-        READ_SIZE
+        if (( WINCH == 1 )); then
+            WINCH=0
+            READ_SIZE 1
+        fi
         if (( WIDTH < MIN_W || HEIGHT < MIN_H )); then
             RESTORE_SCREEN
             ERR "terminal trop petit (${WIDTH}x${HEIGHT}), minimum ${MIN_W}x${MIN_H}."
@@ -1190,6 +1246,7 @@ MAIN() {
     CONFIG_DEFAULTS
     DEFINE_COLORS
     CHECK_DEPS
+    COLLECT_EXCLUDES
     LOAD_CONFIG
     DEFINE_COLORS
     PARSE_ARGS "$@"
