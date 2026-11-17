@@ -1011,13 +1011,14 @@ HELP_OVERLAY() {
     local desc
     local kpad dpad line hint title hz bv tl tr bl br bg reset
 
-    ktxt=( 'c' 'C' 'm' 'p / P' 'N' 'u' 'M' 'o' 'k' 'h' 'f' '/' '- / +'
+    ktxt=( 'c' 'C' 'm' 'p' 'P' 'N' 'u' 'M' 'o' 'k' 'h' 'f' '/' '- / +'
            'F' '↑ / ↓' 'Début / Fin' '← / →' 'q' '?' )
-    dtxt=( 'trier par %CPU' 'trier par commande' 'trier par mémoire' 'trier par PID / PPID'
-           'trier par nice' 'trier par utilisateur' '%CPU : cœur / machine' 'options des commandes'
-           'threads noyau (cycle)' 'entête on / off' 'pied de page on / off'
-           'filtrer (Entrée / Échap)' 'ralentir / accélérer' 'gel / dégel' 'défiler'
-           'premier / dernier' 'simplifié / étendu' 'quitter' 'cette aide' )
+    dtxt=( 'trier par %CPU' 'trier par commande' 'trier par mémoire' 'trier par PID'
+           'trier par PPID' 'trier par nice' 'trier par utilisateur' '%CPU : cœur / machine'
+           'options des commandes' 'threads noyau (cycle)' 'entête on / off'
+           'pied de page on / off' 'filtrer (Entrée / Échap)' 'ralentir / accélérer'
+           'gel / dégel' 'défiler' 'premier / dernier' 'simplifié / étendu'
+           'quitter' 'cette aide' )
     n=${#ktxt[@]}
 
     if (( NO_COLOR == 0 )); then
