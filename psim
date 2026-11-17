@@ -258,6 +258,7 @@ ${Vert}RACCOURCIS (dynamique)${Reset}
    k  noyau
    h  entête     f  pied        t/?  bandeau      q  quitter
    +/-  délai    F  gel/dégel   ↑↓/Home/End       ←/→  newbie/étendu
+   H  aide en sur-impression (la liste complète, sans le bandeau tronqué)
 
 ${Vert}FILTRE INTERACTIF${Reset}
    ${Jaune}/${Reset} ouvre la saisie : le motif se construit caractère par caractère et la liste
@@ -1059,6 +1060,7 @@ HANDLE_KEY() {
         h) HEADER=$((1 - HEADER)) ;;
         f) FOOTER=$((1 - FOOTER)) ;;
         t|'?') TIPS=$((1 - TIPS)) ;;   # '? = alias de t
+        H) HELP_OVERLAY ;;
         q|Q) QUIT 0 ;;
         +)
             if (( INTERVAL >= 120 )); then INTERVAL=120; else INTERVAL=$((INTERVAL + 1)); fi
@@ -1103,6 +1105,134 @@ HANDLE_KEY() {
             ;;
         *) : ;;
     esac
+    return 0
+}
+
+##############################################################################
+# Aide en sur-impression (touche H)
+#
+# Modale : dessinée par-dessus la vue, elle attend une touche, puis l'écran est
+# effacé et la boucle redessine l'image. Aucun coût par rafraîchissement : rien
+# n'est ajouté au chemin normal.
+##############################################################################
+# Remplissage à la largeur demandée en CARACTÈRES. printf '%-12s' compte des
+# octets : « Début / Fin » (12 octets, 11 caractères) sortait décalé d'une
+# colonne, et « ↑ / ↓ » de quatre.
+HPAD() {
+    local s="$1"
+    local -i w="$2" n
+    n=${#s}
+    if (( n >= w )); then
+        printf '%s' "${s:0:w}"
+    else
+        printf '%s%*s' "${s}" $(( w - n )) ''
+    fi
+    return 0
+}
+
+HELP_OVERLAY() {
+    local -a ktxt dtxt
+    local -i n cols keyw descw cellw bw bh rows x0 y0 r c idx inner pad avail
+    local desc
+    local kpad dpad line hint title hz bv tl tr bl br bg reset
+
+    ktxt=( 'c' 'C' 'm' 'p / P' 'N' 'u' 'M' 'o' 'k' 'h' 'f' 't / ?' '/' '- / +'
+           'F' '↑ / ↓' 'Début / Fin' '← / →' 'q' 'H' )
+    dtxt=( 'trier par %CPU' 'trier par commande' 'trier par mémoire' 'trier par PID / PPID'
+           'trier par nice' 'trier par utilisateur' '%CPU : cœur / machine' 'options des commandes'
+           'threads noyau (cycle)' 'entête on / off' 'pied de page on / off' 'bandeau on / off'
+           'filtrer (Entrée / Échap)' 'ralentir / accélérer' 'gel / dégel' 'défiler'
+           'premier / dernier' 'simplifié / étendu' 'quitter' 'cette aide' )
+    n=${#ktxt[@]}
+
+    if (( NO_COLOR == 0 )); then
+        hz='─'; bv='│'; tl='┌'; tr='┐'; bl='└'; br='┘'
+        bg="${BgGris}"; reset="${Reset}"
+    else
+        hz='-'; bv='|'; tl='+'; tr='+'; bl='+'; br='+'
+        bg=''; reset=''
+    fi
+
+    # deux colonnes si la largeur le permet ; sinon, en hauteur insuffisante,
+    # on préfère deux colonnes serrées à une liste amputée de ses dernières
+    # lignes (c'est ainsi que « q » et « H » disparaissaient sur 22 lignes)
+    cols=1
+    if (( WIDTH >= 104 )); then
+        cols=2
+    elif (( WIDTH >= 56 && n > HEIGHT - 4 )); then
+        cols=2
+    fi
+    keyw=12
+    (( WIDTH < 70 )) && keyw=10
+    # tout dérive de la largeur disponible : une largeur de description
+    # forcée vers le haut faisait déborder la bordure droite d'un caractère
+    avail=$(( WIDTH - 2 - 3 * (cols - 1) ))
+    descw=$(( avail / cols - (keyw + 2) ))
+    (( descw < 8 )) && descw=8
+    (( descw > 46 )) && descw=46
+    cellw=$(( keyw + 2 + descw ))
+    bw=$(( 2 + cellw * cols + 3 * (cols - 1) ))
+    rows=$(( (n + cols - 1) / cols ))
+    (( rows + 4 > HEIGHT )) && rows=$(( HEIGHT - 4 ))
+    (( rows < 1 )) && rows=1
+    bh=$(( rows + 3 ))
+
+    x0=$(( (WIDTH - bw) / 2 + 1 ))
+    y0=$(( (HEIGHT - bh) / 2 + 1 ))
+    (( x0 < 1 )) && x0=1
+    (( y0 < 1 )) && y0=1
+    inner=$(( bw - 2 ))
+
+    # bord supérieur, titre inclus
+    title=' AIDE — raccourcis '
+    (( ${#title} > inner )) && title=' AIDE '
+    line="${tl}${hz}${title}"
+    while (( ${#line} < bw - 1 )); do line+="${hz}"; done
+    line+="${tr}"
+    printf '%s\033[%d;%dH%s%s%s\033[K' "${bg}" "${y0}" "${x0}" "${Blanc}" "${line}" "${reset}"
+
+    for ((r = 0; r < rows; r++)); do
+        line="${bv}"
+        for ((c = 0; c < cols; c++)); do
+            idx=$(( c * rows + r ))
+            (( c > 0 )) && line+='   '
+            if (( idx < n )); then
+                kpad=$(HPAD "${ktxt[idx]}" "${keyw}")
+                desc="${dtxt[idx]}"
+                if (( ${#desc} > descw )); then
+                    desc="${desc:0:$(( descw - 1 ))}…"
+                fi
+                dpad=$(HPAD "${desc}" "${descw}")
+                line+=" ${BleuBold}${kpad}${ResetFg} ${dpad}"
+            else
+                line+=$(HPAD '' "${cellw}")
+            fi
+        done
+        line+="${bv}"
+        printf '%s\033[%d;%dH%s%s%s\033[K' "${bg}" "$(( y0 + 1 + r ))" "${x0}" "${Blanc}" "${line}" "${reset}"
+    done
+
+    hint='une touche pour fermer'
+    pad=$(( (inner - ${#hint}) / 2 ))
+    (( pad < 1 )) && pad=1
+    line="${bv}$(printf '%*s' "${pad}" '')${Gris}${hint}${ResetFg}"
+    line+=$(HPAD '' "$(( inner - pad - ${#hint} ))")
+    line+="${bv}"
+    printf '%s\033[%d;%dH%s%s%s\033[K' "${bg}" "$(( y0 + 1 + rows ))" "${x0}" "${Blanc}" "${line}" "${reset}"
+
+    line="${bl}"
+    for ((i = 0; i < inner; i++)); do line+="${hz}"; done
+    line+="${br}"
+    printf '%s\033[%d;%dH%s%s%s\033[K' "${bg}" "$(( y0 + rows + 2 ))" "${x0}" "${Blanc}" "${line}" "${reset}"
+
+    # modale : on attend une touche (n'importe laquelle)
+    local -i k=0
+    IFS= read -rsn1 _hk 2>/dev/null || k=1
+    : "${k}"
+
+    # l'image précédente est plus étroite que la boîte : on efface, la boucle
+    # redessine aussitôt
+    printf '\033[2J'
     return 0
 }
 
