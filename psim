@@ -353,7 +353,9 @@ PARSE_ARGS() {
             -v|--version) VERSION; QUIT 0 ;;
             -w|--watch)
                 NEED_ARG "${arg}" "${2:-}"
-                if [[ ! "${2}" =~ ^[0-9]+$ ]] || (( 10#${2} > INTERVAL_MAX )); then
+                # ${#2} : un entier de 19 chiffres déborde en négatif et
+                # passerait le test, pour finir en « sleep: invalid option »
+                if [[ ! "${2}" =~ ^[0-9]+$ ]] || (( ${#2} > 4 )) || (( 10#${2} > INTERVAL_MAX )); then
                     ERR "${arg} attend un entier entre 0 et ${INTERVAL_MAX}."
                     QUIT 2
                 fi
@@ -375,6 +377,10 @@ PARSE_ARGS() {
                     continue
                 fi
                 if [[ "${arg}" =~ ^--([0-9]+)$ ]]; then
+                    if (( ${#BASH_REMATCH[1]} > 6 )) || (( 10#${BASH_REMATCH[1]} > 10000 )); then
+                        ERR "--N trop grand (maximum 10000)."
+                        QUIT 2
+                    fi
                     LIMIT=$((10#${BASH_REMATCH[1]}))
                     STATIC=1
                     shift
@@ -439,8 +445,13 @@ PARSE_ARGS() {
 ##############################################################################
 INIT_PATHS() {
     local cfg_home cache_home
-    cfg_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
-    cache_home="${XDG_CACHE_HOME:-${HOME}/.cache}"
+    # set -u ferait mourir bash sur « HOME: unbound variable », sans diagnostic
+    if [[ -z "${HOME:-}" && -z "${XDG_CONFIG_HOME:-}" && -z "${XDG_CACHE_HOME:-}" ]]; then
+        ERR "ni HOME ni XDG_CONFIG_HOME/XDG_CACHE_HOME : impossible de situer la configuration."
+        return 1
+    fi
+    cfg_home="${XDG_CONFIG_HOME:-${HOME:-}/.config}"
+    cache_home="${XDG_CACHE_HOME:-${HOME:-}/.cache}"
     CONFIG="${cfg_home}/${CONF_NAME}/default.conf"
     if [[ ! -f "${CONFIG}" && -f "${cfg_home}/psim/default.conf" ]]; then
         CONFIG="${cfg_home}/psim/default.conf"   # reprise de l'ancienne config
@@ -726,7 +737,9 @@ END {
     if (drawfile != "")
         printf "%d %d\n", shown, total > drawfile
 
-    if (pad) {
+    # remplir l'écran ne sert qu'en dynamique : en statique, --100000 sortait
+    # 99 999 lignes vides
+    if (fill) {
         for (i = shown; i < limit; i++) emit(EL)
     }
     if (footer && pad) {
@@ -748,7 +761,7 @@ AWKEOF
 # Rendu
 ##############################################################################
 RENDER() {
-    local -i pad="$1" limit="$2" header="$3" footer="$4"
+    local -i pad="$1" limit="$2" header="$3" footer="$4" fill="${5:-${1}}"
     local format
     local -a pscmd awkcmd
 
@@ -763,7 +776,7 @@ RENDER() {
     export PSIM_FILTER
 
     awkcmd=("${AWK_BIN}"
-        -v newbie="${NEWBIE}"  -v width="${WIDTH}"    -v pad="${pad}"
+        -v newbie="${NEWBIE}"  -v width="${WIDTH}"    -v pad="${pad}" -v fill="${fill}"
         -v limit="${limit}"    -v offset="${OFFSET}"  -v header="${header}"
         -v footer="${footer}"  -v color="$(( NO_COLOR == 0 ? 1 : 0 ))"
         -v showopts="${SHOW_OPTS}" -v kernel="${KERNEL}" -v sort="${SORT}" -v cpu_mode="${CPU_MODE}"
@@ -1104,6 +1117,7 @@ RUN_DYNAMIC() {
     printf '\033[?25l\033[?1049h\033[H'
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP
+    trap 'exit 131' QUIT PIPE
     # un redimensionnement doit être vu tout de suite : sinon, gelé (intervalle
     # de 3599 s), la mise en page reste fausse pendant près d'une heure.
     WINCH=0
@@ -1153,7 +1167,7 @@ RUN_DYNAMIC() {
 RUN_STATIC() {
     READ_SIZE
     (( WIDTH < THIN_W )) && NEWBIE=1
-    RENDER "${TTY}" "${LIMIT}" "${HEADER}" "${FOOTER}"
+    RENDER "${TTY}" "${LIMIT}" "${HEADER}" "${FOOTER}" 0
     return 0
 }
 
@@ -1242,7 +1256,8 @@ MAIN() {
     STDIN_TTY=0
     [[ -t 0 ]] && STDIN_TTY=1
 
-    INIT_PATHS
+    # shellcheck disable=SC2310  # le message est déjà affiché par INIT_PATHS
+    INIT_PATHS || QUIT 1
     CONFIG_DEFAULTS
     DEFINE_COLORS
     CHECK_DEPS
@@ -1258,15 +1273,17 @@ MAIN() {
         VALIDATE_FILTER || QUIT 2
     fi
 
-    PREPARE_CACHE
     READ_SIZE
-    SESSION=1
-    trap ON_EXIT EXIT
-
     if (( STATIC == 1 )); then
         RUN_STATIC
         return 0
     fi
+
+    # session interactive seulement : un « psim | grep » ne doit ni écrire le
+    # journal (~400 o et ~16 ms par appel) ni créer le cache
+    PREPARE_CACHE
+    SESSION=1
+    trap ON_EXIT EXIT
     RUN_DYNAMIC
     return 0
 }
