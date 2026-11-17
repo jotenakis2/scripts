@@ -35,17 +35,16 @@ readonly MIN_H=6
 readonly INTERVAL_MAX=3599 # au-delà : gel
 readonly LOG_MAX=262144    # rotation du journal (octets)
 
-# Glyphes Nerd Font du bandeau (identiques à psim 0.999)
-readonly ICON_LEAD=$'\uF400'      # icône « info » du bandeau
+# Glyphe Nerd Font du statut (horloge de l'intervalle)
 readonly ICON_CLOCK=$'\uF449'
-readonly ICON_MODE=$'\uEBCB'      # flèches gauche/droite (bandeau large)
-readonly ICON_MODE_SHORT=$'\uF0B2'
-readonly ICON_SCROLL=$'\u2195'
 
 # État
 declare -i WIDTH=120 HEIGHT=40
 declare -i LIMIT=0 OFFSET=0 TOTAL=0
 declare -i ALT=0 SESSION=0 CLEANED=0 TTY=0 STDIN_TTY=0 SIZE_KNOWN=0 WINCH=0
+declare -i STATUSW=0
+status_p=''
+status_c=''
 declare -i FILTER_EDIT=0 FILTER_INVALID=0
 declare -i NEWBIE=1 INTERVAL=1 HEADER=1 FOOTER=1 TIPS=1 NO_COLOR=0
 declare -i KERNEL=0 STATIC=1 SHOW_OPTS=0 FREEZE=0 LOG=1 DEBUG=0 CPU_MODE=0
@@ -54,12 +53,10 @@ declare FILTER="" FILTER_BUF="" FILTER_SAVE=""
 declare -i NCPU=1
 declare PS_BIN="" AWK_BIN="" CONFIG="" CACHE_DIR="" DRAW_FILE="" LOG_FILE="" ME=""
 declare STTY_SAVE=""
-declare lead="" plain="" colored=""
 declare -a CLUSTER_ARGS=()
-declare crit_p="" tail_p="" tail_c="" filt_p="" filt_c=""
 
 # Couleurs (remplies par DEFINE_COLORS)
-Rouge="" Vert="" VertBold="" Jaune="" Bleu="" BleuBold="" Magenta="" Cyan="" Blanc=""
+Rouge="" Vert="" Jaune="" Bleu="" BleuBold="" Magenta="" Cyan="" Blanc=""
 RougeBold="" Gris="" BgGris="" Reset="" ResetFg="" Underline=""
 
 ##############################################################################
@@ -83,10 +80,10 @@ QUIT() { exit "${1:-0}"; }
 
 DEFINE_COLORS() {
     if (( NO_COLOR == 1 )) || (( TTY == 0 )) || [[ "${TERM:-dumb}" == "dumb" ]]; then
-        Rouge="" Vert="" VertBold="" Jaune="" Bleu="" BleuBold="" Magenta="" Cyan="" Blanc=""
+        Rouge="" Vert="" Jaune="" Bleu="" BleuBold="" Magenta="" Cyan="" Blanc=""
         RougeBold="" Gris="" BgGris="" Reset="" ResetFg="" Underline=""
     else
-        Rouge=$'\033[31m' ; Vert=$'\033[32m' ; VertBold=$'\033[1;32m' ; Jaune=$'\033[33m'
+        Rouge=$'\033[31m' ; Vert=$'\033[32m' ; Jaune=$'\033[33m'
         Bleu=$'\033[34m'  ; BleuBold=$'\033[1;34m' ; Magenta=$'\033[35m'
         Cyan=$'\033[36m'  ; Blanc=$'\033[37m' ; RougeBold=$'\033[1;31m'
         Gris=$'\033[37m'  ; BgGris=$'\033[100m'
@@ -222,7 +219,7 @@ ${Vert}OPTIONS${Reset}
    ${Bleu}-w, --watch N${Reset}          rafraîchir toutes les N s (0 = statique)
    ${Bleu}-H, --no-header${Reset}        masquer l'entête
    ${Bleu}-F, --no-footer${Reset}        masquer le pied de page
-   ${Bleu}-T, --no-tips${Reset}          masquer le bandeau des raccourcis
+   ${Bleu}-T, --no-tips${Reset}          masquer la ligne de statut
    ${Bleu}-O, --fullcmd${Reset}          chemin complet et arguments
    ${Bleu}-0, --no-color${Reset}         sans couleurs
    ${Bleu}-M, --machine-cpu${Reset}      %CPU des lignes en % de la machine (défaut : par cœur)
@@ -256,14 +253,16 @@ ${Vert}RACCOURCIS (dynamique)${Reset}
    /  filtre     Enter valider  Échap annuler     Ctrl-U effacer
    c/m/p/P/N/u/C tri            o  options        M  %CPU machine
    k  noyau
-   h  entête     f  pied        t/?  bandeau      q  quitter
+   h  entête     f  pied        t/?  statut       q  quitter
    +/-  délai    F  gel/dégel   ↑↓/Home/End       ←/→  newbie/étendu
-   H  aide en sur-impression (la liste complète, sans le bandeau tronqué)
+   H  aide en sur-impression : la liste complète des raccourcis. Le bandeau
+      fixe du bas a disparu ; le statut (filtre, gel, défilement) s'affiche à
+      droite de l'entête, ou sur une ligne en bas si l'entête est masquée.
 
 ${Vert}FILTRE INTERACTIF${Reset}
    ${Jaune}/${Reset} ouvre la saisie : le motif se construit caractère par caractère et la liste
    se filtre en direct (Entrée valide, Échap annule, Backspace efface, Ctrl-U vide).
-   Un motif invalide vide la liste et affiche ${RougeBold}invalide${Reset} dans le bandeau.
+   Un motif invalide vide la liste et affiche ${RougeBold}invalide${Reset} dans le statut.
 
 ${Vert}PIPE / REDIRECTION${Reset}
    Sans terminal, ${Jaune}${NAME}${Reset} passe en statique, sans couleur ni échappement,
@@ -645,9 +644,16 @@ function emit_header() {
                 hc(sprintf("%6s", hdr_cpu), GREEN, sort ~ /^-?%?cpu$/) "   " \
                 hc(hdr_cmd, YELLOW, sort ~ /^-?%?cmd$/)
         }
+        # statut à droite (filtre, gel, défilement) : il n'a de place que si
+        # l'entête est plus étroit que le terminal
+        stat = ""
         pad_h = width - hdr_plain_len
+        if (statusw > 0 && pad_h > statusw + 1) {
+            pad_h = pad_h - statusw - 2
+            stat = "  " status
+        }
         if (pad_h < 0) pad_h = 0
-        emit(sprintf("%s%s%s%s", hdr, sprintf("%*s", pad_h, ""), EL, RESET))
+        emit(sprintf("%s%s%s%s%s", hdr, sprintf("%*s", pad_h, ""), stat, EL, RESET))
     }
 }
 
@@ -766,6 +772,8 @@ RENDER() {
     local format
     local -a pscmd awkcmd
 
+    STATUS_BUILD
+
     if (( NEWBIE == 1 )); then
         format="pid,user,rss,%cpu,cmd"
     else
@@ -782,6 +790,7 @@ RENDER() {
         -v footer="${footer}"  -v color="$(( NO_COLOR == 0 ? 1 : 0 ))"
         -v showopts="${SHOW_OPTS}" -v kernel="${KERNEL}" -v sort="${SORT}" -v cpu_mode="${CPU_MODE}"
         -v me="${ME}"          -v ncpu="${NCPU}"     -v drawfile="${DRAW_FILE}"
+        -v status="${status_c}" -v statusw="${STATUSW}"
         -v red="${Rouge}"      -v green="${Vert}"     -v yellow="${Jaune}"
         -v blue="${Bleu}"      -v magenta="${Magenta}" -v cyan="${Cyan}"
         -v white="${Blanc}"    -v grey="${Gris}"      -v bg="${BgGris}"
@@ -817,174 +826,46 @@ RENDER() {
 # Bandeau
 ##############################################################################
 # Construit le bandeau dans les variables globales plain/colored.
-TIPS_BUILD() {
-    local -i long="$1"
-    local -a sp sc
-    local cc cm cp cpp cu cC co ck ch cf ct cF
-    local -i budget i
-
-    cc="${BleuBold}"; cm="${BleuBold}"; cp="${BleuBold}"; cpp="${BleuBold}"
-    cu="${BleuBold}"; cC="${BleuBold}"; co="${BleuBold}"; ck="${BleuBold}"
-    ch="${BleuBold}"; cf="${BleuBold}"; ct="${BleuBold}"; cF="${BleuBold}"
-    cM="${BleuBold}"; cN="${BleuBold}"
-    case "${SORT}" in
-        -%cpu|%cpu) cc="${VertBold}" ;;
-        -rss|rss)   cm="${VertBold}" ;;
-        -pid|pid)   cp="${VertBold}" ;;
-        -ppid|ppid) cpp="${VertBold}" ;;
-        -user|user) cu="${VertBold}" ;;
-        -cmd|cmd)   cC="${VertBold}" ;;
-        -nice|nice) cN="${VertBold}" ;;
-        *) : ;;
-    esac
-    (( KERNEL != 0 ))    && ck="${VertBold}"
-    (( HEADER == 1 ))    && ch="${VertBold}"
-    (( FOOTER == 1 ))    && cf="${VertBold}"
-    (( TIPS == 1 ))      && ct="${VertBold}"
-    (( FREEZE == 1 ))    && cF="${VertBold}"
-    (( SHOW_OPTS == 1 )) && co="${VertBold}"
-    (( CPU_MODE == 1 ))  && cM="${VertBold}"
-
-    mode_icon="${ICON_MODE}"
-    (( long == 1 )) || mode_icon="${ICON_MODE_SHORT}"
-
-    if (( long == 1 )); then
-        sp=( "[c]pu" "[M]achine" "[m]em" "[p]id" "[P]pid" "[N]ice" "[u]ser" "[C]md"
-             "[o]ptions" "[k]ernel" "[h]eader" "[f]ooter" "[t]ips" "[/]filtre" )
-        sc=( "${cc}[c]${ResetFg}pu" "${cM}[M]${ResetFg}achine" "${cm}[m]${ResetFg}em"
-             "${cp}[p]${ResetFg}id" "${cpp}[P]${ResetFg}pid" "${cN}[N]${ResetFg}ice"
-             "${cu}[u]${ResetFg}ser" "${cC}[C]${ResetFg}md" "${co}[o]${ResetFg}ptions"
-             "${ck}[k]${ResetFg}ernel"
-             "${ch}[h]${ResetFg}eader" "${cf}[f]${ResetFg}ooter" "${ct}[t]${ResetFg}ips"
-             "${BleuBold}[/]${ResetFg}filtre" )
-        tail_p=" | [+/-]refresh | [F]reeze ${ICON_CLOCK}  ${int}${scroll}"
-        tail_c=" ${Gris}|${ResetFg} ${BleuBold}[+/-]${ResetFg}refresh ${Gris}|${ResetFg} ${cF}[F]${ResetFg}reeze ${Vert}${ICON_CLOCK}  ${int}${Gris}${scroll}${ResetFg}"
-    else
-        sp=( "[c]pu" "[M]" "[m]em" "[p]id" "[P]pid" "[N]" "[u]ser" "[C]md" "[o]"
-             "[k]" "[h]" "[f]" "[t]" "[/]" )
-        sc=( "${cc}[c]${ResetFg}pu" "${cM}[M]${ResetFg}" "${cm}[m]${ResetFg}em"
-             "${cp}[p]${ResetFg}id" "${cpp}[P]${ResetFg}pid" "${cN}[N]${ResetFg}"
-             "${cu}[u]${ResetFg}ser" "${cC}[C]${ResetFg}md" "${co}[o]${ResetFg}"
-             "${ck}[k]${ResetFg}"
-             "${ch}[h]${ResetFg}" "${cf}[f]${ResetFg}" "${ct}[t]${ResetFg}"
-             "${BleuBold}[/]${ResetFg}" )
-        tail_p=" [+/-] [F] ${ICON_CLOCK}  ${int}${scroll}"
-        tail_c=" ${BleuBold}[+/-]${ResetFg} ${cF}[F]${ResetFg} ${Vert}${ICON_CLOCK}  ${int}${Gris}${scroll}${ResetFg}"
-    fi
-
-    # segments toujours affichés : mode, défilement, quitter
-    crit_p=" [${mode_icon}]mode | [${ICON_SCROLL}]scroll | [q]uit"
-
-    budget=$(( WIDTH - 1 - ${#lead} - ${#crit_p} - ${#tail_p} - ${#filt_p} ))
-    (( budget < 0 )) && budget=0
-
-    plain="${lead}"
-    colored="${lead}"
-    first=1
-    for i in "${!sp[@]}"; do
-        local seg_p=" ${sp[i]}"
-        (( ${#seg_p} <= budget )) || continue
-        budget=$(( budget - ${#seg_p} ))
-        if (( long == 1 && first == 0 )); then
-            plain+=" | ${sp[i]}"
-            colored+=" ${Gris}|${ResetFg} ${sc[i]}"
-        else
-            plain+=" ${sp[i]}"
-            colored+=" ${sc[i]}"
+# Statut compact, à droite de l'entête : filtre, gel/intervalle, défilement.
+# C'est tout ce que le bandeau apportait en plus des raccourcis — ceux-ci vivent
+# maintenant dans la boîte de la touche H, ce qui rend une ligne au tableau.
+# status_p = version nue (largeur), status_c = version colorée.
+STATUS_BUILD() {
+    status_p=''
+    status_c=''
+    if (( TIPS == 1 )); then
+        local caret=''
+        (( FILTER_EDIT == 1 )) && caret='_'
+        if [[ -n "${FILTER}" || ${FILTER_EDIT} -eq 1 ]]; then
+            status_p+=" /${FILTER}${caret}"
+            if (( FILTER_INVALID == 1 )); then
+                status_p+=' invalide'
+                status_c+=" ${Jaune}/${FILTER}${caret}${ResetFg} ${RougeBold}invalide${ResetFg}"
+            else
+                status_c+=" ${Jaune}/${FILTER}${caret}${ResetFg}"
+            fi
         fi
-        first=0
-    done
-
-    if (( long == 1 && first == 0 )); then
-        plain+=" | [${mode_icon}]mode | [${ICON_SCROLL}]scroll | [q]uit"
-        colored+=" ${Gris}|${ResetFg} ${BleuBold}[${mode_icon}]${ResetFg}mode ${Gris}|${ResetFg} ${BleuBold}[${ICON_SCROLL}]${ResetFg}scroll ${Gris}|${ResetFg} ${BleuBold}[q]${ResetFg}uit"
-    else
-        # pas de segment de tri : mode/scroll/quit démarrent le bandeau
-        plain+=" [${mode_icon}]mode [${ICON_SCROLL}]scroll [q]uit"
-        colored+=" ${BleuBold}[${mode_icon}]${ResetFg}mode ${BleuBold}[${ICON_SCROLL}]${ResetFg}scroll ${BleuBold}[q]${ResetFg}uit"
-    fi
-
-    plain+="${tail_p}${filt_p}"
-    colored+="${tail_c}${filt_c}"
-    return 0
-}
-
-# Construit filt_p / filt_c : motif, état de saisie, éventuel « invalide ».
-FILTER_INDICATOR() {
-    local label="${FILTER}" suffix="" color="${Jaune}" room
-    filt_p=""
-    filt_c=""
-    if (( FILTER_EDIT == 1 )); then
-        label="/${FILTER}"
-        suffix="_"
-    fi
-    (( FILTER_INVALID == 1 )) && color="${RougeBold}"
-    [[ -n "${label}" ]] || return 0
-    room=$(( WIDTH / 3 ))
-    (( room < 8 )) && room=8
-    (( ${#label} > room )) && label="${label:0:room}>"
-    filt_p=" ${label}${suffix}"
-    filt_c=" ${color}${label}${ResetFg}${suffix}"
-    if (( FILTER_INVALID == 1 )); then
-        filt_p+=" invalide"
-        filt_c+=" ${RougeBold}invalide${ResetFg}"
-    fi
-    return 0
-}
-
-# Ligne minimale : uniquement le motif (utilisée quand le bandeau est masqué,
-# pour ne jamais être aveugle sur le filtre en cours).
-PRINT_TIPS_MIN() {
-    FILTER_INDICATOR
-    [[ -n "${filt_c}" ]] || return 0
-    if [[ -n "${BgGris}" ]]; then
-        printf '%s%s\033[K%s' "${Reset}${BgGris}" "${filt_c}" "${Reset}"
-    else
-        printf '%s' "${filt_c}"
-    fi
-    return 0
-}
-
-PRINT_TIPS() {
-    local int scroll="" room trimmed
-    local -i long
-
-    (( OFFSET > 0 )) && scroll=" [+${OFFSET}]"
-    int="${INTERVAL}s"
-    (( FREEZE == 1 )) && int="GEL"
-    lead=" ${ICON_LEAD}  "
-
-    FILTER_INDICATOR
-
-    # bandeau complet seulement sur écran large (comme psim), puis version courte
-    for long in 1 0; do
-        (( long == 1 && WIDTH < 150 )) && continue
-        TIPS_BUILD "${long}"
-        (( ${#plain} <= WIDTH )) && break
-    done
-
-    if (( ${#plain} > WIDTH )); then
-        # bandeau trop long : on tronque, en gardant le marqueur de filtre
-        trimmed="${plain:0:WIDTH}"
-        [[ -z "${FILTER}" ]] || trimmed="${plain:0:$(( WIDTH > 0 ? WIDTH - 1 : 0 ))}>"
-        if [[ -n "${BgGris}" ]]; then
-            printf '%s%s\033[K%s' "${Reset}${BgGris}" "${trimmed}" "${Reset}"
-        else
-            printf '%s' "${trimmed}"
+        if (( FREEZE == 1 )); then
+            status_p+=" ${ICON_CLOCK} GEL"
+            status_c+=" ${RougeBold}${ICON_CLOCK} GEL${ResetFg}"
+        elif (( INTERVAL != 1 )); then
+            status_p+=" ${ICON_CLOCK} ${INTERVAL}s"
+            status_c+=" ${Gris}${ICON_CLOCK} ${INTERVAL}s${ResetFg}"
         fi
-    elif [[ -n "${BgGris}" ]]; then
-        printf '%s%s\033[K%s' "${Reset}${BgGris}" "${colored}" "${Reset}"
-    else
-        printf '%s' "${colored}"
+        if (( OFFSET > 0 )); then
+            status_p+=" +${OFFSET}"
+            status_c+=" ${Gris}+${OFFSET}${ResetFg}"
+        fi
     fi
+    STATUSW=${#status_p}
     return 0
 }
 
-##############################################################################
-# Clavier
-##############################################################################
-SORT_TOGGLE() {
-    if [[ "${SORT}" == "$1" ]]; then SORT="$2"; else SORT="$1"; fi
+# Repli quand l'entête est masquée (touche h) : le statut prend alors une ligne
+# en bas, réservée par la boucle pour que la hauteur ne saute pas.
+PRINT_STATUS() {
+    [[ -n "${status_c}" ]] || return 0
+    printf '%s\033[K%s' "${status_c}" "${Reset}"
     return 0
 }
 
@@ -1140,7 +1021,7 @@ HELP_OVERLAY() {
            'F' '↑ / ↓' 'Début / Fin' '← / →' 'q' 'H' )
     dtxt=( 'trier par %CPU' 'trier par commande' 'trier par mémoire' 'trier par PID / PPID'
            'trier par nice' 'trier par utilisateur' '%CPU : cœur / machine' 'options des commandes'
-           'threads noyau (cycle)' 'entête on / off' 'pied de page on / off' 'bandeau on / off'
+           'threads noyau (cycle)' 'entête on / off' 'pied de page on / off' 'statut on / off'
            'filtrer (Entrée / Échap)' 'ralentir / accélérer' 'gel / dégel' 'défiler'
            'premier / dernier' 'simplifié / étendu' 'quitter' 'cette aide' )
     n=${#ktxt[@]}
@@ -1265,10 +1146,10 @@ RUN_DYNAMIC() {
         fi
         (( WIDTH < THIN_W )) && NEWBIE=1
 
+        # plus de bandeau : le statut vit dans l'entête. Une ligne n'est
+        # réservée que si l'entête est masquée, pour qu'il reste visible.
         local -i bar=0
-        if (( TIPS == 1 || FILTER_EDIT == 1 )) || [[ -n "${FILTER}" ]]; then
-            bar=1
-        fi
+        (( TIPS == 1 && HEADER == 0 )) && bar=1
 
         LIMIT=$(( HEIGHT - HEADER - FOOTER - bar ))
         (( LIMIT < 1 )) && LIMIT=1
@@ -1284,7 +1165,7 @@ RUN_DYNAMIC() {
             # pas d'effacement ici : la ligne du bandeau est réécrite par-dessus
             # (un \033[J la blanchirait avant de la redessiner -> scintillement)
             printf '\n'
-            if (( TIPS == 1 )); then PRINT_TIPS; else PRINT_TIPS_MIN; fi
+            PRINT_STATUS
         else
             # pas de bandeau : on nettoie ce qui reste sous le pied de page
             printf '\033[J'
