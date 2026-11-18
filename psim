@@ -705,7 +705,7 @@ function emit_header() {
                 hc(sprintf("%-10s", "USER"), BLUE, sort ~ /^-?user$/) " " \
                 hc(sprintf("%3s", "NI"), WHITE, sort ~ /^-?nice$/) " " \
                 hc(sprintf("%6s", "MiB"), GREEN, sort ~ /^-?rss$/) " " \
-                hc(sprintf("%6s", "%MEM"), GREEN, 0) " " \
+                hc(sprintf("%6s", "%MEM"), GREEN, sort ~ /^-?%mem$/) " " \
                 hc(sprintf("%6s", hdr_cpu), GREEN, sort ~ /^-?%?cpu$/) "   " \
                 hc(hdr_cmd, YELLOW, sort ~ /^-?%?cmd$/)
         }
