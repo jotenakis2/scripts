@@ -18,8 +18,8 @@
 #     il s'affiche à sa droite, ou sur une ligne en bas si l'entête est masqué) ;
 #   * mode arbre (--tree / touche t) : hiérarchie des ppid, l'indentation
 #     se prend sur les colonnes de commande et d'arguments ;
-#   * souris en mode dynamique : clic = sélection de la ligne, molette =
-#     défilement de la vue ;
+#   * souris en mode dynamique : clic = sélection de la ligne, double-clic =
+#     détails du processus, molette = défilement de la vue ;
 #   * journal borné (rotation) ;
 #   * options inconnues, arguments en trop et valeurs invalides refusés.
 #
@@ -51,6 +51,11 @@ declare -i ALT=0 SESSION=0 CLEANED=0 TTY=0 STDIN_TTY=0 SIZE_KNOWN=0 WINCH=0
 # relâchement. Renseignés par MOUSE_READ, exploités par MOUSE_ACT. La colonne
 # n'est pas conservée : seule la ligne porte la sélection.
 declare -i MOUSE_BTN=-1 MOUSE_Y=0 MOUSE_REL=0
+# Double-clic : instant (µs) et ligne du dernier appui gauche, et drapeau posé
+# par MOUSE_ACT quand deux appuis tombent sur la même ligne dans l'intervalle.
+declare -i CLICK_LAST=0 CLICK_ROW=0 DOUBLE=0
+declare -i CLICK_US=400000        # 400 ms : la tolérance usuelle d'un double-clic
+declare -i NOWTIC=0               # horodatage courant (µs), posé par NOW_US
 declare -i STATUSW=0
 status_p=''
 status_c=''
@@ -285,8 +290,10 @@ ${Vert}RACCOURCIS (dynamique)${Reset}
    +/-  délai    F  gel/dégel   ←/→  newbie/étendu
    ↑/↓  sélectionner (la vue suit aux bords)   Échap  relâcher
    clic  sélectionner la ligne   molette  défiler la vue
+         double-clic : détails du processus
          (Maj+clic : la sélection de texte du terminal reste possible)
-   Entrée / d  détails du processus sélectionné (une touche ferme la boîte)
+   Entrée / d  détails du processus sélectionné (une touche ferme la boîte,
+   x / X y terminent le processus, après la même confirmation que dans la liste)
    PgUp/PgDn  défiler d'une page   Home/End  début / fin de liste
    x  TERM  et  X  KILL  sur le processus sélectionné, après confirmation (y).
    PID 1, psim et ses propres parents sont refusés.
@@ -1237,8 +1244,21 @@ MOUSE_READ() {
     return 0
 }
 
-# Clic gauche : la ligne sous le curseur devient la sélection. Hors du tableau
-# (entête, ligne de statut, pied de page, sous la dernière ligne) : rien.
+# Horodatage en microsecondes sans fork (EPOCHREALTIME, bash >= 5). Absent ou
+# illisible : NOWTIC reste à 0 et le double-clic est simplement inactif.
+NOW_US() {
+    local t="${EPOCHREALTIME:-}"
+    NOWTIC=0
+    [[ -n "${t}" ]] || return 0
+    t="${t/[.,]/}"                  # la virgule décimale dépend de la locale
+    [[ "${t}" =~ ^[0-9]+$ ]] || return 0
+    NOWTIC=$(( 10#${t} ))
+    return 0
+}
+
+# Clic gauche : la ligne sous le curseur devient la sélection ; deux appuis
+# rapprochés sur la même ligne ouvrent la boîte de détails (DOUBLE). Hors du
+# tableau (entête, ligne de statut, pied de page, sous la dernière ligne) : rien.
 # Molette : la vue seule défile, la sélection ne bouge pas.
 MOUSE_ACT() {
     local -i i max_off step=3
@@ -1262,6 +1282,16 @@ MOUSE_ACT() {
     (( i <= LIMIT )) || return 0
     (( i <= ${#ROWPIDS[@]} )) || return 0
     SEL_PID=${ROWPIDS[i]}
+    NOW_US
+    DOUBLE=0
+    if (( NOWTIC > 0 && CLICK_LAST > 0 && i == CLICK_ROW \
+          && NOWTIC - CLICK_LAST <= CLICK_US )); then
+        CLICK_LAST=0                  # le triple-clic ne rouvre pas la boîte
+        DOUBLE=1
+    else
+        CLICK_LAST=${NOWTIC}
+        CLICK_ROW=${i}
+    fi
     return 0
 }
 
@@ -1344,6 +1374,10 @@ HANDLE_KEY() {
         if [[ "${seq}" == '[<' || "${seq}" == '[M' ]]; then
             MOUSE_READ "${seq}"
             MOUSE_ACT
+            if (( DOUBLE == 1 && SEL_PID > 0 )); then
+                DOUBLE=0
+                DETAILS_OVERLAY "${SEL_PID}"
+            fi
             return 0
         fi
     fi
@@ -1446,7 +1480,7 @@ HELP_OVERLAY() {
     local kpad dpad line hint title hz bv tl tr bl br bg reset
 
     ktxt=( 'c' 'C' 'm' 'p' 'P' 'N' 'u' 'M' 'o' 'k' 'h' 'f' '/' '- / +'
-           'F' '↑ / ↓' 'clic' 'molette' 'PgUp / PgDn' 'Début / Fin' 'Échap'
+           'F' '↑ / ↓' 'clic' 'double-clic' 'molette' 'PgUp / PgDn' 'Début / Fin' 'Échap'
            'Entrée / d' 'x / X' '← / →'
            't' 'q' '?' )
     dtxt=( 'trier par %CPU' 'trier par commande' 'trier par mémoire' 'trier par PID'
@@ -1455,9 +1489,10 @@ HELP_OVERLAY() {
            'pied de page on / off' 'filtrer (Entrée / Échap)'
            'augmenter / diminuer le taux de rafraîchissement'
            'gel / dégel' 'sélectionner (la vue suit)'
-           'sélectionner la ligne' 'défiler la vue' "défiler d'une page" 
+           'sélectionner la ligne' 'détails du processus' 'défiler la vue' "défiler d'une page" 
            'premier / dernier' 'relâcher la sélection' 'détails du processus'
-           'TERM / KILL (après y)' 'simplifié / étendu' 'arbre on / off' 'quitter' 'cette aide' )
+           'TERM / KILL (y, ou dans les détails)' 'simplifié / étendu'
+           'arbre on / off' 'quitter' 'cette aide' )
     n=${#ktxt[@]}
 
     if (( NO_COLOR == 0 )); then
@@ -1948,15 +1983,26 @@ DET_CLOSE() {
     return 0
 }
 
-# Détails d'un processus (Entrée ou d) — lecture seule
+# Détails d'un processus (Entrée, d ou double-clic) — lecture seule, sauf
+# x/X qui terminent le processus affiché (mêmes garde-fous que la liste : PID 1,
+# psim et ses parents). La boîte de confirmation remplace celle des détails.
 DETAILS_OVERLAY() {
     local -i pid="${1:-0}"
+    local sig=''
     DET_INIT
     PROC_INFO "${pid}" $(( HEIGHT - 3 ))
-    DET_HINT='une touche pour fermer'
+    DET_HINT='x = TERM   ·   X = KILL   ·   une autre touche ferme'
     DET_DRAW " DÉTAILS — ${pid} ${DET_NAME} "
     MODAL_KEY
     DET_CLOSE
+    case "${MODAL_KEY}" in
+        x) sig='TERM' ;;
+        X) sig='KILL' ;;
+        *) return 0 ;;
+    esac
+    # la confirmation dessine sa propre boîte : celle des détails est déjà fermée
+    SEL_PID=${pid}
+    KILL_SELECTED "${sig}"
     return 0
 }
 
