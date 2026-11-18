@@ -55,11 +55,14 @@ declare -i MOUSE_BTN=-1 MOUSE_Y=0 MOUSE_REL=0
 # par MOUSE_ACT quand deux appuis tombent sur la même ligne dans l'intervalle.
 declare -i CLICK_LAST=0 CLICK_ROW=0 DOUBLE=0
 declare -i CLICK_US=400000        # 400 ms : la tolérance usuelle d'un double-clic
+# Molette : neutralisée sur demande (les événements sont quand même drainés, le
+# terminal n'a pas d'autre usage). WHEEL=1 rend le défilement de la vue.
+declare -i WHEEL=0 WHEEL_STEP=3
 declare -i NOWTIC=0               # horodatage courant (µs), posé par NOW_US
 # Flèches maintenues : la répétition rapprochée accélère le déplacement
-# (1, 1, 2, 2, 3, 3… jusqu'à SEL_FAST lignes par appui). Un appui isolé reste
+# (1, 1, 2, 2, 3, 3, 4… jusqu'à SEL_FAST lignes par appui). Un appui isolé reste
 # exactement d'une ligne, et le pas retombe dès que la frappe ralentit.
-declare -i SEL_LAST=0 SEL_REP=0 SEL_FAST=5
+declare -i SEL_LAST=0 SEL_REP=0 SEL_FAST=4
 declare -i REPEAT_US=250000       # au-delà de 250 ms entre deux appuis : on repart à 1
 declare -i STATUSW=0
 status_p=''
@@ -295,8 +298,7 @@ ${Vert}RACCOURCIS (dynamique)${Reset}
    +/-  délai    F  gel/dégel   ←/→  newbie/étendu
    ↑/↓  sélectionner (la vue suit aux bords ; maintenir la flèche accélère)
          Échap  relâcher
-   clic  sélectionner la ligne   molette  défiler la vue
-         double-clic : détails du processus
+   clic  sélectionner la ligne   double-clic : détails du processus
          (Maj+clic : la sélection de texte du terminal reste possible)
    Entrée / d  détails du processus sélectionné (une touche ferme la boîte,
    x / X y terminent le processus, après la même confirmation que dans la liste)
@@ -1291,10 +1293,11 @@ NOW_US() {
 # tableau (entête, ligne de statut, pied de page, sous la dernière ligne) : rien.
 # Molette : la vue seule défile, la sélection ne bouge pas.
 MOUSE_ACT() {
-    local -i i max_off step=3
+    local -i i max_off step=${WHEEL_STEP}
     (( MOUSE_BTN < 0 )) && return 0
     (( MOUSE_REL == 1 )) && return 0
     if (( (MOUSE_BTN & 64) != 0 )); then
+        (( WHEEL == 1 )) || return 0          # molette neutralisée (WHEEL=0)
         max_off=$(( TOTAL - LIMIT ))
         (( max_off < 0 )) && max_off=0
         if (( (MOUSE_BTN & 1) == 0 )); then
@@ -1510,7 +1513,7 @@ HELP_OVERLAY() {
     local kpad dpad line hint title hz bv tl tr bl br bg reset
 
     ktxt=( 'c' 'C' 'm' 'p' 'P' 'N' 'u' 'M' 'o' 'k' 'h' 'f' '/' '- / +'
-           'F' '↑ / ↓' 'clic' 'double-clic' 'molette' 'PgUp / PgDn' 'Début / Fin' 'Échap'
+           'F' '↑ / ↓' 'clic' 'double-clic' 'PgUp / PgDn' 'Début / Fin' 'Échap'
            'Entrée / d' 'x / X' '← / →'
            't' 'q' '?' )
     dtxt=( 'trier par %CPU' 'trier par commande' 'trier par mémoire' 'trier par PID'
@@ -1519,7 +1522,7 @@ HELP_OVERLAY() {
            'pied de page on / off' 'filtrer (Entrée / Échap)'
            'augmenter / diminuer le taux de rafraîchissement'
            'gel / dégel' 'sélectionner (tenir = accélère)'
-           'sélectionner la ligne' 'détails du processus' 'défiler la vue' "défiler d'une page" 
+           'sélectionner la ligne' 'détails du processus' "défiler d'une page" 
            'premier / dernier' 'relâcher la sélection' 'détails du processus'
            'TERM / KILL (y, ou dans les détails)' 'simplifié / étendu'
            'arbre on / off' 'quitter' 'cette aide' )
