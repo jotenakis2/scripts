@@ -597,6 +597,10 @@ IFS= read -r -d '' AWK_MAIN <<'AWKEOF' || true
 BEGIN {
     filter = ENVIRON["PSIM_FILTER"]
     lfilter = tolower(filter)
+    # écart entre la colonne cmd et celle des options (même valeur dans le
+    # budget de largeur et dans le dessin : elles ne peuvent pas diverger)
+    SEP = 2
+    SEPS = sprintf("%*s", SEP, "")
 
     if (newbie) {
         # la colonne ppid n'est demandée à ps que si l'arbre en a besoin
@@ -616,8 +620,10 @@ BEGIN {
     }
     avail = width - prefix
     if (avail < 10) avail = 10
+    # écart entre la commande et ses arguments : il fait partie du budget, donc
+    # l'élargir rétrécit d'autant la colonne des options
     cmdw = (avail > 60) ? 60 : avail
-    optw = avail - cmdw - 1
+    optw = avail - cmdw - SEP
     if (optw < 0) optw = 0
 
     if (color) {
@@ -819,7 +825,7 @@ function draw_row(ind, indw,   line, cw, ow, cmd_d, pad_n, user_c, nice_c, cmd_c
     }
 
     if (ow > 0 && C_args != "")
-        line = line " " GREY cut(C_args, ow) RESET
+        line = line SEPS GREY cut(C_args, ow) RESET
 
     # ligne sélectionnée : bande pleine largeur. L'effacement de fin de ligne doit
     # être émis AVANT le reset final : un EL après le reset repeint la zone avec
