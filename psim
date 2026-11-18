@@ -16,6 +16,8 @@
 #   * configuration validée clé par clé (plus d'évaluation de shell) ;
 #   * options --no-header/--no-footer indépendantes (le statut suit l'entête :
 #     il s'affiche à sa droite, ou sur une ligne en bas si l'entête est masqué) ;
+#   * mode arbre (--tree / touche t) : hiérarchie des ppid, l'indentation
+#     se prend sur les colonnes de commande et d'arguments ;
 #   * journal borné (rotation) ;
 #   * options inconnues, arguments en trop et valeurs invalides refusés.
 #
@@ -49,6 +51,8 @@ status_c=''
 declare -i FILTER_EDIT=0 FILTER_INVALID=0
 declare -i NEWBIE=1 INTERVAL=1 HEADER=1 FOOTER=1 NO_COLOR=0
 declare -i KERNEL=0 STATIC=1 SHOW_OPTS=0 FREEZE=0 LOG=1 DEBUG=0 CPU_MODE=0
+# TREE=1 : mode arbre (hiérarchie ppid), calculé par awk en fin de flux
+declare -i TREE=0
 # Sélection : SEL_PID est la vérité (elle suit le processus d'une trame à
 # l'autre) ; SELROW/SELABS sont renseignés par awk (rang dans la fenêtre et rang
 # absolu), ROWPIDS porte les PID de la fenêtre courante pour les déplacements.
@@ -126,6 +130,7 @@ CONFIG_DEFAULTS() {
     DEBUG=0
     CPU_MODE=0
     STATIC=0
+    TREE=0
     return 0
 }
 
@@ -167,7 +172,7 @@ LOAD_CONFIG() {
         val="${val%\'}" ; val="${val#\'}"
 
         case "${key}" in
-            NEWBIE|HEADER|FOOTER|NO_COLOR|SHOW_OPTS|LOG|DEBUG|CPU_MODE)
+            NEWBIE|HEADER|FOOTER|NO_COLOR|SHOW_OPTS|LOG|DEBUG|CPU_MODE|TREE)
                 # volontaire : une valeur invalide est comptée et le chargement continue
                 # shellcheck disable=SC2310
                 SET_BOOL "${key}" "${val}" "${n}" || bad=$((bad + 1))
@@ -228,6 +233,7 @@ ${Vert}OPTIONS${Reset}
    ${Bleu}-N, --nice${Reset}             tri par valeur nice (NI)
    ${Bleu}-u, --user${Reset}             tri par propriétaire
    ${Bleu}-C, --cmd${Reset}              tri par commande
+   ${Bleu}-t, --tree${Reset}             hiérarchie des processus (arbre des ppid)
    ${Bleu}-n, --newbie${Reset}           affichage simplifié (PID USER MiB %CPU CMD)
    ${Bleu}-k, --kernel${Reset}           inclure les threads noyau
    ${Bleu}-K, --kernel-only${Reset}      uniquement les threads noyau
@@ -267,7 +273,7 @@ ${Vert}PIED DE PAGE${Reset}
 ${Vert}RACCOURCIS (dynamique)${Reset}
    /  filtre     Enter valider  Échap annuler     Ctrl-U effacer
    c/m/p/P/N/u/C tri            o  options        M  %CPU machine
-   k  noyau
+   t  arbre     k  noyau
    h  entête     f  pied        ?  aide         q  quitter
    +/-  délai    F  gel/dégel   ←/→  newbie/étendu
    ↑/↓  sélectionner (la vue suit aux bords)   Échap  relâcher
@@ -284,6 +290,13 @@ ${Vert}FILTRE INTERACTIF${Reset}
    se filtre en direct (Entrée valide, Échap annule, Backspace efface, Ctrl-U vide).
    Un motif invalide vide la liste et affiche ${RougeBold}invalide${Reset} dans le statut.
 
+${Vert}ARBRE${Reset}
+   ${Jaune}t${Reset} (ou ${Jaune}--tree${Reset}) range chaque processus sous son parent ; l'ordre du tri
+   actif devient l'ordre des frères. Un processus dont le parent est absent de la
+   liste (filtré, ou sorti de ps) passe à la racine : on obtient une forêt, jamais
+   une branche coupée. L'indentation se prend sur les colonnes de la commande et
+   des arguments, pas sur le reste du tableau ; les PID, eux, ne bougent pas.
+
 ${Vert}PIPE / REDIRECTION${Reset}
    Sans terminal, ${Jaune}${NAME}${Reset} passe en statique, sans couleur ni échappement,
    sans troncature ni padding : ${Jaune}${NAME} > liste.txt${Reset}, ${Jaune}${NAME} | grep ssh${Reset},
@@ -292,7 +305,7 @@ ${Vert}PIPE / REDIRECTION${Reset}
 ${Vert}CONFIGURATION${Reset}
    ${Bleu}${CONFIG}${Reset} — une clé par ligne, ${Jaune}CLÉ=VALEUR${Reset}.
    Clés : NEWBIE INTERVAL KERNEL SORT FILTER SHOW_OPTS HEADER FOOTER
-          NO_COLOR LOG DEBUG CPU_MODE (STATS : ancienne clé, sans effet)
+          NO_COLOR LOG DEBUG CPU_MODE TREE (STATS : ancienne clé, sans effet)
    Le fichier n'est jamais interprété comme du shell ; les clés inconnues
    sont signalées puis ignorées.
 
@@ -358,6 +371,7 @@ PARSE_ARGS() {
             -m|--mem)   SORT="-rss";  shift ;;
             -u|--user)  SORT="user";  shift ;;
             -C|--cmd)   SORT="cmd";   shift ;;
+            -t|--tree) TREE=1; shift ;;
             -n|--newbie) NEWBIE=1; shift ;;
             -k|--kernel) k=1; shift ;;
             -K|--kernel-only) konly=1; shift ;;
@@ -585,7 +599,11 @@ BEGIN {
     lfilter = tolower(filter)
 
     if (newbie) {
-        f_user = 2; f_rss = 3; f_cpu = 4; f_cmd = 5; f_arg = 6
+        # la colonne ppid n'est demandée à ps que si l'arbre en a besoin
+        # (treep=1) : elle sert au calcul, elle n'est jamais affichée ici
+        f_ppid = treep ? 2 : 0
+        d = treep ? 1 : 0
+        f_user = 2 + d; f_rss = 3 + d; f_cpu = 4 + d; f_cmd = 5 + d; f_arg = 6 + d
         prefix = 7 + 1 + 10 + 1 + 6 + 1 + 6 + 3
         hdr_cmd = (showopts ? "CMD" : "COMMAND")
         hdr_cpu = cpu_mode ? "%CPU/m" : "%CPU"
@@ -620,6 +638,28 @@ BEGIN {
     uloff = color ? "\033[24m" : ""
     mb = (length("é") == 1)
     cont_re = "[" sprintf("%c", 128) "-" sprintf("%c", 191) "]$"
+    # Arbre : un glyphe de branche fait 2 caractères mais 4 octets en UTF-8, donc
+    # le jeu de glyphes suit la capacité multibyte de awk — c'est elle qui
+    # décide si length() compte des caractères ou des octets, et donc si le
+    # padding de la colonne reste juste. Le critère est celui d'awk, pas celui du
+    # terminal : sur une machine dont la locale est UTF-8 mais le terminal en
+    # latin-1, les branches sortiraient en déchets — cas non couvert, et
+    # volontairement : choisir UTF-8 pour un awk qui compte en octets casserait
+    # l'alignement, ce qui est pire que des glyphes approximatifs.
+    if (mb) { T_TEE = "├─"; T_LAST = "└─"; T_VERT = "│ " } else { T_TEE = "|-"; T_LAST = "`-"; T_VERT = "| " }
+    # profondeur dessinée : bornée par la largeur de la colonne de commande en
+    # mode tableau ; en mode brut (pipe, pad=0) rien n'est tronqué, et cmdw vaut
+    # 0 — la borne doit donc y être large, sinon les branches s'arrêtent au
+    # deuxième niveau
+    if (pad) {
+        treeind_max = cmdw - 12
+        if (treeind_max > 24) treeind_max = 24
+        if (treeind_max < 4) treeind_max = 4
+    } else {
+        treeind_max = 48
+    }
+    total = 0
+    np = 0
     hdr_plain_len = prefix + length(hdr_cmd)
     emit_header()
 }
@@ -676,56 +716,74 @@ function emit_header() {
     }
 }
 
-{
-    cmd = $f_cmd
-    # thread noyau = nom entre crochets, mais PAS un zombie ([nom] <defunct>)
-    # (« <defunct> » est un champ séparé : on teste la ligne entière)
-    is_kernel = (substr(cmd, 1, 1) == "[" && $0 !~ /<defunct>$/)
+##############################################################################
+# Ligne : producteur (flux ps ou arbre) et dessinateur unique
+#
+# C_* porte la ligne courante. Le bloc d'enregistrement la remplit depuis les
+# champs de ps et dessine tout de suite ; le mode arbre l'emmagasine (P_*),
+# réordonne en fin de flux, puis rejoue les lignes par le même dessinateur.
+##############################################################################
+function store_row(v) {
+    np++
+    P_pid[np] = C_pid
+    P_ppid[np] = C_ppid
+    P_vis[np] = v
+    P_user[np] = C_user
+    P_nice[np] = C_nice
+    P_rss[np] = C_rss
+    P_mem[np] = C_mem
+    P_cpu[np] = C_cpu
+    P_rcpu[np] = C_rcpu
+    P_cmd[np] = C_cmd
+    P_args[np] = C_args
+}
 
-    if (kernel == 0 && is_kernel) next
-    if (kernel == 2 && !is_kernel) next
+function load_row(i) {
+    C_pid = P_pid[i]
+    C_ppid = P_ppid[i]
+    C_user = P_user[i]
+    C_nice = P_nice[i]
+    C_rss = P_rss[i]
+    C_mem = P_mem[i]
+    C_cpu = P_cpu[i]
+    C_rcpu = P_rcpu[i]
+    C_cmd = P_cmd[i]
+    C_args = P_args[i]
+}
 
-    args = ""
-    if (NF >= f_arg) {
-        for (i = f_arg; i <= NF; i++) args = args (i > f_arg ? " " : "") $i
-    }
-
-    if (filter != "") {
-        search = tolower($f_user " " cmd " " args)
-        if (search !~ lfilter) next
-    }
-
-    # mode « options » désactivé : nom de commande seul, sans chemin ni arguments
-    if (showopts == 0 && !is_kernel) {
-        sub(/^.*\//, "", cmd)
-        args = ""
-    }
-
-    total++
-    # rang absolu de la sélection, y compris hors écran : c'est lui qui permet
-    # de recadrer la vue sur le processus sélectionné après un défilement
-    if (selpid > 0 && $1 + 0 == selpid) selabs = total
-    if (total <= offset) next
-    if (limit > 0 && shown >= limit) next
-
-    rss = $f_rss / 1024
-    cpu = cpu_mode ? $f_cpu / ncpu : $f_cpu
+# ind : glyphes de branche déjà calculés, indw leur largeur visible. L'écart
+# entre le nombre de caractères et d'octets est réglé en BEGIN (jeu ASCII quand
+# awk ne sait pas compter en caractères).
+function draw_row(ind, indw,   line, cw, ow, budget, cmd_d, pad_n, user_c, nice_c, cmd_c, dir_p, base_p, indc) {
     shown++
-    rowpid[shown] = $1
-    sum_rss += rss
-    sum_cpu += $f_cpu
-    if (!newbie) sum_mem += $f_mem
+    rowpid[shown] = C_pid
+    sum_rss += C_rss
+    sum_cpu += C_rcpu
+    if (!newbie) sum_mem += C_mem
 
     if (!pad) {
         if (newbie)
-            printf "%s %s %.0f %.1f %s%s\n", $1, $f_user, rss, cpu, cmd, (args != "" ? " " args : "")
+            printf "%s %s %.0f %.1f %s%s%s\n", C_pid, C_user, C_rss, C_cpu, ind, C_cmd, (C_args != "" ? " " C_args : "")
         else
-            printf "%s %s %s %s %.0f %.1f %.1f %s%s\n", $1, $f_ppid, $f_user, $f_nice, rss, $f_mem, cpu, cmd, (args != "" ? " " args : "")
-        next
+            printf "%s %s %s %s %.0f %.1f %.1f %s%s%s\n", C_pid, C_ppid, C_user, C_nice, C_rss, C_mem, C_cpu, ind, C_cmd, (C_args != "" ? " " C_args : "")
+        return
     }
 
-    cmd_d = cut(cmd, cmdw)
-    pad_n = cmdw - length(cmd_d)
+    # l'indentation sort de la largeur du tableau : on la prend d'abord sur la
+    # colonne des arguments, puis sur celle de la commande
+    cw = cmdw
+    ow = optw
+    if (indw > 0) {
+        budget = cmdw + (optw > 0 ? optw + 1 : 0) - indw
+        if (budget < 10) budget = 10
+        cw = (budget < cmdw) ? budget : cmdw
+        ow = budget - cw - 1
+        if (ow < 0) ow = 0
+    }
+    indc = (indw > 0) ? GREY ind RESET : ""
+
+    cmd_d = cut(C_cmd, cw)
+    pad_n = cw - length(cmd_d)
     if (pad_n < 0) pad_n = 0
 
     if (showopts && cmd_d ~ /\//) {
@@ -737,43 +795,147 @@ function emit_header() {
         cmd_c = YELLOW cmd_d RESET sprintf("%*s", pad_n, "")
     }
 
-    if ($f_user == "root")
-        user_c = RED substr($f_user, 1, 10) RESET sprintf("%*s", 10 - length(substr($f_user, 1, 10)), "")
-    else if ($f_user == me)
-        user_c = BLUE substr($f_user, 1, 10) RESET sprintf("%*s", 10 - length(substr($f_user, 1, 10)), "")
+    if (C_user == "root")
+        user_c = RED substr(C_user, 1, 10) RESET sprintf("%*s", 10 - length(substr(C_user, 1, 10)), "")
+    else if (C_user == me)
+        user_c = BLUE substr(C_user, 1, 10) RESET sprintf("%*s", 10 - length(substr(C_user, 1, 10)), "")
     else
-        user_c = substr($f_user, 1, 10) sprintf("%*s", 10 - length(substr($f_user, 1, 10)), "")
+        user_c = substr(C_user, 1, 10) sprintf("%*s", 10 - length(substr(C_user, 1, 10)), "")
 
     if (newbie) {
-        line = MAGENTA sprintf("%7d", $1) RESET " " user_c " " \
-               GREEN sprintf("%6.0f", rss) RESET " " GREEN sprintf("%6.1f", cpu) RESET "   " cmd_c
+        line = MAGENTA sprintf("%7d", C_pid) RESET " " user_c " " \
+               GREEN sprintf("%6.0f", C_rss) RESET " " GREEN sprintf("%6.1f", C_cpu) RESET "   " indc cmd_c
     } else {
-        if ($f_nice == "-")      nice_c = GREY sprintf("%3s", $f_nice) RESET
-        else if ($f_nice < 0)    nice_c = YELLOW sprintf("%3s", $f_nice) RESET
-        else                     nice_c = CYAN sprintf("%3s", $f_nice) RESET
+        if (C_nice == "-")      nice_c = GREY sprintf("%3s", C_nice) RESET
+        else if (C_nice < 0)    nice_c = YELLOW sprintf("%3s", C_nice) RESET
+        else                    nice_c = CYAN sprintf("%3s", C_nice) RESET
 
-        line = MAGENTA sprintf("%7d", $1) RESET " " CYAN sprintf("%7d", $f_ppid) RESET " " \
-               user_c " " nice_c " " GREEN sprintf("%6.0f", rss) RESET " " \
-               GREEN sprintf("%6.1f", $f_mem) RESET " " GREEN sprintf("%6.1f", cpu) RESET "   " cmd_c
+        line = MAGENTA sprintf("%7d", C_pid) RESET " " CYAN sprintf("%7d", C_ppid) RESET " " \
+               user_c " " nice_c " " GREEN sprintf("%6.0f", C_rss) RESET " " \
+               GREEN sprintf("%6.1f", C_mem) RESET " " GREEN sprintf("%6.1f", C_cpu) RESET "   " indc cmd_c
     }
 
-    if (optw > 0 && args != "")
-        line = line " " GREY cut(args, optw) RESET
+    if (ow > 0 && C_args != "")
+        line = line " " GREY cut(C_args, ow) RESET
 
     # ligne sélectionnée : bande pleine largeur. L'effacement de fin de ligne doit
     # être émis AVANT le reset final : un EL après le reset repeint la zone avec
     # les attributs par défaut et coupe la bande à la fin du texte.
-    if (selpid > 0 && $1 + 0 == selpid) {
+    if (selpid > 0 && C_pid + 0 == selpid) {
         selrow = shown
         if (color) gsub(/\033\[0m/, "\033[0m\033[7m", line)
         emit("\033[7m" line "\033[0K\033[0m")
-        next
+        return
     }
-
     emit(line EL)
 }
 
+# Parcours arbre, en profondeur, dans l'ordre où ps a livré les frères : le tri
+# actif reste donc l'ordre des frères, la hiérarchie passe devant.
+function walk(i, pre, depth, last,   lst, cnt, j, child, ind, nxt) {
+    if (seen[i] == 1) return      # garde-fou : un cycle ppid ne boucle pas
+    seen[i] = 1
+    total++
+    # ind : glyphes de la branche de ce nœud ; nxt : ce que ses enfants portent en
+    # plus (la barre verticale reste tant que le nœud n'est pas le dernier frère).
+    # Au-delà du budget d'indentation la branche s'arrête : les descendants
+    # restent visibles, alignés, plutôt que de perdre leur commande.
+    ind = pre
+    nxt = pre
+    if (depth > 0 && length(pre) < treeind_max) {
+        ind = pre (last ? T_LAST : T_TEE)
+        nxt = pre (last ? "  " : T_VERT)
+    }
+    # rang absolu de la sélection, y compris hors écran : c'est lui qui permet
+    # de recadrer la vue sur le processus sélectionné après un défilement
+    if (selpid > 0 && P_pid[i] + 0 == selpid) selabs = total
+    if (total > offset && (limit == 0 || shown < limit)) {
+        load_row(i)
+        draw_row(ind, length(ind))
+    }
+    if (depth >= 200) return      # profondeur aberrante : on cesse de descendre
+    cnt = split(kids[i], lst, " ")
+    for (j = 1; j <= cnt; j++) {
+        child = lst[j] + 0
+        walk(child, nxt, depth + 1, (j == cnt))
+    }
+}
+
+{
+    cmd = $f_cmd
+    # thread noyau = nom entre crochets, mais PAS un zombie ([nom] <defunct>)
+    # (« <defunct> » est un champ séparé : on teste la ligne entière)
+    is_kernel = (substr(cmd, 1, 1) == "[" && $0 !~ /<defunct>$/)
+
+    # vis : la ligne est-elle dans la liste (noyau + filtre) ? En mode arbre, les
+    # lignes invisibles sont tout de même mémorisées : elles portent la parenté.
+    vis = 1
+    if (kernel == 0 && is_kernel) vis = 0
+    if (kernel == 2 && !is_kernel) vis = 0
+
+    args = ""
+    if (NF >= f_arg) {
+        for (i = f_arg; i <= NF; i++) args = args (i > f_arg ? " " : "") $i
+    }
+
+    if (vis && filter != "") {
+        search = tolower($f_user " " cmd " " args)
+        if (search !~ lfilter) vis = 0
+    }
+
+    # mode « options » désactivé : nom de commande seul, sans chemin ni arguments
+    if (showopts == 0 && !is_kernel) {
+        sub(/^.*\//, "", cmd)
+        args = ""
+    }
+
+    C_pid = $1
+    C_ppid = (f_ppid > 0) ? $f_ppid : 0
+    C_user = $f_user
+    C_nice = newbie ? "" : $f_nice
+    C_rss = $f_rss / 1024
+    C_mem = newbie ? 0 : $f_mem
+    C_rcpu = $f_cpu
+    C_cpu = cpu_mode ? C_rcpu / ncpu : C_rcpu
+    C_cmd = cmd
+    C_args = args
+
+    if (tree) { store_row(vis); next }
+    if (!vis) next
+
+    total++
+    if (selpid > 0 && C_pid + 0 == selpid) selabs = total
+    if (total <= offset) next
+    if (limit > 0 && shown >= limit) next
+    draw_row("", 0)
+}
+
 END {
+    # Mode arbre : le flux est complet, on peut ranger chaque ligne sous son
+    # parent puis descendre. L'ordre de ps (donc le tri actif) est conservé entre
+    # frères ; un processus dont le parent est absent de la liste (filtré, ou
+    # sorti de ps) devient une racine — une forêt plutôt qu'une branche coupée.
+    if (tree) {
+        for (i = 1; i <= np; i++)
+            if (P_vis[i]) idx[P_pid[i]] = i
+        roots = ""
+        for (i = 1; i <= np; i++) {
+            if (!P_vis[i]) continue
+            p = P_ppid[i]
+            # kids est indexé par rang de ligne, pas par PID : deux lignes de même
+            # PID (instantané incohérent) ne se volent pas leurs enfants
+            if ((p in idx) && idx[p] != i) kids[idx[p]] = kids[idx[p]] " " i
+            else                           roots = roots " " i
+        }
+        nr = split(roots, rt, " ")
+        for (j = 1; j <= nr; j++) walk(rt[j] + 0, "", 0, (j == nr))
+        # second passage : un nœud jamais atteint (cycle de ppid, chaîne plus
+        # profonde que la borne) remonte à la racine — aucune ligne visible ne
+        # doit manquer au total, même sur un instantané incohérent
+        for (i = 1; i <= np; i++)
+            if (P_vis[i] && seen[i] != 1) walk(i, "", 0, 1)
+    }
+
     if (drawfile != "") {
         # trame d'état : totaux, rangs de la sélection, puis les PID visibles dans
         # l'ordre — l'arithmétique du curseur se fait côté bash, à la frappe
@@ -812,7 +974,12 @@ RENDER() {
     STATUS_BUILD
 
     if (( NEWBIE == 1 )); then
-        format="pid,user,rss,%cpu,cmd"
+        # l'arbre a besoin des ppid : la colonne est demandée sans être affichée
+        if (( TREE == 1 )); then
+            format="pid,ppid,user,rss,%cpu,cmd"
+        else
+            format="pid,user,rss,%cpu,cmd"
+        fi
     else
         format="pid,ppid,user,nice,rss,%mem,%cpu,cmd"
     fi
@@ -826,7 +993,8 @@ RENDER() {
         -v limit="${limit}"    -v offset="${OFFSET}"  -v header="${header}"
         -v footer="${footer}"  -v color="$(( NO_COLOR == 0 ? 1 : 0 ))"
         -v showopts="${SHOW_OPTS}" -v kernel="${KERNEL}" -v sort="${SORT}" -v cpu_mode="${CPU_MODE}"
-        -v selpid="${SEL_PID}"
+        -v selpid="${SEL_PID}" -v tree="${TREE}" \
+        -v treep="$(( NEWBIE == 1 && TREE == 1 ? 1 : 0 ))"
         -v me="${ME}"          -v ncpu="${NCPU}"     -v drawfile="${DRAW_FILE}"
         -v status="${status_c}" -v statusw="${STATUSW}"
         -v red="${Rouge}"      -v green="${Vert}"     -v yellow="${Jaune}"
@@ -888,6 +1056,10 @@ STATUS_BUILD() {
         elif (( INTERVAL != 1 )); then
             status_p+=" ${ICON_CLOCK} ${INTERVAL}s"
             status_c+=" ${Gris}${ICON_CLOCK} ${INTERVAL}s${ResetFg}"
+        fi
+        if (( TREE == 1 )); then
+            status_p+=" arbre"
+            status_c+=" ${Cyan}arbre${ResetFg}"
         fi
         if (( OFFSET > 0 )); then
             status_p+=" +${OFFSET}"
@@ -1052,6 +1224,7 @@ HANDLE_KEY() {
         /) FILTER_EDIT=1; FILTER_SAVE="${FILTER}"; FILTER_BUF="${FILTER}"; OFFSET=0 ;;
         o) SHOW_OPTS=$((1 - SHOW_OPTS)) ;;
         k) KERNEL=$(( (KERNEL + 1) % 3 )) ;;
+        t) TREE=$((1 - TREE)); OFFSET=0 ;;
         h) HEADER=$((1 - HEADER)) ;;
         f) FOOTER=$((1 - FOOTER)) ;;
         '?') HELP_OVERLAY ;;
@@ -1146,7 +1319,7 @@ HELP_OVERLAY() {
 
     ktxt=( 'c' 'C' 'm' 'p' 'P' 'N' 'u' 'M' 'o' 'k' 'h' 'f' '/' '- / +'
            'F' '↑ / ↓' 'PgUp / PgDn' 'Début / Fin' 'Échap' 'Entrée / d' 'x / X' '← / →'
-           'q' '?' )
+           't' 'q' '?' )
     dtxt=( 'trier par %CPU' 'trier par commande' 'trier par mémoire' 'trier par PID'
            'trier par PPID' 'trier par nice' 'trier par utilisateur' '%CPU : cœur / machine'
            'options des commandes' 'threads noyau (cycle)' 'entête on / off'
@@ -1154,7 +1327,7 @@ HELP_OVERLAY() {
            'augmenter / diminuer le taux de rafraîchissement'
            'gel / dégel' 'sélectionner (la vue suit)' "défiler d'une page"
            'premier / dernier' 'relâcher la sélection' 'détails du processus'
-           'TERM / KILL (après y)' 'simplifié / étendu' 'quitter' 'cette aide' )
+           'TERM / KILL (après y)' 'simplifié / étendu' 'arbre on / off' 'quitter' 'cette aide' )
     n=${#ktxt[@]}
 
     if (( NO_COLOR == 0 )); then
