@@ -54,6 +54,7 @@ declare -i MOUSE_BTN=-1 MOUSE_Y=0 MOUSE_REL=0
 # Double-clic : instant (µs) et ligne du dernier appui gauche, et drapeau posé
 # par MOUSE_ACT quand deux appuis tombent sur la même ligne dans l'intervalle.
 declare -i CLICK_LAST=0 CLICK_ROW=0 DOUBLE=0
+declare -i REDRAW=0               # l'événement souris a-t-il changé quelque chose ?
 declare -i CLICK_US=400000        # 400 ms : la tolérance usuelle d'un double-clic
 # Molette : neutralisée sur demande (les événements sont quand même drainés, le
 # terminal n'a pas d'autre usage). WHEEL=1 rend le défilement de la vue.
@@ -1293,13 +1294,19 @@ NOW_US() {
 # tableau (entête, ligne de statut, pied de page, sous la dernière ligne) : rien.
 # Molette : la vue seule défile, la sélection ne bouge pas.
 MOUSE_ACT() {
-    local -i i max_off step=${WHEEL_STEP}
+    local -i i max_off step=${WHEEL_STEP} prev
+    # REDRAW reste à 0 quand l'événement ne change rien (relâchement, molette
+    # neutralisée, cran en butée, clic hors tableau) : la boucle réattend une
+    # touche sans refaire une trame, sinon une rafale de molette déclenche
+    # autant de ps+awk que de crans et l'écran donne l'impression de ramer.
+    REDRAW=0
     (( MOUSE_BTN < 0 )) && return 0
     (( MOUSE_REL == 1 )) && return 0
     if (( (MOUSE_BTN & 64) != 0 )); then
         (( WHEEL == 1 )) || return 0          # molette neutralisée (WHEEL=0)
         max_off=$(( TOTAL - LIMIT ))
         (( max_off < 0 )) && max_off=0
+        prev=${OFFSET}
         if (( (MOUSE_BTN & 1) == 0 )); then
             OFFSET=$(( OFFSET - step ))
         else
@@ -1307,6 +1314,7 @@ MOUSE_ACT() {
         fi
         (( OFFSET < 0 )) && OFFSET=0
         (( OFFSET > max_off )) && OFFSET=${max_off}
+        (( OFFSET != prev )) && REDRAW=1
         return 0
     fi
     (( (MOUSE_BTN & 3) == 0 )) || return 0        # bouton gauche seulement
@@ -1314,6 +1322,7 @@ MOUSE_ACT() {
     (( i >= 1 )) || return 0
     (( i <= LIMIT )) || return 0
     (( i <= ${#ROWPIDS[@]} )) || return 0
+    (( SEL_PID != ROWPIDS[i] )) && REDRAW=1
     SEL_PID=${ROWPIDS[i]}
     NOW_US
     DOUBLE=0
@@ -1321,6 +1330,7 @@ MOUSE_ACT() {
           && NOWTIC - CLICK_LAST <= CLICK_US )); then
         CLICK_LAST=0                  # le triple-clic ne rouvre pas la boîte
         DOUBLE=1
+        REDRAW=1
     else
         CLICK_LAST=${NOWTIC}
         CLICK_ROW=${i}
@@ -1385,102 +1395,109 @@ FILTER_EDIT_KEY() {
 
 HANDLE_KEY() {
     local key seq
-    local -i max_off
+    local -i max_off rc
 
-    local -i rc=0
-    read -rt "${INTERVAL}" -n 1 key 2>/dev/null || rc=$?
-    if (( rc != 0 )); then
-        # 1 = EOF (entrée fermée) : on ne tourne pas à vide
-        (( rc > 128 )) || sleep "${INTERVAL}"
-        return 0
-    fi
-
-    if (( FILTER_EDIT == 1 )); then
-        FILTER_EDIT_KEY "${key}"
-        return 0
-    fi
-
-    if [[ "${key}" == $'\e' ]]; then
-        read -rt 0.05 -n 2 seq 2>/dev/null || true
-        key+="${seq}"
-        # souris : la séquence est drainée puis traitée, jamais passée au case
-        if [[ "${seq}" == '[<' || "${seq}" == '[M' ]]; then
-            MOUSE_READ "${seq}"
-            MOUSE_ACT
-            if (( DOUBLE == 1 && SEL_PID > 0 )); then
-                DOUBLE=0
-                DETAILS_OVERLAY "${SEL_PID}"
-            fi
+    while :; do
+        key=''
+        seq=''
+        rc=0
+        read -rt "${INTERVAL}" -n 1 key 2>/dev/null || rc=$?
+        if (( rc != 0 )); then
+            # 1 = EOF (entrée fermée) : on ne tourne pas à vide
+            (( rc > 128 )) || sleep "${INTERVAL}"
             return 0
         fi
-    fi
 
-    case "${key}" in
-        /) FILTER_EDIT=1; FILTER_SAVE="${FILTER}"; FILTER_BUF="${FILTER}"; OFFSET=0 ;;
-        o) SHOW_OPTS=$((1 - SHOW_OPTS)) ;;
-        k) KERNEL=$(( (KERNEL + 1) % 3 )) ;;
-        t) TREE=$((1 - TREE)); OFFSET=0 ;;
-        h) HEADER=$((1 - HEADER)) ;;
-        f) FOOTER=$((1 - FOOTER)) ;;
-        '?') HELP_OVERLAY ;;
-        q|Q) QUIT 0 ;;
-        +)
-            if (( INTERVAL >= 120 )); then INTERVAL=120; else INTERVAL=$((INTERVAL + 1)); fi
-            FREEZE=0
-            ;;
-        -)
-            if (( INTERVAL > 120 )); then INTERVAL=120; else INTERVAL=$(( INTERVAL > 1 ? INTERVAL - 1 : 1 )); fi
-            FREEZE=0
-            ;;
-        F)
-            if (( FREEZE == 1 )); then
-                FREEZE=0
-                INTERVAL=1
-            else
-                FREEZE=1
-                INTERVAL="${INTERVAL_MAX}"
+        if (( FILTER_EDIT == 1 )); then
+            FILTER_EDIT_KEY "${key}"
+            return 0
+        fi
+
+        if [[ "${key}" == $'\e' ]]; then
+            read -rt 0.05 -n 2 seq 2>/dev/null || true
+            key+="${seq}"
+            # souris : la séquence est drainée puis traitée, jamais passée au case
+            if [[ "${seq}" == '[<' || "${seq}" == '[M' ]]; then
+                MOUSE_READ "${seq}"
+                MOUSE_ACT
+                if (( DOUBLE == 1 && SEL_PID > 0 )); then
+                    DOUBLE=0
+                    DETAILS_OVERLAY "${SEL_PID}"
+                    return 0
+                fi
+                # rien n'a changé à l'écran : on réattend une touche sans trame
+                (( REDRAW == 1 )) && return 0
+                continue
             fi
-            ;;
-        c) SORT_TOGGLE "-%cpu" "%cpu"; OFFSET=0 ;;
-        C) SORT_TOGGLE "cmd" "-cmd"; SHOW_OPTS=1; OFFSET=0 ;;
-        N) SORT_TOGGLE "nice" "-nice"; OFFSET=0 ;;
-        u) SORT_TOGGLE "user" "-user"; OFFSET=0 ;;
-        p) SORT_TOGGLE "pid" "-pid"; OFFSET=0 ;;
-        P) SORT_TOGGLE "ppid" "-ppid"; OFFSET=0 ;;
-        m) SORT_TOGGLE "-rss" "rss"; OFFSET=0 ;;
-        M) CPU_MODE=$((1 - CPU_MODE)) ;;
-        $'\e[D') NEWBIE=1 ;;
-        $'\e[C') NEWBIE=0 ;;
-        $'\e[A') READ_DRAWN; SEL_STEP_KEY -1 ;;
-        $'\e[B') READ_DRAWN; SEL_STEP_KEY 1 ;;
-        $'\e[5')                        # PageUp : la vue seule, la sélection tient
-            READ_DRAWN
-            OFFSET=$(( OFFSET - (LIMIT > 1 ? LIMIT - 1 : 1) ))
-            (( OFFSET < 0 )) && OFFSET=0
-            ;;
-        $'\e[6')
-            READ_DRAWN
-            max_off=$(( TOTAL - LIMIT ))
-            (( max_off < 0 )) && max_off=0
-            OFFSET=$(( OFFSET + (LIMIT > 1 ? LIMIT - 1 : 1) ))
-            (( OFFSET > max_off )) && OFFSET=${max_off}
-            ;;
-        $'\e[H') OFFSET=0 ;;
-        $'\e[F')
-            READ_DRAWN
-            max_off=$(( TOTAL - LIMIT ))
-            (( max_off < 0 )) && max_off=0
-            OFFSET="${max_off}"
-            ;;
-        $'\e') SEL_PID=0 ;;             # Échap : on relâche la sélection
-        x) KILL_SELECTED TERM ;;        # fin douce : laisse le processus s'arrêter
-        X) KILL_SELECTED KILL ;;        # fin immédiate : pas de nettoyage
-        ''|$'\r'|$'\n'|d)               # Entrée ou d : détails du processus choisi
-            if (( SEL_PID > 0 )); then DETAILS_OVERLAY "${SEL_PID}"; fi
-            ;;
-        *) : ;;
-    esac
-    return 0
+        fi
+
+        case "${key}" in
+            /) FILTER_EDIT=1; FILTER_SAVE="${FILTER}"; FILTER_BUF="${FILTER}"; OFFSET=0 ;;
+            o) SHOW_OPTS=$((1 - SHOW_OPTS)) ;;
+            k) KERNEL=$(( (KERNEL + 1) % 3 )) ;;
+            t) TREE=$((1 - TREE)); OFFSET=0 ;;
+            h) HEADER=$((1 - HEADER)) ;;
+            f) FOOTER=$((1 - FOOTER)) ;;
+            '?') HELP_OVERLAY ;;
+            q|Q) QUIT 0 ;;
+            +)
+                if (( INTERVAL >= 120 )); then INTERVAL=120; else INTERVAL=$((INTERVAL + 1)); fi
+                FREEZE=0
+                ;;
+            -)
+                if (( INTERVAL > 120 )); then INTERVAL=120; else INTERVAL=$(( INTERVAL > 1 ? INTERVAL - 1 : 1 )); fi
+                FREEZE=0
+                ;;
+            F)
+                if (( FREEZE == 1 )); then
+                    FREEZE=0
+                    INTERVAL=1
+                else
+                    FREEZE=1
+                    INTERVAL="${INTERVAL_MAX}"
+                fi
+                ;;
+            c) SORT_TOGGLE "-%cpu" "%cpu"; OFFSET=0 ;;
+            C) SORT_TOGGLE "cmd" "-cmd"; SHOW_OPTS=1; OFFSET=0 ;;
+            N) SORT_TOGGLE "nice" "-nice"; OFFSET=0 ;;
+            u) SORT_TOGGLE "user" "-user"; OFFSET=0 ;;
+            p) SORT_TOGGLE "pid" "-pid"; OFFSET=0 ;;
+            P) SORT_TOGGLE "ppid" "-ppid"; OFFSET=0 ;;
+            m) SORT_TOGGLE "-rss" "rss"; OFFSET=0 ;;
+            M) CPU_MODE=$((1 - CPU_MODE)) ;;
+            $'\e[D') NEWBIE=1 ;;
+            $'\e[C') NEWBIE=0 ;;
+            $'\e[A') READ_DRAWN; SEL_STEP_KEY -1 ;;
+            $'\e[B') READ_DRAWN; SEL_STEP_KEY 1 ;;
+            $'\e[5')                        # PageUp : la vue seule, la sélection tient
+                READ_DRAWN
+                OFFSET=$(( OFFSET - (LIMIT > 1 ? LIMIT - 1 : 1) ))
+                (( OFFSET < 0 )) && OFFSET=0
+                ;;
+            $'\e[6')
+                READ_DRAWN
+                max_off=$(( TOTAL - LIMIT ))
+                (( max_off < 0 )) && max_off=0
+                OFFSET=$(( OFFSET + (LIMIT > 1 ? LIMIT - 1 : 1) ))
+                (( OFFSET > max_off )) && OFFSET=${max_off}
+                ;;
+            $'\e[H') OFFSET=0 ;;
+            $'\e[F')
+                READ_DRAWN
+                max_off=$(( TOTAL - LIMIT ))
+                (( max_off < 0 )) && max_off=0
+                OFFSET="${max_off}"
+                ;;
+            $'\e') SEL_PID=0 ;;             # Échap : on relâche la sélection
+            x) KILL_SELECTED TERM ;;        # fin douce : laisse le processus s'arrêter
+            X) KILL_SELECTED KILL ;;        # fin immédiate : pas de nettoyage
+            ''|$'\r'|$'\n'|d)               # Entrée ou d : détails du processus choisi
+                if (( SEL_PID > 0 )); then DETAILS_OVERLAY "${SEL_PID}"; fi
+                ;;
+            *) : ;;
+        esac
+        return 0
+    done
 }
 
 ##############################################################################
