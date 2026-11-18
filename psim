@@ -18,6 +18,8 @@
 #     il s'affiche à sa droite, ou sur une ligne en bas si l'entête est masqué) ;
 #   * mode arbre (--tree / touche t) : hiérarchie des ppid, l'indentation
 #     se prend sur les colonnes de commande et d'arguments ;
+#   * souris en mode dynamique : clic = sélection de la ligne, molette =
+#     défilement de la vue ;
 #   * journal borné (rotation) ;
 #   * options inconnues, arguments en trop et valeurs invalides refusés.
 #
@@ -45,6 +47,10 @@ readonly ICON_CLOCK=$'\uF449'
 declare -i WIDTH=120 HEIGHT=40
 declare -i LIMIT=0 OFFSET=0 TOTAL=0
 declare -i ALT=0 SESSION=0 CLEANED=0 TTY=0 STDIN_TTY=0 SIZE_KNOWN=0 WINCH=0
+# Dernier événement souris (MOUSE_BTN < 0 : aucun) : bouton, ligne du curseur,
+# relâchement. Renseignés par MOUSE_READ, exploités par MOUSE_ACT. La colonne
+# n'est pas conservée : seule la ligne porte la sélection.
+declare -i MOUSE_BTN=-1 MOUSE_Y=0 MOUSE_REL=0
 declare -i STATUSW=0
 status_p=''
 status_c=''
@@ -91,7 +97,7 @@ RESTORE_SCREEN() {
         if [[ -n "${STTY_SAVE}" ]]; then
             stty "${STTY_SAVE}" 2>/dev/null || true
         fi
-        printf '\033[?25h\033[?1049l\033[0m'
+        printf '\033[?1000l\033[?1006l\033[?25h\033[?1049l\033[0m'
         ALT=0
     fi
     return 0
@@ -278,6 +284,8 @@ ${Vert}RACCOURCIS (dynamique)${Reset}
    h  entête     f  pied        ?  aide         q  quitter
    +/-  délai    F  gel/dégel   ←/→  newbie/étendu
    ↑/↓  sélectionner (la vue suit aux bords)   Échap  relâcher
+   clic  sélectionner la ligne   molette  défiler la vue
+         (Maj+clic : la sélection de texte du terminal reste possible)
    Entrée / d  détails du processus sélectionné (une touche ferme la boîte)
    PgUp/PgDn  défiler d'une page   Home/End  début / fin de liste
    x  TERM  et  X  KILL  sur le processus sélectionné, après confirmation (y).
@@ -1177,13 +1185,116 @@ SEL_DOWN() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# Souris (mode dynamique uniquement)
+#
+# Le terminal est mis en rapports « appui / relâchement » (1000h) et en
+# encodage SGR (1006h) : un clic arrive comme \e[<bouton;colonne;ligneM (m au
+# relâchement), une molette comme les boutons 64 (haut) et 65 (bas). La
+# séquence fait plus de deux octets, donc elle est drainée ici : sans cela ses
+# caractères restants (« M », « 0 », « ; »…) tomberaient dans le case des
+# raccourcis — un clic basculerait le mode %CPU. Les vieux terminaux (encodage
+# X10, \e[M suivi de trois octets décalés de 32) sont acceptés aussi, pour la
+# même raison : ne rien laisser traîner dans le tampon.
+# ---------------------------------------------------------------------------
+
+# Draine la fin d'une séquence souris dont les deux premiers octets sont déjà
+# lus (passés en argument : « [< » ou « [M ») -> MOUSE_BTN/X/Y/REL.
+MOUSE_READ() {
+    local rest='' c=''
+    local -i n=0 b=0 y=0 rel=0
+    MOUSE_BTN=-1
+    MOUSE_Y=0
+    MOUSE_REL=0
+    if [[ "$1" == '[<' ]]; then
+        while (( n < 24 )); do
+            IFS= read -rt 0.05 -n 1 c 2>/dev/null || break
+            n=$(( n + 1 ))
+            if [[ "${c}" == 'M' || "${c}" == 'm' ]]; then
+                [[ "${c}" == 'm' ]] && rel=1
+                break
+            fi
+            rest+="${c}"
+        done
+        [[ "${rest}" =~ ^([0-9]+)\;([0-9]+)\;([0-9]+)$ ]] || return 0
+        b=${BASH_REMATCH[1]}
+        y=${BASH_REMATCH[3]}
+    else
+        # X10 : trois octets, dont un peut être une espace (0x20) — d'où IFS vide
+        local -a raw=()
+        for (( n = 0; n < 3; n++ )); do
+            IFS= read -rt 0.05 -n 1 c 2>/dev/null || return 0
+            [[ -n "${c}" ]] || return 0
+            printf -v "raw[n]" '%d' "'${c}"
+        done
+        b=$(( raw[0] - 32 ))
+        y=$(( raw[2] - 32 ))
+        (( (b & 3) == 3 )) && rel=1
+    fi
+    MOUSE_BTN=${b}
+    MOUSE_Y=${y}
+    MOUSE_REL=${rel}
+    return 0
+}
+
+# Clic gauche : la ligne sous le curseur devient la sélection. Hors du tableau
+# (entête, ligne de statut, pied de page, sous la dernière ligne) : rien.
+# Molette : la vue seule défile, la sélection ne bouge pas.
+MOUSE_ACT() {
+    local -i i max_off step=3
+    (( MOUSE_BTN < 0 )) && return 0
+    (( MOUSE_REL == 1 )) && return 0
+    if (( (MOUSE_BTN & 64) != 0 )); then
+        max_off=$(( TOTAL - LIMIT ))
+        (( max_off < 0 )) && max_off=0
+        if (( (MOUSE_BTN & 1) == 0 )); then
+            OFFSET=$(( OFFSET - step ))
+        else
+            OFFSET=$(( OFFSET + step ))
+        fi
+        (( OFFSET < 0 )) && OFFSET=0
+        (( OFFSET > max_off )) && OFFSET=${max_off}
+        return 0
+    fi
+    (( (MOUSE_BTN & 3) == 0 )) || return 0        # bouton gauche seulement
+    i=$(( MOUSE_Y - HEADER ))                     # rang de ligne dans la fenêtre
+    (( i >= 1 )) || return 0
+    (( i <= LIMIT )) || return 0
+    (( i <= ${#ROWPIDS[@]} )) || return 0
+    SEL_PID=${ROWPIDS[i]}
+    return 0
+}
+
+# Touche d'une boîte modale : les événements souris sont avalés, une boîte ne
+# se ferme pas sur un clic -> MODAL_KEY ('' sur EOF).
+MODAL_KEY() {
+    local k='' seq=''
+    MODAL_KEY=''
+    while :; do
+        IFS= read -rsn1 k 2>/dev/null || return 0
+        if [[ "${k}" != $'\e' ]]; then
+            MODAL_KEY="${k}"
+            return 0
+        fi
+        read -rt 0.05 -n 2 seq 2>/dev/null || true
+        if [[ "${seq}" == '[<' || "${seq}" == '[M' ]]; then
+            MOUSE_READ "${seq}"
+            continue
+        fi
+        MODAL_KEY=$'\e'"${seq}"
+        return 0
+    done
+}
+
 # Mode saisie du filtre : chaque caractère met FILTER à jour (rendu en direct).
 FILTER_EDIT_KEY() {
     local key="$1" seq=""
     case "${key}" in
         $'\e')
             read -rt 0.05 -n 2 seq 2>/dev/null || true
-            if [[ -z "${seq}" ]]; then      # Échap seul : on annule
+            if [[ "${seq}" == '[<' || "${seq}" == '[M' ]]; then
+                MOUSE_READ "${seq}"         # un clic ne touche pas au filtre
+            elif [[ -z "${seq}" ]]; then    # Échap seul : on annule
                 FILTER="${FILTER_SAVE}"
                 FILTER_EDIT=0
                 OFFSET=0
@@ -1229,6 +1340,12 @@ HANDLE_KEY() {
     if [[ "${key}" == $'\e' ]]; then
         read -rt 0.05 -n 2 seq 2>/dev/null || true
         key+="${seq}"
+        # souris : la séquence est drainée puis traitée, jamais passée au case
+        if [[ "${seq}" == '[<' || "${seq}" == '[M' ]]; then
+            MOUSE_READ "${seq}"
+            MOUSE_ACT
+            return 0
+        fi
     fi
 
     case "${key}" in
@@ -1329,14 +1446,16 @@ HELP_OVERLAY() {
     local kpad dpad line hint title hz bv tl tr bl br bg reset
 
     ktxt=( 'c' 'C' 'm' 'p' 'P' 'N' 'u' 'M' 'o' 'k' 'h' 'f' '/' '- / +'
-           'F' '↑ / ↓' 'PgUp / PgDn' 'Début / Fin' 'Échap' 'Entrée / d' 'x / X' '← / →'
+           'F' '↑ / ↓' 'clic' 'molette' 'PgUp / PgDn' 'Début / Fin' 'Échap'
+           'Entrée / d' 'x / X' '← / →'
            't' 'q' '?' )
     dtxt=( 'trier par %CPU' 'trier par commande' 'trier par mémoire' 'trier par PID'
            'trier par PPID' 'trier par nice' 'trier par utilisateur' '%CPU : cœur / machine'
            'options des commandes' 'threads noyau (cycle)' 'entête on / off'
            'pied de page on / off' 'filtrer (Entrée / Échap)'
            'augmenter / diminuer le taux de rafraîchissement'
-           'gel / dégel' 'sélectionner (la vue suit)' "défiler d'une page"
+           'gel / dégel' 'sélectionner (la vue suit)'
+           'sélectionner la ligne' 'défiler la vue' "défiler d'une page" 
            'premier / dernier' 'relâcher la sélection' 'détails du processus'
            'TERM / KILL (après y)' 'simplifié / étendu' 'arbre on / off' 'quitter' 'cette aide' )
     n=${#ktxt[@]}
@@ -1438,9 +1557,7 @@ HELP_OVERLAY() {
     printf '%s\033[%d;%dH%s%s%s\033[K' "${bg}" "$(( y0 + rows + 2 ))" "${x0}" "${Blanc}" "${line}" "${reset}"
 
     # modale : on attend une touche (n'importe laquelle)
-    local -i k=0
-    IFS= read -rsn1 _hk 2>/dev/null || k=1
-    : "${k}"
+    MODAL_KEY
 
     # l'image précédente est plus étroite que la boîte : on efface, la boucle
     # redessine aussitôt
@@ -1833,14 +1950,12 @@ DET_CLOSE() {
 
 # Détails d'un processus (Entrée ou d) — lecture seule
 DETAILS_OVERLAY() {
-    local -i pid="${1:-0}" k=0
-    local hk=''
+    local -i pid="${1:-0}"
     DET_INIT
     PROC_INFO "${pid}" $(( HEIGHT - 3 ))
     DET_HINT='une touche pour fermer'
     DET_DRAW " DÉTAILS — ${pid} ${DET_NAME} "
-    IFS= read -rsn1 hk 2>/dev/null || k=1
-    : "${k}"
+    MODAL_KEY
     DET_CLOSE
     return 0
 }
@@ -1848,7 +1963,7 @@ DETAILS_OVERLAY() {
 # Confirmation de kill (x / X) : même boîte, question en dernière ligne
 CONFIRM_KILL() {
     local sig="$1"
-    local -i pid="${2:-0}" k=0
+    local -i pid="${2:-0}"
     local hk='' q=''
     ASKED=0
     DET_INIT
@@ -1859,8 +1974,8 @@ CONFIRM_KILL() {
     DET_RAW "${RougeBold}${q}${DET_RST}" "${#q}"
     DET_HINT='y = envoyer   ·   toute autre touche = annuler'
     DET_DRAW " TERMINER — ${pid} ${DET_NAME} "
-    IFS= read -rsn1 hk 2>/dev/null || k=1
-    : "${k}"
+    MODAL_KEY
+    hk="${MODAL_KEY}"
     DET_CLOSE
     if [[ "${hk}" == 'y' || "${hk}" == 'Y' ]]; then ASKED=1; fi
     return 0
@@ -1946,7 +2061,7 @@ RUN_DYNAMIC() {
     ALT=1
     STTY_SAVE=$(stty -g 2>/dev/null || true)
     [[ -z "${STTY_SAVE}" ]] || stty -echo 2>/dev/null || true
-    printf '\033[?25l\033[?1049h\033[H'
+    printf '\033[?25l\033[?1049h\033[?1000h\033[?1006h\033[H'
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP
     trap 'exit 131' QUIT PIPE
