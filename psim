@@ -28,7 +28,7 @@
 ##############################################################################
 set -euo pipefail
 
-readonly VER="1.4.2"
+readonly VER="1.5.0"
 readonly NAME="${0##*/}"
 readonly CONF_NAME="psim"       # config et cache : ~/.config/psim et ~/.cache/psim
 readonly SELF_PID="${BASHPID:-$$}"
