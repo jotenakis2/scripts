@@ -754,7 +754,7 @@ function load_row(i) {
 # ind : glyphes de branche déjà calculés, indw leur largeur visible. L'écart
 # entre le nombre de caractères et d'octets est réglé en BEGIN (jeu ASCII quand
 # awk ne sait pas compter en caractères).
-function draw_row(ind, indw,   line, cw, ow, budget, cmd_d, pad_n, user_c, nice_c, cmd_c, dir_p, base_p, indc) {
+function draw_row(ind, indw,   line, cw, ow, cmd_d, pad_n, user_c, nice_c, cmd_c, dir_p, base_p, indc) {
     shown++
     rowpid[shown] = C_pid
     sum_rss += C_rss
@@ -769,16 +769,19 @@ function draw_row(ind, indw,   line, cw, ow, budget, cmd_d, pad_n, user_c, nice_
         return
     }
 
-    # l'indentation sort de la largeur du tableau : on la prend d'abord sur la
-    # colonne des arguments, puis sur celle de la commande
+    # l'indentation sort de la colonne de commande, et d'elle seule : les deux
+    # colonnes gardent donc leur largeur nominale et la colonne des options
+    # commence au même point sur toutes les lignes, quel que soit le niveau.
+    # Repli sur les arguments seulement si la commande deviendrait illisible.
     cw = cmdw
     ow = optw
     if (indw > 0) {
-        budget = cmdw + (optw > 0 ? optw + 1 : 0) - indw
-        if (budget < 10) budget = 10
-        cw = (budget < cmdw) ? budget : cmdw
-        ow = budget - cw - 1
-        if (ow < 0) ow = 0
+        cw = cmdw - indw
+        if (cw < 10) {
+            cw = 10
+            ow = optw - (indw + cw - cmdw)
+            if (ow < 0) ow = 0
+        }
     }
     indc = (indw > 0) ? GREY ind RESET : ""
 
