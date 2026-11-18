@@ -1594,9 +1594,8 @@ HELP_OVERLAY() {
     # modale : on attend une touche (n'importe laquelle)
     MODAL_KEY
 
-    # l'image précédente est plus étroite que la boîte : on efface, la boucle
-    # redessine aussitôt
-    printf '\033[2J'
+    # pas d'effacement : la boucle redessine toute la trame juste après (même
+    # raison que DET_CLOSE, un écran vide intermédiaire se voit)
     return 0
 }
 
@@ -1976,10 +1975,12 @@ DET_DRAW() {
 }
 
 # Restaure l'état et efface : la boucle redessine aussitôt.
+# Ferme la boîte : l'effacement de l'écran est inutile (la trame suivante
+# réécrit toutes les lignes, [H puis [J), et il produisait un écran vide
+# entre deux images — visible quand une boîte en remplace une autre.
 DET_CLOSE() {
     FREEZE=${DET_FREEZE_SAVE}
     STATUS_BUILD
-    printf '\033[2J'
     return 0
 }
 
@@ -2000,7 +2001,9 @@ DETAILS_OVERLAY() {
         X) sig='KILL' ;;
         *) return 0 ;;
     esac
-    # la confirmation dessine sa propre boîte : celle des détails est déjà fermée
+    # la confirmation doit s'ouvrir sur le tableau, pas sur un écran vide :
+    # DET_CLOSE efface, DRAW_FRAME remet l'image, puis la boîte se dessine dessus
+    DRAW_FRAME
     SEL_PID=${pid}
     KILL_SELECTED "${sig}"
     return 0
@@ -2102,8 +2105,38 @@ KILL_SELECTED() {
 ##############################################################################
 # Modes
 ##############################################################################
+# Une trame complète : bornes de la fenêtre, ps+awk, tableau, statut. Seul
+# endroit qui décide de la géométrie, pour que la boucle et la reprise après une
+# boîte (détails -> confirmation) dessinent exactement la même image.
+DRAW_FRAME() {
+    local -i bar=0 max_off
+    # le statut vit dans l'entête ; une ligne n'est réservée que si l'entête est
+    # masquée, pour qu'il reste visible
+    (( HEADER == 0 )) && bar=1
+
+    LIMIT=$(( HEIGHT - HEADER - FOOTER - bar ))
+    (( LIMIT < 1 )) && LIMIT=1
+
+    READ_DRAWN
+    max_off=$(( TOTAL - LIMIT ))
+    (( max_off < 0 )) && max_off=0
+    (( OFFSET > max_off )) && OFFSET="${max_off}"
+
+    printf '\033[H'
+    RENDER 1 "${LIMIT}" "${HEADER}" "${FOOTER}"
+    if (( bar == 1 )); then
+        # pas d'effacement ici : la ligne du statut est réécrite par-dessus
+        # (un \033[J la blanchirait avant de la redessiner -> scintillement)
+        printf '\n'
+        PRINT_STATUS
+    else
+        # pas de ligne de statut : on nettoie sous le pied de page
+        printf '\033[J'
+    fi
+    return 0
+}
+
 RUN_DYNAMIC() {
-    local -i max_off
     ALT=1
     STTY_SAVE=$(stty -g 2>/dev/null || true)
     [[ -z "${STTY_SAVE}" ]] || stty -echo 2>/dev/null || true
@@ -2128,31 +2161,7 @@ RUN_DYNAMIC() {
         fi
         (( WIDTH < THIN_W )) && NEWBIE=1
 
-        # le statut vit dans l'entête ; une ligne n'est réservée que si
-        # l'entête est masquée, pour qu'il reste visible
-        local -i bar=0
-        (( HEADER == 0 )) && bar=1
-
-        LIMIT=$(( HEIGHT - HEADER - FOOTER - bar ))
-        (( LIMIT < 1 )) && LIMIT=1
-
-        READ_DRAWN
-        max_off=$(( TOTAL - LIMIT ))
-        (( max_off < 0 )) && max_off=0
-        (( OFFSET > max_off )) && OFFSET="${max_off}"
-
-        printf '\033[H'
-        RENDER 1 "${LIMIT}" "${HEADER}" "${FOOTER}"
-        if (( bar == 1 )); then
-            # pas d'effacement ici : la ligne du statut est réécrite par-dessus
-            # (un \033[J la blanchirait avant de la redessiner -> scintillement)
-            printf '\n'
-            PRINT_STATUS
-        else
-            # pas de ligne de statut : on nettoie sous le pied de page
-            printf '\033[J'
-        fi
-
+        DRAW_FRAME
         HANDLE_KEY
     done
 }
