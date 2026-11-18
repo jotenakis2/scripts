@@ -1294,15 +1294,20 @@ NOW_US() {
 # tableau (entête, ligne de statut, pied de page, sous la dernière ligne) : rien.
 # Molette : la vue seule défile, la sélection ne bouge pas.
 MOUSE_ACT() {
-    local -i i max_off step=${WHEEL_STEP} prev
+    local -i i max_off step=${WHEEL_STEP} prev release_only
     # REDRAW reste à 0 quand l'événement ne change rien (relâchement, molette
     # neutralisée, cran en butée, clic hors tableau) : la boucle réattend une
     # touche sans refaire une trame, sinon une rafale de molette déclenche
     # autant de ps+awk que de crans et l'écran donne l'impression de ramer.
     REDRAW=0
     (( MOUSE_BTN < 0 )) && return 0
-    (( MOUSE_REL == 1 )) && return 0
+    # Un relâchement ne compte pas comme un clic (le double-clic se compte sur
+    # les appuis), sauf s'il est le seul événement : certains terminaux avalent
+    # l'appui d'un clic qui donne le focus à la fenêtre et ne livrent que le
+    # relâchement — sans cette tolérance, le premier clic ne fait rien.
+    release_only=${MOUSE_REL}
     if (( (MOUSE_BTN & 64) != 0 )); then
+        (( release_only == 1 )) && return 0
         (( WHEEL == 1 )) || return 0          # molette neutralisée (WHEEL=0)
         max_off=$(( TOTAL - LIMIT ))
         (( max_off < 0 )) && max_off=0
@@ -1324,6 +1329,7 @@ MOUSE_ACT() {
     (( i <= ${#ROWPIDS[@]} )) || return 0
     (( SEL_PID != ROWPIDS[i] )) && REDRAW=1
     SEL_PID=${ROWPIDS[i]}
+    (( release_only == 1 )) && return 0           # relâchement vu seul
     NOW_US
     DOUBLE=0
     if (( NOWTIC > 0 && CLICK_LAST > 0 && i == CLICK_ROW \
@@ -1419,6 +1425,12 @@ HANDLE_KEY() {
             # souris : la séquence est drainée puis traitée, jamais passée au case
             if [[ "${seq}" == '[<' || "${seq}" == '[M' ]]; then
                 MOUSE_READ "${seq}"
+                if [[ -n "${PSIM_MOUSE_DEBUG:-}" ]]; then
+                    printf '%s btn=%s y=%s rel=%s header=%s limit=%s rows=%s sel=%s seq=%q\n' \
+                        "$(date +%T)" "${MOUSE_BTN}" "${MOUSE_Y}" "${MOUSE_REL}" "${HEADER}" \
+                        "${LIMIT}" "${#ROWPIDS[@]}" "${SEL_PID}" "${seq}" \
+                        >> "${CACHE_DIR}/mouse.log" 2>/dev/null || true
+                fi
                 MOUSE_ACT
                 if (( DOUBLE == 1 && SEL_PID > 0 )); then
                     DOUBLE=0
