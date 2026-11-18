@@ -56,6 +56,11 @@ declare -i MOUSE_BTN=-1 MOUSE_Y=0 MOUSE_REL=0
 declare -i CLICK_LAST=0 CLICK_ROW=0 DOUBLE=0
 declare -i CLICK_US=400000        # 400 ms : la tolérance usuelle d'un double-clic
 declare -i NOWTIC=0               # horodatage courant (µs), posé par NOW_US
+# Flèches maintenues : la répétition rapprochée accélère le déplacement
+# (1, 1, 2, 2, 3, 3… jusqu'à SEL_FAST lignes par appui). Un appui isolé reste
+# exactement d'une ligne, et le pas retombe dès que la frappe ralentit.
+declare -i SEL_LAST=0 SEL_REP=0 SEL_FAST=5
+declare -i REPEAT_US=250000       # au-delà de 250 ms entre deux appuis : on repart à 1
 declare -i STATUSW=0
 status_p=''
 status_c=''
@@ -288,7 +293,8 @@ ${Vert}RACCOURCIS (dynamique)${Reset}
    t  arbre     k  noyau
    h  entête     f  pied        ?  aide         q  quitter
    +/-  délai    F  gel/dégel   ←/→  newbie/étendu
-   ↑/↓  sélectionner (la vue suit aux bords)   Échap  relâcher
+   ↑/↓  sélectionner (la vue suit aux bords ; maintenir la flèche accélère)
+         Échap  relâcher
    clic  sélectionner la ligne   molette  défiler la vue
          double-clic : détails du processus
          (Maj+clic : la sélection de texte du terminal reste possible)
@@ -1160,6 +1166,30 @@ SEL_RECENTER() {
     return 0
 }
 
+# Flèche maintenue : SEL_STEP_KEY -1 (haut) ou 1 (bas) déplace la sélection du
+# pas courant. Le pas grandit avec la répétition : tenir la flèche traverse la
+# liste au lieu d'avancer d'une ligne par auto-répétition du terminal.
+SEL_STEP_KEY() {
+    local -i dir="$1" i step
+    NOW_US
+    if (( NOWTIC > 0 && SEL_LAST > 0 && NOWTIC - SEL_LAST <= REPEAT_US )); then
+        SEL_REP=$(( SEL_REP + 1 ))
+    else
+        SEL_REP=0
+    fi
+    SEL_LAST=${NOWTIC}
+    step=$(( 1 + SEL_REP / 2 ))            # 1, 1, 2, 2, 3, 3, 4, 4, 5…
+    (( step > SEL_FAST )) && step=${SEL_FAST}
+    for (( i = 0; i < step; i++ )); do
+        if (( dir < 0 )); then
+            SEL_UP
+        else
+            SEL_DOWN
+        fi
+    done
+    return 0
+}
+
 # Flèche haut : la ligne sélectionnée est la vérité, la vue suit aux bords.
 SEL_UP() {
     SEL_LOCATE
@@ -1418,8 +1448,8 @@ HANDLE_KEY() {
         M) CPU_MODE=$((1 - CPU_MODE)) ;;
         $'\e[D') NEWBIE=1 ;;
         $'\e[C') NEWBIE=0 ;;
-        $'\e[A') READ_DRAWN; SEL_UP ;;
-        $'\e[B') READ_DRAWN; SEL_DOWN ;;
+        $'\e[A') READ_DRAWN; SEL_STEP_KEY -1 ;;
+        $'\e[B') READ_DRAWN; SEL_STEP_KEY 1 ;;
         $'\e[5')                        # PageUp : la vue seule, la sélection tient
             READ_DRAWN
             OFFSET=$(( OFFSET - (LIMIT > 1 ? LIMIT - 1 : 1) ))
@@ -1488,7 +1518,7 @@ HELP_OVERLAY() {
            'options des commandes' 'threads noyau (cycle)' 'entête on / off'
            'pied de page on / off' 'filtrer (Entrée / Échap)'
            'augmenter / diminuer le taux de rafraîchissement'
-           'gel / dégel' 'sélectionner (la vue suit)'
+           'gel / dégel' 'sélectionner (tenir = accélère)'
            'sélectionner la ligne' 'détails du processus' 'défiler la vue' "défiler d'une page" 
            'premier / dernier' 'relâcher la sélection' 'détails du processus'
            'TERM / KILL (y, ou dans les détails)' 'simplifié / étendu'
