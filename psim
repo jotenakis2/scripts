@@ -28,7 +28,7 @@
 ##############################################################################
 set -euo pipefail
 
-readonly VER="1.4.1"
+readonly VER="1.4.2"
 readonly NAME="${0##*/}"
 readonly CONF_NAME="psim"       # config et cache : ~/.config/psim et ~/.cache/psim
 readonly SELF_PID="${BASHPID:-$$}"
@@ -1955,7 +1955,8 @@ DET_DRAW() {
         pad=$(( (inner - ${#DET_HINT}) / 2 ))
         (( pad < 1 )) && pad=1
         printf -v spaces '%*s' "${pad}" ''
-        line="${DET_BV}${spaces}${DET_GRIS}${DET_HINT}${DET_RST}"
+        # dernière ligne (x / X, y… ) en gras : c'est l'action à retenir
+        line="${DET_BV}${spaces}${Gras}${DET_GRIS}${DET_HINT}${DET_RST}"
         printf -v spaces '%*s' "$(( inner - pad - ${#DET_HINT} ))" ''
         line+="${spaces}${DET_BV}"
         printf '%s\033[%d;%dH%s%s%s' "${DET_BG}" "$(( y0 + 1 + rows ))" "${x0}" "${Blanc}" "${line}" "${DET_RS}"
