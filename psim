@@ -78,7 +78,7 @@ declare -a CLUSTER_ARGS=()
 
 # Couleurs (remplies par DEFINE_COLORS)
 Rouge="" Vert="" Jaune="" Bleu="" BleuBold="" Magenta="" Cyan="" Blanc=""
-RougeBold="" Gris="" BgGris="" Reset="" ResetFg="" Underline=""
+RougeBold="" Gris="" BgGris="" Reset="" ResetFg="" Underline="" Gras=""
 
 ##############################################################################
 # Utilitaires
@@ -102,13 +102,14 @@ QUIT() { exit "${1:-0}"; }
 DEFINE_COLORS() {
     if (( NO_COLOR == 1 )) || (( TTY == 0 )) || [[ "${TERM:-dumb}" == "dumb" ]]; then
         Rouge="" Vert="" Jaune="" Bleu="" BleuBold="" Magenta="" Cyan="" Blanc=""
-        RougeBold="" Gris="" BgGris="" Reset="" ResetFg="" Underline=""
+        RougeBold="" Gris="" BgGris="" Reset="" ResetFg="" Underline="" Gras=""
     else
         Rouge=$'\033[31m' ; Vert=$'\033[32m' ; Jaune=$'\033[33m'
         Bleu=$'\033[34m'  ; BleuBold=$'\033[1;34m' ; Magenta=$'\033[35m'
         Cyan=$'\033[36m'  ; Blanc=$'\033[37m' ; RougeBold=$'\033[1;31m'
         Gris=$'\033[37m'  ; BgGris=$'\033[100m'
         Reset=$'\033[0m'  ; ResetFg=$'\033[39m' ; Underline=$'\033[4m'
+        Gras=$'\033[1m'
     fi
     return 0
 }
@@ -629,12 +630,12 @@ BEGIN {
     if (color) {
         RED = red; GREEN = green; YELLOW = yellow; BLUE = blue
         MAGENTA = magenta; CYAN = cyan; WHITE = white; GREY = grey
-        BG = bg; RESET = reset; RFG = resetfg; UL = underline
+        BG = bg; RESET = reset; RFG = resetfg; UL = underline; BOLD = bold
         EL = "\033[0K"
     } else {
         RED = ""; GREEN = ""; YELLOW = ""; BLUE = ""
         MAGENTA = ""; CYAN = ""; WHITE = ""; GREY = ""
-        BG = ""; RESET = ""; RFG = ""; UL = ""
+        BG = ""; RESET = ""; RFG = ""; UL = ""; BOLD = ""
         EL = ""
     }
     if (!pad) { cmdw = 0; optw = 0 }
@@ -799,9 +800,9 @@ function draw_row(ind, indw,   line, cw, ow, cmd_d, pad_n, user_c, nice_c, cmd_c
         match(cmd_d, /\/[^\/]*$/)
         dir_p = substr(cmd_d, 1, RSTART)
         base_p = substr(cmd_d, RSTART + 1)
-        cmd_c = GREY dir_p RESET YELLOW base_p RESET sprintf("%*s", pad_n, "")
+        cmd_c = GREY dir_p RESET BOLD YELLOW base_p RESET sprintf("%*s", pad_n, "")
     } else {
-        cmd_c = YELLOW cmd_d RESET sprintf("%*s", pad_n, "")
+        cmd_c = BOLD YELLOW cmd_d RESET sprintf("%*s", pad_n, "")
     }
 
     if (C_user == "root")
@@ -1010,6 +1011,7 @@ RENDER() {
         -v blue="${Bleu}"      -v magenta="${Magenta}" -v cyan="${Cyan}"
         -v white="${Blanc}"    -v grey="${Gris}"      -v bg="${BgGris}"
         -v reset="${Reset}"    -v resetfg="${ResetFg}" -v underline="${Underline}"
+        -v bold="${Gras}"
     )
 
     # -ww : ne jamais laisser ps tronquer « cmd » à la largeur de COLUMNS
